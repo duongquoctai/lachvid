@@ -1,0 +1,6 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+python-multipart>=0.0.9
+scenedetect[opencv]>=0.6.3
+numpy>=1.26.0
+imageio-ffmpeg>=0.5.1

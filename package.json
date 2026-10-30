@@ -1,0 +1,31 @@
+{
+  "name": "lachvid",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n \"next,python\" -c \"cyan,yellow\" \"npm run dev:next\" \"npm run dev:python\"",
+    "dev:next": "next dev -p 3000",
+    "dev:python": "./backend/.venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "geist": "^1.8.2",
+    "lucide-react": "^1.64.0",
+    "next": "^16.4.3",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "concurrently": "^9.2.5",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^16.4.3",
+    "postcss": "^8",
+    "tailwindcss": "^3.4.1",
+    "typescript": "^5"
+  }
+}
