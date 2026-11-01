@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readProjectState } from "@/lib/store";
+import {
+  getSessionIdFromHeaders,
+  readProjectState,
+  sanitizeSessionId,
+} from "@/lib/store";
 import { ComposedVideo } from "@/types/lachvid";
 
 const PYTHON_BACKEND_URL =
@@ -8,7 +12,8 @@ const PYTHON_BACKEND_URL =
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
-    const state = readProjectState();
+    const sessionId = sanitizeSessionId(body.sessionId || getSessionIdFromHeaders(req.headers));
+    const state = readProjectState(sessionId);
 
     const composedVideos: ComposedVideo[] =
       body.videos ||
@@ -21,11 +26,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const sessionId = body.sessionId || `render_${Date.now().toString(36)}`;
-
     // Prepare payload for Python backend
     const videosPayload = composedVideos.map((comp) => {
-      // Find voice track if available
       let voiceFilePath = "";
       let voiceUrl = "";
       if (comp.voiceTrackId) {
@@ -71,6 +73,30 @@ export async function POST(req: NextRequest) {
         { error: `Python service render error: ${errText}` },
         { status: pyRes.status }
       );
+    }
+
+    const contentType = pyRes.headers.get("content-type") || "";
+    if (contentType.includes("application/zip")) {
+      const zipArrayBuffer = await pyRes.arrayBuffer();
+      return new NextResponse(zipArrayBuffer, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/zip",
+          "Content-Disposition": `attachment; filename="lachvid_rendered_${sessionId}.zip"`,
+        },
+      });
+    }
+
+    if (contentType.includes("video/mp4")) {
+      const mp4ArrayBuffer = await pyRes.arrayBuffer();
+      const filename = composedVideos[0]?.name ? `${composedVideos[0].name}.mp4` : "rendered.mp4";
+      return new NextResponse(mp4ArrayBuffer, {
+        status: 200,
+        headers: {
+          "Content-Type": "video/mp4",
+          "Content-Disposition": `attachment; filename="${filename}"`,
+        },
+      });
     }
 
     const data = await pyRes.json();

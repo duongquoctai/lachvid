@@ -1,6 +1,10 @@
 import fs from "node:fs";
 import { NextRequest, NextResponse } from "next/server";
-import { readProjectState } from "@/lib/store";
+import {
+  getSessionIdFromHeaders,
+  readProjectState,
+  sanitizeSessionId,
+} from "@/lib/store";
 
 const PYTHON_BACKEND_URL =
   process.env.PYTHON_BACKEND_URL || "http://localhost:8000";
@@ -8,12 +12,13 @@ const PYTHON_BACKEND_URL =
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
-    const state = readProjectState();
+    const sessionId = sanitizeSessionId(body.sessionId || getSessionIdFromHeaders(req.headers));
+    const state = readProjectState(sessionId);
 
     const videoPath = body.filePath || state.sourceVideo?.localPath;
     if (!videoPath || !fs.existsSync(videoPath)) {
       return NextResponse.json(
-        { error: "Không tìm thấy file video nguồn để cắt cảnh." },
+        { error: "Không tìm thấy file video nguồn để cắt cảnh (hoặc phiên làm việc đã hết hạn)." },
         { status: 400 }
       );
     }
@@ -44,9 +49,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const sessionId = body.sessionId || `session_${Date.now()}`;
-
-    // Gọi Python backend để cắt video
+    // Call Python backend
     const pyRes = await fetch(`${PYTHON_BACKEND_URL}/slice-scenes`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -63,6 +66,19 @@ export async function POST(req: NextRequest) {
         { error: `Python service slice error: ${errText}` },
         { status: pyRes.status }
       );
+    }
+
+    // Forward the streaming ZIP file or JSON response
+    const contentType = pyRes.headers.get("content-type") || "";
+    if (contentType.includes("application/zip")) {
+      const zipArrayBuffer = await pyRes.arrayBuffer();
+      return new NextResponse(zipArrayBuffer, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/zip",
+          "Content-Disposition": `attachment; filename="lachvid_categories_${sessionId}.zip"`,
+        },
+      });
     }
 
     const data = await pyRes.json();

@@ -7,6 +7,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import JSZip from "jszip";
 import {
   AudioVideoSyncMode,
   CategoryMinDurations,
@@ -86,6 +87,20 @@ export default function LachVidStudioPage() {
     "content",
   );
   const [isSlicing, setIsSlicing] = useState<boolean>(false);
+  const [sourceBlobUrl, setSourceBlobUrl] = useState<string | null>(null);
+
+  // Client-side session ID management (stored in localStorage)
+  const [sessionId, setSessionId] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      let sid = localStorage.getItem("lachvid_session_id");
+      if (!sid) {
+        sid = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+        localStorage.setItem("lachvid_session_id", sid);
+      }
+      return sid;
+    }
+    return "default_session";
+  });
   const [splitEditingCategory, setSplitEditingCategory] = useState<ShotCategory | null>("open");
   const [accordionShotId, setAccordionShotId] = useState<string | null>(null);
 
@@ -158,9 +173,14 @@ export default function LachVidStudioPage() {
   });
   const voiceInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Load project state and category library on mount
+  // Load project state and category library on mount or when sessionId is ready
   useEffect(() => {
-    fetch("/api/project")
+    if (!sessionId) return;
+    const sid = sessionId;
+
+    fetch(`/api/project?sessionId=${encodeURIComponent(sid)}`, {
+      headers: { "x-session-id": sid },
+    })
       .then((r) => r.json())
       .then((data) => {
         if (data.state) {
@@ -181,27 +201,32 @@ export default function LachVidStudioPage() {
       })
       .catch(() => {});
 
-    fetch("/api/category-library")
+    fetch(`/api/category-library?sessionId=${encodeURIComponent(sid)}`, {
+      headers: { "x-session-id": sid },
+    })
       .then((r) => r.json())
       .then((data) => {
         if (data.categoryPools) setCategoryPools(data.categoryPools);
         if (data.multiVoiceTracks) setMultiVoices(data.multiVoiceTracks);
       })
       .catch(() => {});
-  }, []);
+  }, [sessionId]);
 
   const persistState = useCallback(async (nextState: ProjectState) => {
     setState(nextState);
     try {
       await fetch("/api/project", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ state: nextState }),
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-id": sessionId,
+        },
+        body: JSON.stringify({ state: nextState, sessionId }),
       });
     } catch {
       // ignore transient save error
     }
-  }, []);
+  }, [sessionId]);
 
   const categoryMinDurations: CategoryMinDurations = useMemo(() => {
     return {
@@ -335,21 +360,20 @@ export default function LachVidStudioPage() {
       let duration = 0;
       let width = 1080;
       let height = 1920;
+      let localBlobUrl = "";
       try {
         const videoEl = document.createElement("video");
         videoEl.preload = "metadata";
-        const blobUrl = URL.createObjectURL(file);
-        videoEl.src = blobUrl;
+        localBlobUrl = URL.createObjectURL(file);
+        videoEl.src = localBlobUrl;
         await new Promise<void>((resolve) => {
           videoEl.onloadedmetadata = () => {
             duration = videoEl.duration || 0;
             width = videoEl.videoWidth || 1080;
             height = videoEl.videoHeight || 1920;
-            URL.revokeObjectURL(blobUrl);
             resolve();
           };
           videoEl.onerror = () => {
-            URL.revokeObjectURL(blobUrl);
             resolve();
           };
           setTimeout(resolve, 2000);
@@ -358,15 +382,19 @@ export default function LachVidStudioPage() {
         // fallback
       }
 
+      setSourceBlobUrl(localBlobUrl);
+
       const fd = new FormData();
       fd.append("file", file);
       fd.append("kind", "source");
+      fd.append("sessionId", sessionId);
       if (duration > 0) fd.append("duration", String(duration));
       if (width > 0) fd.append("width", String(width));
       if (height > 0) fd.append("height", String(height));
 
       const res = await fetch("/api/upload-local", {
         method: "POST",
+        headers: { "x-session-id": sessionId },
         body: fd,
       });
       const data = await res.json();
@@ -403,8 +431,12 @@ export default function LachVidStudioPage() {
     try {
       const res = await fetch("/api/detect-scenes", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-id": sessionId,
+        },
         body: JSON.stringify({
+          sessionId,
           detector: pyDetector,
           threshold: pyThreshold,
           minSceneLen: pyMinSceneLen,
@@ -800,28 +832,36 @@ export default function LachVidStudioPage() {
     try {
       const res = await fetch("/api/slice-scenes", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-id": sessionId,
+        },
         body: JSON.stringify({
           filePath: state.sourceVideo.localPath,
           scenes: state.shots,
           categoryMinDurations,
-          sessionId: `video_${Date.now().toString(36)}`,
+          sessionId,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi khi cắt video");
 
-      // Trigger download
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || `HTTP ${res.status}`);
+      }
+
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = data.zip_download_url;
-      a.download = `lachvid_categories_${data.session_id}.zip`;
+      a.href = blobUrl;
+      a.download = `lachvid_categories_${sessionId}.zip`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
 
       setStatusBanner({
         type: "success",
-        text: `Đã cắt thành công ${data.total_sliced} clip và tải về file ZIP (chứa sẵn 5 folder OPEN, PRODUCT, TEXTURE, APPLY, END)!`,
+        text: `Đã cắt thành công ${state.shots.length} clip và tải về file ZIP (chứa sẵn 5 folder OPEN, PRODUCT, TEXTURE, APPLY, END)!`,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -849,7 +889,6 @@ export default function LachVidStudioPage() {
     }
 
     try {
-      // Prompt user to pick a root folder on disk
       const picker = (
         window as unknown as {
           showDirectoryPicker?: (opts: unknown) => Promise<any>;
@@ -860,49 +899,49 @@ export default function LachVidStudioPage() {
 
       setIsSlicing(true);
       setBusyMessage(
-        "Đang cắt các clip và ghi thẳng vào các thư mục trên ổ cứng...",
+        "Đang cắt các clip và chuẩn bị ghi vào ổ cứng...",
       );
 
       const res = await fetch("/api/slice-scenes", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-id": sessionId,
+        },
         body: JSON.stringify({
           filePath: state.sourceVideo.localPath,
           scenes: state.shots,
           categoryMinDurations,
-          sessionId: `video_${Date.now().toString(36)}`,
+          sessionId,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi khi cắt video");
 
-      // Write each sliced file directly into the corresponding category subfolder
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || `HTTP ${res.status}`);
+      }
+
+      setBusyMessage("Đang ghi thẳng các file .mp4 vào đúng các thư mục trên máy tính...");
+      const zipBlob = await res.blob();
+      const zip = await JSZip.loadAsync(zipBlob);
+
       let savedCount = 0;
-      for (const item of data.files) {
-        const catName = item.category.toUpperCase();
+      for (const [relativePath, zipEntry] of Object.entries(zip.files)) {
+        if (zipEntry.dir) continue;
+        const parts = relativePath.split("/");
+        const catName = parts[0]?.toUpperCase() || "PRODUCT";
+        const fileName = parts[parts.length - 1];
+
         const catDirHandle = await rootDirHandle.getDirectoryHandle(catName, {
           create: true,
         });
 
-        // Fetch file content
-        const fileRes = await fetch(item.url);
-        if (!fileRes.ok) {
-          throw new Error(
-            `Lỗi tải video ${item.filename} (HTTP ${fileRes.status})`,
-          );
-        }
-        const blob = await fileRes.blob();
-        if (blob.size < 500) {
-          throw new Error(
-            `File ${item.filename} tải về không hợp lệ (${blob.size} bytes).`,
-          );
-        }
-
-        const fileHandle = await catDirHandle.getFileHandle(item.filename, {
+        const fileBlob = await zipEntry.async("blob");
+        const fileHandle = await catDirHandle.getFileHandle(fileName, {
           create: true,
         });
         const writable = await fileHandle.createWritable();
-        await writable.write(blob);
+        await writable.write(fileBlob);
         await writable.close();
         savedCount++;
       }
@@ -924,8 +963,24 @@ export default function LachVidStudioPage() {
   };
 
   // Reset to process next video (up to 50 videos)
-  const handleNextVideo = () => {
+  const handleNextVideo = async () => {
     if (!state) return;
+    try {
+      await fetch("/api/project", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-id": sessionId,
+        },
+        body: JSON.stringify({ action: "reset_source", sessionId }),
+      });
+    } catch {
+      // ignore
+    }
+    if (sourceBlobUrl) {
+      URL.revokeObjectURL(sourceBlobUrl);
+      setSourceBlobUrl(null);
+    }
     persistState({
       ...state,
       sourceVideo: null,
@@ -968,11 +1023,13 @@ export default function LachVidStudioPage() {
     setStatusBanner(null);
     try {
       const fd = new FormData();
+      fd.append("sessionId", sessionId);
       for (let i = 0; i < files.length; i++) {
         fd.append("files", files[i]);
       }
       const res = await fetch("/api/category-library", {
         method: "POST",
+        headers: { "x-session-id": sessionId },
         body: fd,
       });
       const data = await res.json();
@@ -1021,12 +1078,14 @@ export default function LachVidStudioPage() {
     );
     try {
       const fd = new FormData();
+      fd.append("sessionId", sessionId);
       fd.append("targetCategory", category);
       for (let i = 0; i < files.length; i++) {
         fd.append("files", files[i]);
       }
       const res = await fetch("/api/category-library", {
         method: "POST",
+        headers: { "x-session-id": sessionId },
         body: fd,
       });
       const data = await res.json();
@@ -1054,12 +1113,14 @@ export default function LachVidStudioPage() {
     setBusyMessage(`Đang nạp ${files.length} file audio voice...`);
     try {
       const fd = new FormData();
+      fd.append("sessionId", sessionId);
       fd.append("action", "upload_voice");
       for (let i = 0; i < files.length; i++) {
         fd.append("files", files[i]);
       }
       const res = await fetch("/api/category-library", {
         method: "POST",
+        headers: { "x-session-id": sessionId },
         body: fd,
       });
       const data = await res.json();
@@ -1084,11 +1145,13 @@ export default function LachVidStudioPage() {
     itemId: string,
   ) => {
     const fd = new FormData();
+    fd.append("sessionId", sessionId);
     fd.append("action", "remove_item");
     fd.append("category", cat);
     fd.append("itemId", itemId);
     const res = await fetch("/api/category-library", {
       method: "POST",
+      headers: { "x-session-id": sessionId },
       body: fd,
     });
     const data = await res.json();
@@ -1115,8 +1178,12 @@ export default function LachVidStudioPage() {
     try {
       const res = await fetch("/api/plan-mix", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-id": sessionId,
+        },
         body: JSON.stringify({
+          sessionId,
           categoryPools,
           diversityConfig: {
             targetCount: targetMixCount,
@@ -1207,29 +1274,35 @@ export default function LachVidStudioPage() {
     try {
       const res = await fetch("/api/render-composed", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-id": sessionId,
+        },
         body: JSON.stringify({
           videos: [composed],
           sessionId: `single_${composed.id}`,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi khi render video");
 
-      const file = data.files?.[0];
-      if (file?.url) {
-        const a = document.createElement("a");
-        a.href = file.url;
-        a.download = file.filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-
-        setStatusBanner({
-          type: "success",
-          text: `Đã xuất thành công ${file.filename} (${file.duration}s)!`,
-        });
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || `HTTP ${res.status}`);
       }
+
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = `${composed.name}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+
+      setStatusBanner({
+        type: "success",
+        text: `Đã xuất thành công ${composed.name}.mp4!`,
+      });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setStatusBanner({ type: "error", text: msg });
@@ -1248,28 +1321,35 @@ export default function LachVidStudioPage() {
     try {
       const res = await fetch("/api/render-composed", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-id": sessionId,
+        },
         body: JSON.stringify({
           videos: state.composedVideos,
           sessionId: `batch_${Date.now().toString(36)}`,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi khi render tổ hợp");
 
-      if (data.zip_download_url) {
-        const a = document.createElement("a");
-        a.href = data.zip_download_url;
-        a.download = `lachvid_rendered_${data.session_id}.zip`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-
-        setStatusBanner({
-          type: "success",
-          text: `Đã render thành công toàn bộ ${data.total_rendered} video MP4 chuẩn và tải về ZIP!`,
-        });
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || `HTTP ${res.status}`);
       }
+
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = `lachvid_rendered_${sessionId}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+
+      setStatusBanner({
+        type: "success",
+        text: `Đã render thành công toàn bộ ${state.composedVideos.length} video MP4 chuẩn và tải về ZIP!`,
+      });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setStatusBanner({ type: "error", text: msg });
@@ -1303,29 +1383,39 @@ export default function LachVidStudioPage() {
       if (!picker) throw new Error("showDirectoryPicker không khả dụng");
       const rootDirHandle = await picker({ mode: "readwrite" });
 
-      setBusyMessage(`Đang render ${state.composedVideos.length} video và ghi thẳng vào ổ cứng...`);
+      setBusyMessage(`Đang render ${state.composedVideos.length} video và chuẩn bị ghi vào ổ cứng...`);
 
       const res = await fetch("/api/render-composed", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-id": sessionId,
+        },
         body: JSON.stringify({
           videos: state.composedVideos,
           sessionId: `batch_${Date.now().toString(36)}`,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi khi render tổ hợp");
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || `HTTP ${res.status}`);
+      }
+
+      setBusyMessage("Đang ghi thẳng các file .mp4 vào thư mục máy tính...");
+      const zipBlob = await res.blob();
+      const zip = await JSZip.loadAsync(zipBlob);
 
       let saved = 0;
-      for (const item of data.files || []) {
-        const fileRes = await fetch(item.url);
-        if (!fileRes.ok) continue;
-        const blob = await fileRes.blob();
-        const fileHandle = await rootDirHandle.getFileHandle(item.filename, {
+      for (const [fileName, zipEntry] of Object.entries(zip.files)) {
+        if (zipEntry.dir) continue;
+        const cleanName = fileName.split("/").pop() || fileName;
+        const fileBlob = await zipEntry.async("blob");
+        const fileHandle = await rootDirHandle.getFileHandle(cleanName, {
           create: true,
         });
         const writable = await fileHandle.createWritable();
-        await writable.write(blob);
+        await writable.write(fileBlob);
         await writable.close();
         saved++;
       }
@@ -2578,10 +2668,10 @@ export default function LachVidStudioPage() {
 
                     {/* 9:16 Video Canvas Player with live effects */}
                     <div className="relative aspect-[9/16] max-h-[380px] mx-auto rounded-xl overflow-hidden bg-slate-950 border border-slate-800 flex items-center justify-center shadow-2xl">
-                      {state.sourceVideo?.localUrl ? (
+                      {sourceBlobUrl || state.sourceVideo?.localUrl ? (
                         <video
                           ref={slicerVideoRef}
-                          src={state.sourceVideo.localUrl}
+                          src={sourceBlobUrl || state.sourceVideo?.localUrl}
                           playsInline
                           onTimeUpdate={(e) => {
                             const cur = e.currentTarget.currentTime;

@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readProjectState, writeProjectState } from "@/lib/store";
+import {
+  getSessionIdFromHeaders,
+  readProjectState,
+  sanitizeSessionId,
+  writeProjectState,
+} from "@/lib/store";
 import {
   CATEGORY_ORDER,
   buildComposedVideo,
@@ -17,7 +22,8 @@ import {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
-    const state = readProjectState();
+    const sessionId = sanitizeSessionId(body.sessionId || getSessionIdFromHeaders(req.headers));
+    const state = readProjectState(sessionId);
 
     const pools: CategoryPools = body.categoryPools || state.categoryPools || {
       open: [],
@@ -138,10 +144,11 @@ export async function POST(req: NextRequest) {
 
     state.composedVideos = composedVideos;
     state.diversityConfig = diversityConfig;
-    writeProjectState(state);
+    writeProjectState(state, sessionId);
 
     return NextResponse.json({
       success: true,
+      sessionId,
       totalComposed: composedVideos.length,
       composedVideos,
       warnings: plan.warnings,

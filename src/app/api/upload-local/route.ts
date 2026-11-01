@@ -2,9 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { NextRequest, NextResponse } from "next/server";
 import {
-  ensureDataDirs,
+  cleanupExpiredSessions,
+  clearSessionSourceVideo,
+  ensureSessionDirs,
+  getSessionIdFromHeaders,
   readProjectState,
-  UPLOADS_DIR,
+  sanitizeSessionId,
   writeProjectState,
 } from "@/lib/store";
 import {
@@ -15,13 +18,18 @@ import {
 
 export async function POST(req: NextRequest) {
   try {
-    ensureDataDirs();
+    // Proactively clean up expired sessions
+    cleanupExpiredSessions();
+
     const formData = await req.formData();
     const file = formData.get("file") as File | null;
-    const kind = (formData.get("kind") as string) || "video"; // "video" | "voice"
+    const kind = (formData.get("kind") as string) || "video"; // "video" | "voice" | "source"
     const duration = Number(formData.get("duration") || 38);
     const width = Number(formData.get("width") || 1080);
     const height = Number(formData.get("height") || 1920);
+
+    const formSessionId = formData.get("sessionId") as string | null;
+    const sessionId = sanitizeSessionId(formSessionId || getSessionIdFromHeaders(req.headers));
 
     if (!file) {
       return NextResponse.json(
@@ -30,21 +38,24 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const sessionPaths = ensureSessionDirs(sessionId);
     const safeBase = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
     const uniqueName = `${Date.now()}_${safeBase}`;
-    const destPath = path.join(UPLOADS_DIR, uniqueName);
 
     const arrayBuffer = await file.arrayBuffer();
-    fs.writeFileSync(destPath, Buffer.from(arrayBuffer));
+    const buffer = Buffer.from(arrayBuffer);
 
-    const state = readProjectState();
+    const state = readProjectState(sessionId);
 
     if (kind === "voice") {
+      const destPath = path.join(sessionPaths.voicesDir, uniqueName);
+      fs.writeFileSync(destPath, buffer);
+
       const voiceTrack: VoiceTrack = {
         id: `voice_${Date.now()}`,
         name: file.name.replace(/\.[^.]+$/, ""),
         fileName: uniqueName,
-        localUrl: `/api/media/uploads/${uniqueName}`,
+        localUrl: `/api/media/sessions/${sessionId}/voices/${uniqueName}`,
         localPath: destPath,
         sizeBytes: file.size,
         duration: duration > 0 ? Math.round(duration * 100) / 100 : 15,
@@ -54,15 +65,22 @@ export async function POST(req: NextRequest) {
         createdAt: new Date().toISOString(),
       };
       state.voiceTrack = voiceTrack;
-      writeProjectState(state);
-      return NextResponse.json({ state, voiceTrack });
+      writeProjectState(state, sessionId);
+      return NextResponse.json({ state, voiceTrack, sessionId });
     }
+
+    // Kind is source video
+    // RULE: Only 1 original video is kept in sourceDir at any time. Purge previous ones.
+    clearSessionSourceVideo(sessionId);
+
+    const destPath = path.join(sessionPaths.sourceDir, uniqueName);
+    fs.writeFileSync(destPath, buffer);
 
     const sourceVideo: SourceVideo = {
       id: `src_${Date.now()}`,
       name: file.name.replace(/\.[^.]+$/, ""),
       fileName: uniqueName,
-      localUrl: `/api/media/uploads/${uniqueName}`,
+      localUrl: `/api/media/sessions/${sessionId}/source/${uniqueName}`,
       localPath: destPath,
       sizeBytes: file.size,
       duration: duration > 0 ? Math.round(duration * 100) / 100 : 38,
@@ -81,9 +99,9 @@ export async function POST(req: NextRequest) {
     };
     state.shots = [];
     state.composedVideos = [];
-    writeProjectState(state);
+    writeProjectState(state, sessionId);
 
-    return NextResponse.json({ state, sourceVideo });
+    return NextResponse.json({ state, sourceVideo, sessionId });
   } catch (err) {
     return NextResponse.json(
       {

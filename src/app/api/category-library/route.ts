@@ -2,30 +2,26 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
-import { DATA_DIR, readProjectState, writeProjectState } from "@/lib/store";
+import {
+  cleanupExpiredSessions,
+  clearSessionCategories,
+  ensureSessionDirs,
+  getSessionIdFromHeaders,
+  readProjectState,
+  sanitizeSessionId,
+  writeProjectState,
+} from "@/lib/store";
 import { CategoryPools, CategoryVideoItem, MultiVoiceItem, ShotCategory } from "@/types/lachvid";
-
-const CATEGORIES_DIR = path.join(DATA_DIR, "uploads", "categories");
-const VOICES_DIR = path.join(DATA_DIR, "uploads", "voices");
 
 const VALID_CATS: ShotCategory[] = ["open", "product", "texture", "apply", "end"];
 
-function ensureDirs() {
-  if (!fs.existsSync(CATEGORIES_DIR)) {
-    fs.mkdirSync(CATEGORIES_DIR, { recursive: true });
-  }
-  for (const c of VALID_CATS) {
-    const cDir = path.join(CATEGORIES_DIR, c);
-    if (!fs.existsSync(cDir)) fs.mkdirSync(cDir, { recursive: true });
-  }
-  if (!fs.existsSync(VOICES_DIR)) {
-    fs.mkdirSync(VOICES_DIR, { recursive: true });
-  }
-}
+export async function GET(req: NextRequest) {
+  const url = new URL(req.url);
+  const qSessionId = url.searchParams.get("sessionId");
+  const sessionId = sanitizeSessionId(qSessionId || getSessionIdFromHeaders(req.headers));
 
-export async function GET() {
-  ensureDirs();
-  const state = readProjectState();
+  ensureSessionDirs(sessionId);
+  const state = readProjectState(sessionId);
 
   const pools: CategoryPools = state.categoryPools || {
     open: [],
@@ -36,21 +32,26 @@ export async function GET() {
   };
 
   return NextResponse.json({
+    sessionId,
     categoryPools: pools,
     multiVoiceTracks: state.multiVoiceTracks || [],
   });
 }
 
 export async function POST(req: NextRequest) {
-  ensureDirs();
+  cleanupExpiredSessions();
   const formData = await req.formData().catch(() => null);
 
   if (!formData) {
     return NextResponse.json({ error: "Invalid form data" }, { status: 400 });
   }
 
+  const formSessionId = formData.get("sessionId") as string | null;
+  const sessionId = sanitizeSessionId(formSessionId || getSessionIdFromHeaders(req.headers));
+  const sessionPaths = ensureSessionDirs(sessionId);
+
   const action = (formData.get("action") as string) || "upload";
-  const state = readProjectState();
+  const state = readProjectState(sessionId);
 
   const pools: CategoryPools = state.categoryPools || {
     open: [],
@@ -63,14 +64,21 @@ export async function POST(req: NextRequest) {
   if (action === "clear_category") {
     const category = (formData.get("category") as ShotCategory) || "open";
     if (pools[category]) {
+      // Physically delete files in this category folder
+      const catDir = path.join(sessionPaths.categoriesDir, category);
+      if (fs.existsSync(catDir)) {
+        fs.rmSync(catDir, { recursive: true, force: true });
+        fs.mkdirSync(catDir, { recursive: true });
+      }
       pools[category] = [];
     }
     state.categoryPools = pools;
-    writeProjectState(state);
-    return NextResponse.json({ success: true, categoryPools: pools });
+    writeProjectState(state, sessionId);
+    return NextResponse.json({ success: true, sessionId, categoryPools: pools });
   }
 
   if (action === "clear_all") {
+    clearSessionCategories(sessionId);
     pools.open = [];
     pools.product = [];
     pools.texture = [];
@@ -78,19 +86,32 @@ export async function POST(req: NextRequest) {
     pools.end = [];
     state.categoryPools = pools;
     state.multiVoiceTracks = [];
-    writeProjectState(state);
-    return NextResponse.json({ success: true, categoryPools: pools, multiVoiceTracks: [] });
+    writeProjectState(state, sessionId);
+    return NextResponse.json({
+      success: true,
+      sessionId,
+      categoryPools: pools,
+      multiVoiceTracks: [],
+    });
   }
 
   if (action === "remove_item") {
     const itemId = formData.get("itemId") as string;
     const category = formData.get("category") as ShotCategory;
     if (category && pools[category]) {
+      const targetItem = pools[category].find((i) => i.id === itemId);
+      if (targetItem?.localPath && fs.existsSync(targetItem.localPath)) {
+        try {
+          fs.unlinkSync(targetItem.localPath);
+        } catch {
+          // Ignore
+        }
+      }
       pools[category] = pools[category].filter((i) => i.id !== itemId);
     }
     state.categoryPools = pools;
-    writeProjectState(state);
-    return NextResponse.json({ success: true, categoryPools: pools });
+    writeProjectState(state, sessionId);
+    return NextResponse.json({ success: true, sessionId, categoryPools: pools });
   }
 
   if (action === "upload_voice") {
@@ -105,7 +126,7 @@ export async function POST(req: NextRequest) {
       const ext = path.extname(safeName).toLowerCase() || ".mp3";
       const id = `voice_${crypto.randomBytes(4).toString("hex")}`;
       const savedFileName = `${id}_${safeName}`;
-      const filePath = path.join(VOICES_DIR, savedFileName);
+      const filePath = path.join(sessionPaths.voicesDir, savedFileName);
 
       fs.writeFileSync(filePath, buffer);
 
@@ -113,19 +134,18 @@ export async function POST(req: NextRequest) {
         id,
         name: safeName.replace(ext, ""),
         fileName: savedFileName,
-        localUrl: `/api/media/uploads/voices/${savedFileName}`,
+        localUrl: `/api/media/sessions/${sessionId}/voices/${savedFileName}`,
         localPath: filePath,
         duration: 20, // default placeholder until parsed
       });
     }
 
     state.multiVoiceTracks = newVoices;
-    writeProjectState(state);
-    return NextResponse.json({ success: true, multiVoiceTracks: newVoices });
+    writeProjectState(state, sessionId);
+    return NextResponse.json({ success: true, sessionId, multiVoiceTracks: newVoices });
   }
 
   // Upload category files / folder scan
-  // Files can have relative webkitRelativePath such as "MyFolders/OPEN/clip1.mp4"
   const files = formData.getAll("files") as File[];
   const targetCategory = (formData.get("targetCategory") as string) || "";
 
@@ -134,7 +154,6 @@ export async function POST(req: NextRequest) {
   for (const file of files) {
     if (!file || typeof file === "string" || !file.name) continue;
 
-    // Detect category from folder path if available, or targetCategory, or filename prefix
     let detectedCat: ShotCategory = "product";
     const relativePath = (file as unknown as { webkitRelativePath?: string }).webkitRelativePath || "";
     const lowerRel = relativePath.toLowerCase();
@@ -163,7 +182,9 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    const catDir = path.join(CATEGORIES_DIR, detectedCat);
+    const catDir = path.join(sessionPaths.categoriesDir, detectedCat);
+    if (!fs.existsSync(catDir)) fs.mkdirSync(catDir, { recursive: true });
+
     const savedFileName = `${id}_${safeName}`;
     const filePath = path.join(catDir, savedFileName);
 
@@ -176,7 +197,7 @@ export async function POST(req: NextRequest) {
       name: safeName.replace(ext, ""),
       fileName: savedFileName,
       category: detectedCat,
-      localUrl: `/api/media/uploads/categories/${detectedCat}/${savedFileName}`,
+      localUrl: `/api/media/sessions/${sessionId}/categories/${detectedCat}/${savedFileName}`,
       localPath: filePath,
       duration: 4.0, // default placeholder
       sizeBytes: bytes.byteLength,
@@ -188,10 +209,11 @@ export async function POST(req: NextRequest) {
   }
 
   state.categoryPools = pools;
-  writeProjectState(state);
+  writeProjectState(state, sessionId);
 
   return NextResponse.json({
     success: true,
+    sessionId,
     addedCount: addedItems.length,
     categoryPools: pools,
   });

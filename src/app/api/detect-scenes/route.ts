@@ -1,6 +1,11 @@
 import fs from "node:fs";
 import { NextRequest, NextResponse } from "next/server";
-import { readProjectState, writeProjectState } from "@/lib/store";
+import {
+  getSessionIdFromHeaders,
+  readProjectState,
+  sanitizeSessionId,
+  writeProjectState,
+} from "@/lib/store";
 import {
   CategoryMinDurations,
   computeShotSpeedForMinDuration,
@@ -27,14 +32,16 @@ type int = number;
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
+    const sessionId = sanitizeSessionId(body.sessionId || getSessionIdFromHeaders(req.headers));
+
     const detector = body.detector || "content"; // "content" | "adaptive"
     const threshold = Number(body.threshold || 27.0);
     const minSceneLen = Number(body.minSceneLen || 0.8);
 
-    const state = readProjectState();
+    const state = readProjectState(sessionId);
     if (!state.sourceVideo) {
       return NextResponse.json(
-        { error: "Chưa có source video để phân tích." },
+        { error: "Chưa có source video để phân tích (hoặc phiên làm việc đã hết hạn)." },
         { status: 400 }
       );
     }
@@ -48,8 +55,7 @@ export async function POST(req: NextRequest) {
 
     let scenes: PythonSceneItem[] = [];
 
-    // Cách 1: Nếu file local tồn tại (môi trường Local hoặc VPS), gọi endpoint /detect-local
-    // để Python đọc trực tiếp từ đĩa với tốc độ siêu nhanh (không tốn băng thông)
+    // Cách 1: Nếu file local tồn tại (cùng máy chủ hoặc chung volume), gọi /detect-local
     if (state.sourceVideo.localPath && fs.existsSync(state.sourceVideo.localPath)) {
       try {
         const pyRes = await fetch(`${PYTHON_BACKEND_URL}/detect-local`, {
@@ -71,7 +77,7 @@ export async function POST(req: NextRequest) {
           throw new Error(errData.detail || `Python backend HTTP ${pyRes.status}`);
         }
       } catch {
-        // Fallback sang Cách 2 nếu /detect-local không khả dụng (ví dụ khi deploy Cloud A)
+        // Fallback sang /detect-upload nếu chạy khác máy chủ
         scenes = await uploadAndDetectRemote(
           state.sourceVideo.localPath,
           state.sourceVideo.fileName,
@@ -82,7 +88,7 @@ export async function POST(req: NextRequest) {
       }
     } else {
       return NextResponse.json(
-        { error: "Không tìm thấy file video trên hệ thống." },
+        { error: "Không tìm thấy file video trên hệ thống (phiên có thể đã bị dọn dẹp sau 30 phút)." },
         { status: 404 }
       );
     }
@@ -95,7 +101,6 @@ export async function POST(req: NextRequest) {
     }
 
     // Gom các phân cảnh nhỏ của PySceneDetect thành các Shot chuẩn theo Số Giây Tối Thiểu (Min Giây) của 5 Category.
-    // Nếu một phân cảnh sau khi gom vẫn ngắn hơn minDuration, tự động áp dụng Slow-motion để đảm bảo đủ số giây tối thiểu.
     const totalVideoDur = scenes[scenes.length - 1].end_seconds;
     let slowMoCount = 0;
 
@@ -204,11 +209,13 @@ export async function POST(req: NextRequest) {
 
     state.shots = generatedShots;
     state.composedVideos = [];
-    writeProjectState(state);
+    writeProjectState(state, sessionId);
 
     return NextResponse.json({
       success: true,
+      sessionId,
       totalScenes: scenes.length,
+      totalDetected: generatedShots.length,
       slowMoCount,
       shots: generatedShots,
       state,

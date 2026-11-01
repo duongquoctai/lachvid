@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { NextRequest, NextResponse } from "next/server";
-import { DATA_DIR } from "@/lib/store";
+import {
+  BASE_SESSIONS_DIR,
+  DATA_DIR,
+  touchSession,
+} from "@/lib/store";
 
 export async function GET(
   req: NextRequest,
@@ -12,18 +16,36 @@ export async function GET(
     return NextResponse.json({ error: "Missing path" }, { status: 400 });
   }
 
-  // Prevent directory traversal
-  let filePath = path.resolve(DATA_DIR, ...segments);
+  let filePath = "";
 
-  // Fallback: If not found and segments start with "slices", check DATA_DIR/outputs/slices/...
-  if (!fs.existsSync(filePath) && segments[0] === "slices") {
-    const fallbackPath = path.resolve(DATA_DIR, "outputs", ...segments);
-    if (fs.existsSync(fallbackPath)) {
-      filePath = fallbackPath;
+  // Check if first segment is "sessions" (e.g. /api/media/sessions/{sessionId}/...)
+  if (segments[0] === "sessions") {
+    filePath = path.resolve(BASE_SESSIONS_DIR, ...segments.slice(1));
+    if (segments[1]) {
+      touchSession(segments[1]);
+    }
+  } else {
+    // Try in BASE_SESSIONS_DIR first if it matches
+    const testSessionPath = path.resolve(BASE_SESSIONS_DIR, ...segments);
+    if (fs.existsSync(testSessionPath)) {
+      filePath = testSessionPath;
+    } else {
+      // Fallback to legacy DATA_DIR
+      filePath = path.resolve(DATA_DIR, ...segments);
+      if (!fs.existsSync(filePath) && segments[0] === "slices") {
+        const fallbackPath = path.resolve(DATA_DIR, "outputs", ...segments);
+        if (fs.existsSync(fallbackPath)) {
+          filePath = fallbackPath;
+        }
+      }
     }
   }
 
-  if (!filePath.startsWith(DATA_DIR) || !fs.existsSync(filePath)) {
+  // Security check: must reside inside BASE_SESSIONS_DIR or DATA_DIR
+  const inSessions = filePath.startsWith(BASE_SESSIONS_DIR);
+  const inData = filePath.startsWith(DATA_DIR);
+
+  if ((!inSessions && !inData) || !fs.existsSync(filePath)) {
     return NextResponse.json({ error: "File not found" }, { status: 404 });
   }
 
