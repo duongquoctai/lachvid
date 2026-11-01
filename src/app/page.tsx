@@ -19,6 +19,7 @@ import {
   ProjectState,
   ResolvedShotSlot,
   Shot,
+  ShotEdits,
   SHOT_CATEGORIES,
   ShotCategory,
   VoiceTrack,
@@ -28,11 +29,17 @@ import PreviewPlayer916 from "@/components/PreviewPlayer916";
 import IPhoneVideoTrimmer from "@/components/IPhoneVideoTrimmer";
 import {
   AlertTriangle,
+  ArrowLeft,
   ArrowRight,
   CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
   Clock,
   Code2,
   Download,
+  Edit3,
   Film,
   FlipHorizontal,
   FolderDown,
@@ -79,6 +86,8 @@ export default function LachVidStudioPage() {
     "content",
   );
   const [isSlicing, setIsSlicing] = useState<boolean>(false);
+  const [splitEditingCategory, setSplitEditingCategory] = useState<ShotCategory | null>("open");
+  const [accordionShotId, setAccordionShotId] = useState<string | null>(null);
 
   // Tab 2 (Mixer) states
   const [categoryPools, setCategoryPools] = useState<CategoryPools>({
@@ -225,6 +234,55 @@ export default function LachVidStudioPage() {
     return state.shots.find((s) => s.id === selectedShotId) || null;
   }, [state, selectedShotId]);
 
+  const splitCatShots = useMemo(() => {
+    if (!state || !splitEditingCategory) return [];
+    return state.shots.filter((s) => s.category === splitEditingCategory);
+  }, [state, splitEditingCategory]);
+
+  const accordionShot = useMemo(() => {
+    if (!state || !accordionShotId) return null;
+    return state.shots.find((s) => s.id === accordionShotId) || null;
+  }, [state, accordionShotId]);
+
+  const splitShotTrimInfo = useMemo(() => {
+    if (!accordionShot) return null;
+    const cat = accordionShot.category || "product";
+    const baseStart = accordionShot.rawBegin ?? accordionShot.begin;
+    const baseEnd = accordionShot.rawEnd ?? accordionShot.end;
+    const rawDuration = Math.max(0.2, baseEnd - baseStart);
+    const trimBegin = Math.max(
+      0,
+      Math.min(rawDuration - 0.2, accordionShot.begin - baseStart),
+    );
+    const trimEnd = Math.max(
+      trimBegin + 0.2,
+      Math.min(rawDuration, accordionShot.end - baseStart),
+    );
+    const cutDur = accordionShot.end - accordionShot.begin;
+    const speed = accordionShot.edits.speed || 1.0;
+    const effectiveDur = cutDur / speed;
+    const minDur = categoryMinDurations[cat] ?? 3.0;
+    return {
+      baseStart,
+      baseEnd,
+      rawDuration,
+      trimBegin,
+      trimEnd,
+      cutDur,
+      speed,
+      effectiveDur,
+      minDur,
+    };
+  }, [accordionShot, categoryMinDurations]);
+
+  const handleSelectSplitShot = (shot: Shot) => {
+    setSelectedShotId(shot.id);
+    if (slicerVideoRef.current) {
+      slicerVideoRef.current.currentTime = shot.begin;
+    }
+    setSlicerTime(shot.begin);
+  };
+
   const selectedComposed = useMemo(() => {
     if (!state || state.composedVideos.length === 0) return null;
     return (
@@ -258,12 +316,54 @@ export default function LachVidStudioPage() {
 
   const handleUploadSingleSource = async (file: File) => {
     if (!file) return;
+
+    if (
+      file.size > 95 * 1024 * 1024 &&
+      typeof window !== "undefined" &&
+      window.location.hostname.includes("trycloudflare.com")
+    ) {
+      setStatusBanner({
+        type: "error",
+        text: `File "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB) vượt quá giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy chọn video dưới 95 MB hoặc nén trước khi tải lên.`,
+      });
+      return;
+    }
+
     setBusyMessage(`Đang tải lên video ${file.name}...`);
     setStatusBanner(null);
     try {
+      let duration = 0;
+      let width = 1080;
+      let height = 1920;
+      try {
+        const videoEl = document.createElement("video");
+        videoEl.preload = "metadata";
+        const blobUrl = URL.createObjectURL(file);
+        videoEl.src = blobUrl;
+        await new Promise<void>((resolve) => {
+          videoEl.onloadedmetadata = () => {
+            duration = videoEl.duration || 0;
+            width = videoEl.videoWidth || 1080;
+            height = videoEl.videoHeight || 1920;
+            URL.revokeObjectURL(blobUrl);
+            resolve();
+          };
+          videoEl.onerror = () => {
+            URL.revokeObjectURL(blobUrl);
+            resolve();
+          };
+          setTimeout(resolve, 2000);
+        });
+      } catch {
+        // fallback
+      }
+
       const fd = new FormData();
       fd.append("file", file);
       fd.append("kind", "source");
+      if (duration > 0) fd.append("duration", String(duration));
+      if (width > 0) fd.append("width", String(width));
+      if (height > 0) fd.append("height", String(height));
 
       const res = await fetch("/api/upload-local", {
         method: "POST",
@@ -379,69 +479,83 @@ export default function LachVidStudioPage() {
   };
 
   // Split shot at current playhead or midpoint
-  const handleSplitAtTime = (targetSec: number) => {
-    if (!state) return;
-    const shotToSplit =
-      state.shots.find(
-        (s) => targetSec > s.begin + 0.3 && targetSec < s.end - 0.3,
-      ) || selectedShot;
+  const handleSplitAtTime = useCallback(
+    (targetSec: number) => {
+      if (!state) return;
+      const shotToSplit =
+        state.shots.find(
+          (s) => targetSec > s.begin + 0.3 && targetSec < s.end - 0.3,
+        ) || selectedShot;
 
-    if (!shotToSplit) {
-      setStatusBanner({
-        type: "error",
-        text: "Hãy chọn 1 shot hoặc di chuyển thanh thời gian vào giữa đoạn cần tách.",
-      });
-      return;
-    }
-
-    const cutPoint =
-      targetSec > shotToSplit.begin + 0.3 && targetSec < shotToSplit.end - 0.3
-        ? Math.round(targetSec * 10) / 10
-        : Math.round(((shotToSplit.begin + shotToSplit.end) / 2) * 10) / 10;
-
-    if (
-      cutPoint <= shotToSplit.begin + 0.2 ||
-      cutPoint >= shotToSplit.end - 0.2
-    ) {
-      return;
-    }
-
-    const firstHalf = applyMinDurationToShot(
-      {
-        ...shotToSplit,
-        end: cutPoint,
-        label: `${shotToSplit.label} (P1)`,
-      },
-      categoryMinDurations,
-    );
-    const secondHalf = applyMinDurationToShot(
-      {
-        ...shotToSplit,
-        id: `shot_${Date.now()}`,
-        begin: cutPoint,
-        end: shotToSplit.end,
-        label: `${shotToSplit.label} (P2)`,
-        edits: { ...shotToSplit.edits },
-      },
-      categoryMinDurations,
-    );
-
-    const nextShots: Shot[] = [];
-    for (const s of state.shots) {
-      if (s.id === shotToSplit.id) {
-        nextShots.push(firstHalf, secondHalf);
-      } else {
-        nextShots.push(s);
+      if (!shotToSplit) {
+        setStatusBanner({
+          type: "error",
+          text: "Hãy chọn 1 shot hoặc di chuyển thanh thời gian vào giữa đoạn cần tách.",
+        });
+        return;
       }
-    }
 
-    persistState({ ...state, shots: nextShots });
-    setSelectedShotId(secondHalf.id);
-    setStatusBanner({
-      type: "success",
-      text: `Đã tách đôi shot tại mốc ${cutPoint}s!`,
-    });
-  };
+      const cutPoint =
+        targetSec > shotToSplit.begin + 0.2 && targetSec < shotToSplit.end - 0.2
+          ? Math.round(targetSec * 10) / 10
+          : Math.round(((shotToSplit.begin + shotToSplit.end) / 2) * 10) / 10;
+
+      if (
+        cutPoint <= shotToSplit.begin + 0.2 ||
+        cutPoint >= shotToSplit.end - 0.2
+      ) {
+        return;
+      }
+
+      const firstHalf = applyMinDurationToShot(
+        {
+          ...shotToSplit,
+          end: cutPoint,
+          rawBegin: shotToSplit.rawBegin ?? shotToSplit.begin,
+          rawEnd: cutPoint,
+          label: `${shotToSplit.label} (P1)`,
+        },
+        categoryMinDurations,
+      );
+      const secondHalf = applyMinDurationToShot(
+        {
+          ...shotToSplit,
+          id: `shot_${Date.now()}`,
+          begin: cutPoint,
+          end: shotToSplit.end,
+          rawBegin: cutPoint,
+          rawEnd: shotToSplit.rawEnd ?? shotToSplit.end,
+          label: `${shotToSplit.label} (P2)`,
+          edits: { ...shotToSplit.edits },
+        },
+        categoryMinDurations,
+      );
+
+      const nextShots: Shot[] = [];
+      for (const s of state.shots) {
+        if (s.id === shotToSplit.id) {
+          nextShots.push(firstHalf, secondHalf);
+        } else {
+          nextShots.push(s);
+        }
+      }
+
+      persistState({ ...state, shots: nextShots });
+      setSelectedShotId(secondHalf.id);
+      setStatusBanner({
+        type: "success",
+        text: `Đã tách đôi shot tại mốc ${cutPoint}s!`,
+      });
+    },
+    [
+      state,
+      selectedShot,
+      categoryMinDurations,
+      applyMinDurationToShot,
+      persistState,
+      setStatusBanner,
+    ],
+  );
 
   // Merge shot with next shot
   const handleMergeWithNext = (shotId: string) => {
@@ -462,6 +576,8 @@ export default function LachVidStudioPage() {
       {
         ...currentShot,
         end: nextShot.end,
+        rawBegin: currentShot.rawBegin ?? currentShot.begin,
+        rawEnd: nextShot.rawEnd ?? nextShot.end,
         label: `${currentShot.label} + ${nextShot.label}`,
       },
       categoryMinDurations,
@@ -478,6 +594,48 @@ export default function LachVidStudioPage() {
         mergedShot.end - mergedShot.begin
       ).toFixed(1)}s!`,
     });
+  };
+
+  // Trim shot relative to its detected scene start/end (like Khâu 2)
+  const handleUpdateShotTrim = (
+    shotId: string,
+    trimBeginOffset: number,
+    trimEndOffset: number,
+  ) => {
+    if (!state) return;
+    const nextShots = state.shots.map((s) => {
+      if (s.id !== shotId) return s;
+      const baseStart = s.rawBegin ?? s.begin;
+      const baseEnd = s.rawEnd ?? s.end;
+      const newBegin = Math.round((baseStart + trimBeginOffset) * 10) / 10;
+      const newEnd = Math.round((baseStart + trimEndOffset) * 10) / 10;
+      return {
+        ...s,
+        rawBegin: baseStart,
+        rawEnd: baseEnd,
+        begin: Math.min(newBegin, newEnd - 0.2),
+        end: Math.max(newEnd, newBegin + 0.2),
+      };
+    });
+    persistState({ ...state, shots: nextShots });
+  };
+
+  const handleUpdateShotEdits = (
+    shotId: string,
+    edits: Partial<ShotEdits>,
+  ) => {
+    if (!state) return;
+    const nextShots = state.shots.map((s) => {
+      if (s.id !== shotId) return s;
+      return {
+        ...s,
+        edits: {
+          ...s.edits,
+          ...edits,
+        },
+      };
+    });
+    persistState({ ...state, shots: nextShots });
   };
 
   // Direct begin/end editing with step 0.1s
@@ -547,17 +705,17 @@ export default function LachVidStudioPage() {
     persistState({ ...state, shots: nextShots });
   };
 
-  const keyActionsRef = useRef({
-    handleCategoryChange,
-    handleSplitAtTime,
-    handleToggleFlipH,
-    handleToggleLockFlipH,
-    handleStopSlicer,
-    handlePlayActiveShot,
-    selectedShotId,
-    slicerTime,
-    isPlayingSlicer,
-  });
+  const keyActionsRef = useRef<{
+    handleCategoryChange: (shotId: string, newCat: ShotCategory) => void;
+    handleSplitAtTime: (targetSec: number) => void;
+    handleToggleFlipH: (shotId: string) => void;
+    handleToggleLockFlipH: (shotId: string) => void;
+    handleStopSlicer: () => void;
+    handlePlayActiveShot: (shot?: Shot | null) => void;
+    selectedShotId: string | null;
+    slicerTime: number;
+    isPlayingSlicer: boolean;
+  } | null>(null);
 
   useEffect(() => {
     keyActionsRef.current = {
@@ -587,6 +745,7 @@ export default function LachVidStudioPage() {
       }
 
       const actions = keyActionsRef.current;
+      if (!actions) return;
 
       if (e.key >= "1" && e.key <= "5") {
         const catMap: Record<string, ShotCategory> = {
@@ -790,6 +949,21 @@ export default function LachVidStudioPage() {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
+    let totalBytes = 0;
+    for (let i = 0; i < files.length; i++) totalBytes += files[i].size;
+    if (
+      totalBytes > 95 * 1024 * 1024 &&
+      typeof window !== "undefined" &&
+      window.location.hostname.includes("trycloudflare.com")
+    ) {
+      setStatusBanner({
+        type: "error",
+        text: `Tổng dung lượng thư mục (${(totalBytes / 1024 / 1024).toFixed(1)} MB) vượt giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy chia nhỏ hoặc nạp từng cột.`,
+      });
+      if (masterFolderInputRef.current) masterFolderInputRef.current.value = "";
+      return;
+    }
+
     setBusyMessage(`Đang phân loại và nạp ${files.length} file từ thư mục...`);
     setStatusBanner(null);
     try {
@@ -807,7 +981,7 @@ export default function LachVidStudioPage() {
       setCategoryPools(data.categoryPools);
       setStatusBanner({
         type: "success",
-        text: `Đã nạp thành công ${data.addedCount} video vào 5 Category!`,
+        text: `Đã nạp thành công ${data.addedCount} video vào 5 category!`,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -824,6 +998,24 @@ export default function LachVidStudioPage() {
     files: FileList | null,
   ) => {
     if (!files || files.length === 0) return;
+
+    let totalBytes = 0;
+    for (let i = 0; i < files.length; i++) totalBytes += files[i].size;
+    if (
+      totalBytes > 95 * 1024 * 1024 &&
+      typeof window !== "undefined" &&
+      window.location.hostname.includes("trycloudflare.com")
+    ) {
+      setStatusBanner({
+        type: "error",
+        text: `Tổng dung lượng file (${(totalBytes / 1024 / 1024).toFixed(1)} MB) vượt giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy tải từng file nhỏ hơn.`,
+      });
+      if (categoryInputRefs.current[category]) {
+        categoryInputRefs.current[category]!.value = "";
+      }
+      return;
+    }
+
     setBusyMessage(
       `Đang nạp ${files.length} video vào ${category.toUpperCase()}...`,
     );
@@ -1299,6 +1491,7 @@ export default function LachVidStudioPage() {
         className="hidden"
         onChange={(e) => {
           if (e.target.files?.[0]) handleUploadSingleSource(e.target.files[0]);
+          e.target.value = "";
         }}
       />
       <input
@@ -1364,6 +1557,17 @@ export default function LachVidStudioPage() {
                 {!state?.sourceVideo ? (
                   <div
                     onClick={() => singleVideoInputRef.current?.click()}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (e.dataTransfer.files?.[0]) {
+                        handleUploadSingleSource(e.dataTransfer.files[0]);
+                      }
+                    }}
                     className="border-2 border-dashed border-slate-700 hover:border-rose-500 rounded-2xl p-6 flex flex-col items-center justify-center text-center cursor-pointer transition bg-slate-950/40 hover:bg-slate-950/70"
                   >
                     <Upload className="w-7 h-7 text-rose-400 mb-2 animate-bounce" />
@@ -1375,24 +1579,33 @@ export default function LachVidStudioPage() {
                     </p>
                   </div>
                 ) : (
-                  <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5 text-xs">
+                  <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2 text-xs">
                     <div className="flex items-center justify-between">
-                      <span className="font-bold truncate text-white">
+                      <span className="font-bold truncate text-white max-w-[200px]">
                         {state.sourceVideo.name}
                       </span>
                       <span className="font-mono text-emerald-400">
                         {state.sourceVideo.duration.toFixed(1)}s
                       </span>
                     </div>
-                    <div className="flex items-center gap-2 text-[11px] text-slate-400">
-                      <span>
-                        {(state.sourceVideo.sizeBytes / 1024 / 1024).toFixed(1)}{" "}
-                        MB
-                      </span>
-                      <span>•</span>
-                      <span>
-                        {state.sourceVideo.width}x{state.sourceVideo.height}
-                      </span>
+                    <div className="flex items-center justify-between text-[11px] text-slate-400">
+                      <div className="flex items-center gap-2">
+                        <span>
+                          {(state.sourceVideo.sizeBytes / 1024 / 1024).toFixed(1)}{" "}
+                          MB
+                        </span>
+                        <span>•</span>
+                        <span>
+                          {state.sourceVideo.width}x{state.sourceVideo.height}
+                        </span>
+                      </div>
+                      <button
+                        onClick={() => singleVideoInputRef.current?.click()}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/30 text-[11px] text-rose-300 transition"
+                      >
+                        <Upload className="w-3 h-3" />
+                        <span>Đổi video khác</span>
+                      </button>
                     </div>
                   </div>
                 )}
@@ -1551,140 +1764,936 @@ export default function LachVidStudioPage() {
               </div>
             )}
 
-            {/* FULL SLICER STUDIO 2-COLUMN WORKSPACE */}
+            {/* FULL SLICER STUDIO WORKSPACE (GRID + 100% WIDTH EXPORT CARD) */}
             {state?.shots && state.shots.length > 0 && (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+              <div className="space-y-5">
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
                 {/* ======================================================== */}
-                {/* LEFT COLUMN (5/12): VIDEO MONITOR 9:16 + TIMELINE RIBBON */}
+                {/* LEFT COLUMN (7/12): 5 CATEGORY CARDS + INLINE INSPECTOR */}
                 {/* ======================================================== */}
-                <div className="lg:col-span-5 bg-slate-900/70 border border-slate-800 rounded-2xl p-4 space-y-4">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                      Màn hình duyệt cảnh (Source video monitor)
-                    </h3>
-                    <span className="text-xs font-mono text-rose-400">
-                      {slicerTime.toFixed(1)}s /{" "}
-                      {(state.sourceVideo?.duration || 0).toFixed(1)}s
-                    </span>
-                  </div>
-
-                  {/* 9:16 Video Canvas Player with live effects */}
-                  <div className="relative aspect-[9/16] max-h-[380px] mx-auto rounded-xl overflow-hidden bg-slate-950 border border-slate-800 flex items-center justify-center shadow-2xl">
-                    {state.sourceVideo?.localUrl ? (
-                      <video
-                        ref={slicerVideoRef}
-                        src={state.sourceVideo.localUrl}
-                        playsInline
-                        onTimeUpdate={(e) => {
-                          const cur = e.currentTarget.currentTime;
-                          setSlicerTime(cur);
-
-                          // If playing active shot only, stop or loop at shot.end
-                          if (playingShotOnly && selectedShot) {
-                            if (cur >= selectedShot.end) {
-                              e.currentTarget.pause();
-                              setIsPlayingSlicer(false);
-                              setPlayingShotOnly(false);
-                            }
-                          }
-                        }}
-                        onEnded={() => {
-                          setIsPlayingSlicer(false);
-                          setPlayingShotOnly(false);
-                        }}
-                        className="w-full h-full object-contain"
-                        style={{
-                          transform: selectedShot?.edits.flipH
-                            ? "scaleX(-1)"
-                            : undefined,
-                        }}
-                      />
-                    ) : (
-                      <div className="p-6 text-center text-xs text-slate-500">
-                        Chưa nạp video
+                <div className="lg:col-span-7 space-y-4">
+                  {/* 5 Category Cards Header & Action */}
+                  <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Layers className="w-4 h-4 text-purple-400" />
+                        <h3 className="text-sm font-bold text-white">
+                          Kho video theo 5 category (đã tách từ video gốc)
+                        </h3>
                       </div>
-                    )}
-
-                    {/* Active Shot Badge Overlay */}
-                    {selectedShot && (
-                      <div className="absolute top-2 left-2 z-10 px-2.5 py-0.5 rounded-full text-[10px] font-bold border bg-black/60 backdrop-blur-sm text-white border-white/20">
-                        Đang chọn: {selectedShot.label} (
-                        {selectedShot.category?.toUpperCase()})
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Playback Controls Bar */}
-                  <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800">
-                    <div className="flex items-center gap-1.5">
-                      {isPlayingSlicer ? (
-                        <button
-                          onClick={handleStopSlicer}
-                          className="px-3 py-1.5 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/40 text-xs font-bold flex items-center gap-1 hover:bg-amber-500/30"
-                        >
-                          <Pause className="w-3.5 h-3.5" />
-                          <span>Tạm dừng</span>
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() => handlePlayActiveShot()}
-                          className="px-3.5 py-1.5 rounded-lg bg-rose-500 hover:bg-rose-600 text-white text-xs font-bold flex items-center gap-1.5 shadow-md shadow-rose-500/20"
-                        >
-                          <Play className="w-3.5 h-3.5" />
-                          <span>Xem riêng</span>
-                        </button>
-                      )}
                       <button
                         onClick={() => {
-                          if (slicerVideoRef.current && selectedShot) {
-                            slicerVideoRef.current.currentTime =
-                              selectedShot.begin;
-                            setSlicerTime(selectedShot.begin);
-                          }
+                          const lastEnd =
+                            state.shots[state.shots.length - 1]?.end || 0;
+                          const maxDur = state.sourceVideo?.duration || 30;
+                          const newBegin =
+                            lastEnd < maxDur - 1
+                              ? lastEnd
+                              : Math.max(0, maxDur - 4);
+                          const newEnd =
+                            Math.round(Math.min(maxDur, newBegin + 4) * 10) /
+                            10;
+                          const catToAssign =
+                            splitEditingCategory || "product";
+                          const newShot: Shot = {
+                            id: `shot_${Date.now()}`,
+                            sourceVideoId: state.sourceVideo?.id || "src_vid",
+                            label: `Cảnh #${state.shots.length + 1}`,
+                            begin: Math.round(newBegin * 10) / 10,
+                            end: newEnd,
+                            rawBegin: Math.round(newBegin * 10) / 10,
+                            rawEnd: newEnd,
+                            category: catToAssign,
+                            edits: {
+                              flipH: false,
+                              lockFlipH: false,
+                              speed: 1,
+                              zoom: false,
+                            },
+                          };
+                          persistState({
+                            ...state,
+                            shots: [...state.shots, newShot],
+                          });
+                          handleSelectSplitShot(newShot);
+                          setSplitEditingCategory(catToAssign);
+                          setAccordionShotId(newShot.id);
                         }}
-                        className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300"
-                        title="Về đầu cảnh"
+                        className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition"
                       >
-                        Đầu cảnh
-                      </button>
-                      <button
-                        onClick={() => {
-                          if (slicerVideoRef.current && selectedShot) {
-                            slicerVideoRef.current.currentTime =
-                              selectedShot.end;
-                            setSlicerTime(selectedShot.end);
-                          }
-                        }}
-                        className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300"
-                        title="Về cuối cảnh"
-                      >
-                        Cuối cảnh
+                        <Plus className="w-3.5 h-3.5 text-purple-400" />
+                        <span>+ Thêm shot thủ công</span>
                       </button>
                     </div>
 
-                    <div className="flex items-center gap-1">
-                      <button
-                        onClick={() => handleSplitAtTime(slicerTime)}
-                        className="px-2.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 text-xs font-semibold flex items-center gap-1"
-                        title="Tách đôi shot tại con trỏ (phím S)"
-                      >
-                        <Scissors className="w-3 h-3" />
-                        <span>Tách (S)</span>
-                      </button>
-                      {selectedShotId && (
-                        <button
-                          onClick={() => handleMergeWithNext(selectedShotId)}
-                          className="px-2.5 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40 text-xs font-semibold"
-                          title="Gộp với shot kế tiếp"
-                        >
-                          Gộp sau
-                        </button>
+                    {/* 5 Slots Badges / Category Cards */}
+                    <div className="grid grid-cols-5 gap-1.5">
+                      {SHOT_CATEGORIES.map((cat) => {
+                        const catShots = state.shots.filter(
+                          (s) => s.category === cat.id,
+                        );
+                        const isCatActive = splitEditingCategory === cat.id;
+                        const minDur = categoryMinDurations[cat.id] ?? 3.0;
+                        const totalDur = catShots.reduce(
+                          (acc, s) =>
+                            acc +
+                            (s.end - s.begin) / (s.edits.speed || 1),
+                          0,
+                        );
+
+                        return (
+                          <button
+                            key={cat.id}
+                            type="button"
+                            onClick={() => {
+                              if (isCatActive) {
+                                setSplitEditingCategory(null);
+                                setAccordionShotId(null);
+                              } else {
+                                setSplitEditingCategory(cat.id);
+                                setAccordionShotId(null);
+                                const currentCatShots = state.shots.filter(
+                                  (s) => s.category === cat.id,
+                                );
+                                if (currentCatShots.length > 0) {
+                                  handleSelectSplitShot(currentCatShots[0]);
+                                }
+                              }
+                            }}
+                            className={`p-2 rounded-xl text-left border text-[10px] transition cursor-pointer flex flex-col justify-between ${
+                              isCatActive
+                                ? "bg-purple-950/70 border-purple-500 ring-2 ring-purple-500/50 shadow-md shadow-purple-500/20"
+                                : "bg-slate-950/80 border-slate-800 hover:border-slate-700"
+                            }`}
+                          >
+                            <div>
+                              <div className="font-bold text-slate-200 uppercase flex items-center justify-between">
+                                <span
+                                  className={
+                                    isCatActive
+                                      ? "text-purple-300 font-extrabold"
+                                      : ""
+                                  }
+                                >
+                                  {cat.id}
+                                </span>
+                                <span className={`font-mono font-bold ${isCatActive ? "text-purple-300" : "text-slate-300"}`}>
+                                  {catShots.length > 0
+                                    ? `${totalDur.toFixed(1)}s`
+                                    : "0s"}
+                                </span>
+                              </div>
+                              <div className="text-slate-400 truncate mt-1 text-[9px] font-medium">
+                                {catShots.length > 0
+                                  ? `${catShots.length} cảnh`
+                                  : "Chưa có"}
+                              </div>
+                            </div>
+                            <div className="font-mono text-[9px] text-slate-500 mt-1.5 pt-1 border-t border-slate-800/80 flex items-center justify-between">
+                              <span>≥ {minDur}s</span>
+                              <span
+                                className={
+                                  catShots.length > 0
+                                    ? "text-emerald-400 font-bold"
+                                    : "text-slate-600"
+                                }
+                              >
+                                {catShots.length > 0 ? "✓ Sẵn sàng" : "Trống"}
+                              </span>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Inline Scene Inspector / Accordion View */}
+                    {splitEditingCategory && (
+                      <div className="mt-3 p-3.5 rounded-xl bg-slate-900 border border-slate-800 space-y-3 animate-in fade-in duration-200">
+                        {splitCatShots.length === 0 ? (
+                          /* EMPTY STATE */
+                          <div className="py-6 text-center space-y-2">
+                            <p className="text-xs text-slate-400">
+                              Chưa có cảnh nào được gán cho nhóm{" "}
+                              <span className="text-purple-400 font-bold uppercase">
+                                {splitEditingCategory}
+                              </span>
+                              .
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const maxDur =
+                                  state.sourceVideo?.duration || 30;
+                                const newShot: Shot = {
+                                  id: `shot_${Date.now()}`,
+                                  sourceVideoId:
+                                    state.sourceVideo?.id || "src_vid",
+                                  label: `Cảnh ${splitEditingCategory.toUpperCase()}`,
+                                  begin: 0,
+                                  end: Math.min(
+                                    maxDur,
+                                    categoryMinDurations[
+                                      splitEditingCategory
+                                    ] || 4,
+                                  ),
+                                  rawBegin: 0,
+                                  rawEnd: Math.min(
+                                    maxDur,
+                                    categoryMinDurations[
+                                      splitEditingCategory
+                                    ] || 4,
+                                  ),
+                                  category: splitEditingCategory,
+                                  edits: {
+                                    flipH: false,
+                                    lockFlipH: false,
+                                    speed: 1,
+                                    zoom: false,
+                                  },
+                                };
+                                persistState({
+                                  ...state,
+                                  shots: [...state.shots, newShot],
+                                });
+                                handleSelectSplitShot(newShot);
+                                setAccordionShotId(newShot.id);
+                              }}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold shadow-md"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                              <span>
+                                + Tạo cảnh mới cho {splitEditingCategory}
+                              </span>
+                            </button>
+                          </div>
+                        ) : (
+                          /* LIST OF SHOT CARDS WITH ACCORDIONS */
+                          <div className="space-y-3">
+                            {/* List Header Bar */}
+                            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-bold text-purple-300 uppercase px-2 py-0.5 rounded-md bg-purple-500/20 border border-purple-500/30">
+                                  Nhóm {splitEditingCategory}
+                                </span>
+                                <span className="text-xs text-slate-300 font-semibold">
+                                  Danh sách {splitCatShots.length} cảnh
+                                </span>
+                              </div>
+
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const lastEnd =
+                                      state.shots[state.shots.length - 1]
+                                        ?.end || 0;
+                                    const maxDur =
+                                      state.sourceVideo?.duration || 30;
+                                    const newBegin =
+                                      lastEnd < maxDur - 1
+                                        ? lastEnd
+                                        : Math.max(0, maxDur - 4);
+                                    const newEnd =
+                                      Math.round(
+                                        Math.min(maxDur, newBegin + 4) * 10,
+                                      ) / 10;
+                                    const newShot: Shot = {
+                                      id: `shot_${Date.now()}`,
+                                      sourceVideoId:
+                                        state.sourceVideo?.id || "src_vid",
+                                      label: `Cảnh ${splitEditingCategory.toUpperCase()} #${splitCatShots.length + 1}`,
+                                      begin: Math.round(newBegin * 10) / 10,
+                                      end: newEnd,
+                                      rawBegin: Math.round(newBegin * 10) / 10,
+                                      rawEnd: newEnd,
+                                      category: splitEditingCategory,
+                                      edits: {
+                                        flipH: false,
+                                        lockFlipH: false,
+                                        speed: 1,
+                                        zoom: false,
+                                      },
+                                    };
+                                    persistState({
+                                      ...state,
+                                      shots: [...state.shots, newShot],
+                                    });
+                                    handleSelectSplitShot(newShot);
+                                    setAccordionShotId(newShot.id);
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-purple-600 hover:bg-purple-500 text-white text-[10px] font-semibold transition"
+                                >
+                                  <Plus className="w-3 h-3" />
+                                  <span>+ Thêm cảnh</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setSplitEditingCategory(null);
+                                    setAccordionShotId(null);
+                                  }}
+                                  className="p-1.5 rounded-lg text-slate-400 hover:text-purple-300 hover:bg-purple-500/20 border border-transparent hover:border-purple-500/30 transition"
+                                  title="Thu gọn bảng"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Scrollable list of cards */}
+                            <div className="max-h-[550px] overflow-y-auto space-y-2.5 pr-1">
+                              {splitCatShots.map((shot, sIdx) => {
+                                const isSelected = shot.id === selectedShotId;
+                                const isAccordionOpen =
+                                  shot.id === accordionShotId;
+                                const rawDur = shot.end - shot.begin;
+                                const speed = shot.edits.speed || 1.0;
+                                const effectiveDur = (
+                                  rawDur / speed
+                                ).toFixed(1);
+                                const minDur =
+                                  categoryMinDurations[splitEditingCategory] ??
+                                  3.0;
+                                const isSlowMo = speed < 0.999;
+
+                                return (
+                                  <div key={shot.id} className="space-y-2">
+                                    {/* Shot Card Header / Row */}
+                                    <div
+                                      onClick={() => {
+                                        handleSelectSplitShot(shot);
+                                      }}
+                                      className={`p-3 rounded-xl border flex items-center justify-between gap-3 cursor-pointer transition select-none ${
+                                        isSelected
+                                          ? "bg-slate-900 border-purple-500/80 shadow-md shadow-purple-500/10 ring-1 ring-purple-500/40"
+                                          : "bg-slate-950/80 border-slate-800 hover:border-slate-700 hover:bg-slate-900/60"
+                                      }`}
+                                    >
+                                      {/* Left: Index, Label, Timestamps, Badges */}
+                                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                                        <span
+                                          className={`w-6 h-6 rounded-lg border text-xs font-mono font-bold flex items-center justify-center shrink-0 ${
+                                            isSelected
+                                              ? "bg-purple-500/20 text-purple-300 border-purple-500/50"
+                                              : "bg-slate-900 border-slate-700 text-slate-300"
+                                          }`}
+                                        >
+                                          #{sIdx + 1}
+                                        </span>
+                                        <div className="min-w-0 flex-1">
+                                          <div className="flex items-center gap-2">
+                                            <span className="text-xs font-bold text-white truncate">
+                                              {shot.label}
+                                            </span>
+                                            {shot.edits.flipH && (
+                                              <span className="px-1.5 py-0.2 rounded bg-fuchsia-500/20 text-fuchsia-300 border border-fuchsia-500/30 text-[9px] font-semibold">
+                                                Lật gương
+                                              </span>
+                                            )}
+                                            {isSlowMo && (
+                                              <span className="px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 text-[9px] font-mono">
+                                                {speed}x
+                                              </span>
+                                            )}
+                                          </div>
+                                          <div className="flex items-center gap-2 text-[11px] text-slate-400 font-mono mt-0.5">
+                                            <span>
+                                              {shot.begin.toFixed(1)}s →{" "}
+                                              {shot.end.toFixed(1)}s
+                                            </span>
+                                            <span>•</span>
+                                            <span
+                                              className={`font-bold ${
+                                                parseFloat(effectiveDur) >=
+                                                minDur
+                                                  ? "text-emerald-400"
+                                                  : "text-amber-400"
+                                              }`}
+                                            >
+                                              ⏱️ {effectiveDur}s
+                                            </span>
+                                          </div>
+                                        </div>
+                                      </div>
+
+                                      {/* Right: Chỉnh sửa & Xoá buttons */}
+                                      <div
+                                        className="flex items-center gap-1.5 shrink-0"
+                                        onClick={(e) => e.stopPropagation()}
+                                      >
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            handleSelectSplitShot(shot);
+                                            setAccordionShotId((prev) =>
+                                              prev === shot.id ? null : shot.id,
+                                            );
+                                          }}
+                                          className={`p-1.5 rounded-lg transition ${
+                                            isAccordionOpen
+                                              ? "text-purple-300 bg-purple-500/20 border border-purple-500/40"
+                                              : "text-slate-400 hover:text-purple-300 hover:bg-slate-800"
+                                          }`}
+                                          title={
+                                            isAccordionOpen
+                                              ? "Đóng chỉnh sửa"
+                                              : "Chỉnh sửa cảnh này"
+                                          }
+                                        >
+                                          <Edit3 className="w-3.5 h-3.5" />
+                                        </button>
+
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            handleDeleteShot(shot.id);
+                                            if (accordionShotId === shot.id) {
+                                              setAccordionShotId(null);
+                                            }
+                                          }}
+                                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-slate-800 transition"
+                                          title="Xoá cảnh này"
+                                        >
+                                          <Trash2 className="w-3.5 h-3.5" />
+                                        </button>
+                                      </div>
+                                    </div>
+
+                                    {/* Accordion Settings Panel */}
+                                    {isAccordionOpen &&
+                                      splitShotTrimInfo &&
+                                      accordionShot &&
+                                      accordionShot.id === shot.id && (
+                                        <div className="pt-2 space-y-3 animate-in fade-in duration-200">
+                                          {/* Header: Title, Mirror toggle, Play, Close X */}
+                                          <div className="flex flex-wrap items-center justify-between border-b border-slate-800 pb-2 gap-2">
+                                            <div className="flex items-center gap-2 min-w-0 flex-1">
+                                              <span className="text-xs font-bold text-purple-300 uppercase px-2 py-0.5 rounded-md bg-purple-500/20 border border-purple-500/30 shrink-0">
+                                                Cảnh {splitEditingCategory}
+                                              </span>
+                                              <input
+                                                type="text"
+                                                value={accordionShot.label}
+                                                onChange={(e) => {
+                                                  const updated =
+                                                    state.shots.map((s) =>
+                                                      s.id === accordionShot.id
+                                                        ? {
+                                                            ...s,
+                                                            label:
+                                                              e.target.value,
+                                                          }
+                                                        : s,
+                                                    );
+                                                  persistState({
+                                                    ...state,
+                                                    shots: updated,
+                                                  });
+                                                }}
+                                                className="bg-transparent text-xs font-bold text-slate-100 focus:outline-none border-b border-transparent focus:border-purple-500 truncate flex-1 min-w-[120px]"
+                                                title="Click để đổi tên cảnh"
+                                              />
+                                              <span className="text-[10px] text-slate-400 font-mono hidden md:inline shrink-0">
+                                                (Gốc:{" "}
+                                                {splitShotTrimInfo.rawDuration.toFixed(
+                                                  1,
+                                                )}
+                                                s)
+                                              </span>
+                                            </div>
+
+                                            <div className="flex items-center gap-2 shrink-0">
+                                              {/* Mirror toggle button */}
+                                              <button
+                                                type="button"
+                                                onClick={() =>
+                                                  handleToggleFlipH(
+                                                    accordionShot.id,
+                                                  )
+                                                }
+                                                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] font-semibold border transition ${
+                                                  accordionShot.edits.flipH
+                                                    ? "bg-purple-600/30 text-purple-300 border-purple-500/60 shadow-sm"
+                                                    : "bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700"
+                                                }`}
+                                                title="Lật gương ngang hình ảnh (Mirror)"
+                                              >
+                                                <FlipHorizontal className="w-3.5 h-3.5" />
+                                                <span>
+                                                  {accordionShot.edits.flipH
+                                                    ? "Đang lật gương"
+                                                    : "Lật gương"}
+                                                </span>
+                                              </button>
+
+                                              {/* Xem đoạn này button */}
+                                              <button
+                                                type="button"
+                                                onClick={() =>
+                                                  handlePlayActiveShot(
+                                                    accordionShot,
+                                                  )
+                                                }
+                                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-200 transition"
+                                                title="Phát thử đoạn video này trên player"
+                                              >
+                                                <Play className="w-3 h-3 text-purple-400 fill-current" />
+                                                <span>Xem đoạn này</span>
+                                              </button>
+
+                                              {/* Close Accordion Button */}
+                                              <button
+                                                type="button"
+                                                onClick={() =>
+                                                  setAccordionShotId(null)
+                                                }
+                                                className="p-1 rounded-md text-slate-400 hover:text-purple-300 hover:bg-purple-500/20 transition"
+                                                title="Đóng bảng chỉnh sửa"
+                                              >
+                                                <X className="w-3.5 h-3.5" />
+                                              </button>
+                                            </div>
+                                          </div>
+
+                                          {/* 3-Column Grid: Speed Controls (1 col) + Apple Trimmer (2 cols) */}
+                                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
+                                            {/* Speed Controls */}
+                                            <div className="space-y-1.5 p-2.5 rounded-lg bg-slate-950/70 border border-slate-800 flex flex-col justify-between">
+                                              <div>
+                                                <label className="text-[11px] font-semibold text-slate-300 flex items-center justify-between mb-1.5">
+                                                  <span>Tốc độ phát:</span>
+                                                  <span className="text-purple-400 font-mono font-bold">
+                                                    {splitShotTrimInfo.speed}x
+                                                  </span>
+                                                </label>
+                                                <div className="flex items-center gap-1 flex-wrap mb-2">
+                                                  {[
+                                                    0.5, 0.75, 1.0, 1.25, 1.5,
+                                                    2.0,
+                                                  ].map((spd) => (
+                                                    <button
+                                                      key={spd}
+                                                      type="button"
+                                                      onClick={() =>
+                                                        handleUpdateShotEdits(
+                                                          accordionShot.id,
+                                                          {
+                                                            speed: spd,
+                                                          },
+                                                        )
+                                                      }
+                                                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition ${
+                                                        splitShotTrimInfo.speed ===
+                                                        spd
+                                                          ? "bg-purple-600 text-white font-bold"
+                                                          : "bg-slate-800 hover:bg-slate-700 text-slate-300"
+                                                      }`}
+                                                    >
+                                                      {spd}x
+                                                    </button>
+                                                  ))}
+                                                </div>
+                                                <input
+                                                  type="range"
+                                                  min="0.25"
+                                                  max="3.0"
+                                                  step="0.05"
+                                                  value={
+                                                    splitShotTrimInfo.speed
+                                                  }
+                                                  onChange={(e) =>
+                                                    handleUpdateShotEdits(
+                                                      accordionShot.id,
+                                                      {
+                                                        speed:
+                                                          parseFloat(
+                                                            e.target.value,
+                                                          ) || 1.0,
+                                                      },
+                                                    )
+                                                  }
+                                                  className="w-full accent-purple-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+                                                />
+                                              </div>
+                                              <p className="text-[10px] text-slate-400 font-mono pt-1 border-t border-slate-800/80">
+                                                Cắt{" "}
+                                                {splitShotTrimInfo.cutDur.toFixed(
+                                                  1,
+                                                )}
+                                                s ÷ {splitShotTrimInfo.speed}x
+                                                ={" "}
+                                                <span
+                                                  className={`font-bold ${
+                                                    splitShotTrimInfo.effectiveDur >=
+                                                    splitShotTrimInfo.minDur
+                                                      ? "text-emerald-400"
+                                                      : "text-amber-400"
+                                                  }`}
+                                                >
+                                                  {splitShotTrimInfo.effectiveDur.toFixed(
+                                                    1,
+                                                  )}
+                                                  s
+                                                </span>
+                                                {splitShotTrimInfo.effectiveDur <
+                                                  splitShotTrimInfo.minDur && (
+                                                  <span className="text-[9px] text-amber-400/90 ml-1">
+                                                    (&lt;
+                                                    {splitShotTrimInfo.minDur}s
+                                                    tối thiểu)
+                                                  </span>
+                                                )}
+                                              </p>
+                                            </div>
+
+                                            {/* Apple Photos / iPhone Dual-Handle Video Trimmer (2 cols) */}
+                                            <div className="sm:col-span-2">
+                                              <IPhoneVideoTrimmer
+                                                videoBegin={
+                                                  splitShotTrimInfo.trimBegin
+                                                }
+                                                videoEnd={
+                                                  splitShotTrimInfo.trimEnd
+                                                }
+                                                maxDuration={
+                                                  splitShotTrimInfo.rawDuration
+                                                }
+                                                onChange={(
+                                                  beginOffset,
+                                                  endOffset,
+                                                ) =>
+                                                  handleUpdateShotTrim(
+                                                    accordionShot.id,
+                                                    beginOffset,
+                                                    endOffset,
+                                                  )
+                                                }
+                                                onScrubStart={() => {
+                                                  handleStopSlicer();
+                                                }}
+                                                onScrubMove={(sourceSec) => {
+                                                  const targetTime = Math.min(
+                                                    state.sourceVideo
+                                                      ?.duration || 0,
+                                                    splitShotTrimInfo.baseStart +
+                                                      sourceSec,
+                                                  );
+                                                  if (slicerVideoRef.current) {
+                                                    slicerVideoRef.current.currentTime =
+                                                      targetTime;
+                                                  }
+                                                  setSlicerTime(targetTime);
+                                                }}
+                                                onScrubEnd={() => {}}
+                                                onSeekPreview={(targetSec) => {
+                                                  const targetTime = Math.min(
+                                                    state.sourceVideo
+                                                      ?.duration || 0,
+                                                    splitShotTrimInfo.baseStart +
+                                                      targetSec,
+                                                  );
+                                                  if (slicerVideoRef.current) {
+                                                    slicerVideoRef.current.currentTime =
+                                                      targetTime;
+                                                  }
+                                                  setSlicerTime(targetTime);
+                                                }}
+                                              />
+                                            </div>
+                                          </div>
+
+                                          {/* Advanced Options (Khoá chữ, Ken Burns, Gán Category, Xoá) - Mặc định mở luôn */}
+                                          <div className="pt-2 border-t border-slate-800/80">
+                                            <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800 space-y-2.5">
+                                              <div className="flex items-center justify-between text-[11px] font-semibold text-slate-300">
+                                                <span className="flex items-center gap-1.5">
+                                                  <Sliders className="w-3.5 h-3.5 text-purple-400" />
+                                                  <span>Tùy chọn nâng cao</span>
+                                                </span>
+                                              </div>
+
+                                              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
+                                                {/* Lock flipH */}
+                                                <button
+                                                  type="button"
+                                                  onClick={() =>
+                                                    handleToggleLockFlipH(
+                                                      accordionShot.id,
+                                                    )
+                                                  }
+                                                  className={`p-2 rounded-lg border flex items-center justify-between transition ${
+                                                    accordionShot.edits
+                                                      .lockFlipH
+                                                      ? "bg-amber-500/20 border-amber-500/50 text-amber-200"
+                                                      : "bg-slate-900 border-slate-800 text-slate-300"
+                                                  }`}
+                                                  title="Khoá không cho phép lật ngang nếu cảnh có chữ/tên thương hiệu"
+                                                >
+                                                  <span className="flex items-center gap-1 font-medium text-[11px]">
+                                                    {accordionShot.edits
+                                                      .lockFlipH ? (
+                                                      <Lock className="w-3.5 h-3.5 text-amber-400" />
+                                                    ) : (
+                                                      <Unlock className="w-3.5 h-3.5 text-slate-500" />
+                                                    )}
+                                                    Khoá chữ (L)
+                                                  </span>
+                                                  <span className="font-mono text-[10px] font-bold">
+                                                    {accordionShot.edits
+                                                      .lockFlipH
+                                                      ? "LOCKED"
+                                                      : "FREE"}
+                                                  </span>
+                                                </button>
+
+                                                {/* Ken Burns Zoom */}
+                                                <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 flex flex-col justify-between">
+                                                  <div className="flex items-center justify-between text-[10px] text-slate-400">
+                                                    <span>Ken Burns zoom</span>
+                                                    <span className="font-mono text-slate-200 font-bold">
+                                                      {typeof accordionShot
+                                                        .edits.zoom === "object"
+                                                        ? `${accordionShot.edits.zoom.depth}x`
+                                                        : accordionShot.edits
+                                                              .zoom
+                                                          ? "1.2x"
+                                                          : "Tắt"}
+                                                    </span>
+                                                  </div>
+                                                  <input
+                                                    type="range"
+                                                    min="1.0"
+                                                    max="1.5"
+                                                    step="0.05"
+                                                    value={
+                                                      typeof accordionShot.edits
+                                                        .zoom === "object"
+                                                        ? accordionShot.edits
+                                                            .zoom.depth
+                                                        : accordionShot.edits
+                                                              .zoom
+                                                          ? 1.2
+                                                          : 1.0
+                                                    }
+                                                    onChange={(e) => {
+                                                      const depth = Number(
+                                                        e.target.value,
+                                                      );
+                                                      handleSetZoom(
+                                                        accordionShot.id,
+                                                        depth <= 1.01
+                                                          ? false
+                                                          : depth,
+                                                      );
+                                                    }}
+                                                    className="w-full accent-purple-500 h-1 bg-slate-800 rounded mt-1"
+                                                  />
+                                                </div>
+
+                                                {/* Delete current shot */}
+                                                <div className="flex items-center justify-end">
+                                                  <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                      handleDeleteShot(
+                                                        accordionShot.id,
+                                                      );
+                                                      setAccordionShotId(null);
+                                                    }}
+                                                    className="w-full py-2 px-3 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-semibold flex items-center justify-center gap-1.5 transition"
+                                                    title="Xoá cảnh này khỏi danh sách"
+                                                  >
+                                                    <Trash2 className="w-3.5 h-3.5" />
+                                                    <span>Xoá cảnh này</span>
+                                                  </button>
+                                                </div>
+                                              </div>
+
+                                              {/* Reassign Category buttons */}
+                                              <div className="flex items-center gap-1.5 pt-1.5 border-t border-slate-800/80">
+                                                <span className="text-[10px] text-slate-400 shrink-0 font-medium">
+                                                  Chuyển sang nhóm:
+                                                </span>
+                                                <div className="flex items-center gap-1 flex-wrap">
+                                                  {SHOT_CATEGORIES.map((c) => (
+                                                    <button
+                                                      key={c.id}
+                                                      type="button"
+                                                      onClick={() => {
+                                                        handleCategoryChange(
+                                                          accordionShot.id,
+                                                          c.id,
+                                                        );
+                                                        setSplitEditingCategory(
+                                                          c.id,
+                                                        );
+                                                      }}
+                                                      disabled={
+                                                        accordionShot.category ===
+                                                        c.id
+                                                      }
+                                                      className={`px-2 py-0.5 rounded text-[10px] font-semibold border transition disabled:opacity-40 ${
+                                                        accordionShot.category ===
+                                                        c.id
+                                                          ? c.badgeClass
+                                                          : "bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200"
+                                                      }`}
+                                                    >
+                                                      {c.hotkey}.{" "}
+                                                      {c.id.toUpperCase()}
+                                                    </button>
+                                                  ))}
+                                                </div>
+                                              </div>
+                                            </div>
+                                          </div>
+                                        </div>
+                                      )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* ======================================================== */}
+                {/* RIGHT COLUMN (5/12): VIDEO MONITOR 9:16 + TIMELINE RIBBON */}
+                {/* ======================================================== */}
+                <div className="lg:col-span-5 bg-slate-900/70 border border-slate-800 rounded-2xl p-4 space-y-4 flex flex-col justify-between">
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                        Màn hình duyệt cảnh (Source video monitor)
+                      </h3>
+                      <span className="text-xs font-mono text-purple-400">
+                        {slicerTime.toFixed(1)}s /{" "}
+                        {(state.sourceVideo?.duration || 0).toFixed(1)}s
+                      </span>
+                    </div>
+
+                    {/* 9:16 Video Canvas Player with live effects */}
+                    <div className="relative aspect-[9/16] max-h-[380px] mx-auto rounded-xl overflow-hidden bg-slate-950 border border-slate-800 flex items-center justify-center shadow-2xl">
+                      {state.sourceVideo?.localUrl ? (
+                        <video
+                          ref={slicerVideoRef}
+                          src={state.sourceVideo.localUrl}
+                          playsInline
+                          onTimeUpdate={(e) => {
+                            const cur = e.currentTarget.currentTime;
+                            setSlicerTime(cur);
+
+                            // If playing active shot only, stop or loop at shot.end
+                            if (playingShotOnly && selectedShot) {
+                              if (cur >= selectedShot.end) {
+                                e.currentTarget.pause();
+                                setIsPlayingSlicer(false);
+                                setPlayingShotOnly(false);
+                              }
+                            }
+                          }}
+                          onEnded={() => {
+                            setIsPlayingSlicer(false);
+                            setPlayingShotOnly(false);
+                          }}
+                          className="w-full h-full object-contain"
+                          style={{
+                            transform: selectedShot?.edits.flipH
+                              ? "scaleX(-1)"
+                              : undefined,
+                          }}
+                        />
+                      ) : (
+                        <div className="p-6 text-center text-xs text-slate-500">
+                          Chưa nạp video
+                        </div>
                       )}
+
+                      {/* Active Shot Badge Overlay */}
+                      {selectedShot && (
+                        <div className="absolute top-2 left-2 z-10 px-2.5 py-0.5 rounded-full text-[10px] font-bold border bg-black/60 backdrop-blur-sm text-white border-white/20">
+                          Đang chọn: {selectedShot.label} (
+                          {selectedShot.category?.toUpperCase()})
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Playback Controls Bar */}
+                    <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800">
+                      <div className="flex items-center gap-1.5">
+                        {isPlayingSlicer ? (
+                          <button
+                            onClick={handleStopSlicer}
+                            className="px-3 py-1.5 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/40 text-xs font-bold flex items-center gap-1 hover:bg-amber-500/30"
+                          >
+                            <Pause className="w-3.5 h-3.5" />
+                            <span>Tạm dừng</span>
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => handlePlayActiveShot()}
+                            className="px-3.5 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md shadow-purple-600/20"
+                          >
+                            <Play className="w-3.5 h-3.5" />
+                            <span>Xem riêng</span>
+                          </button>
+                        )}
+                        <button
+                          onClick={() => {
+                            if (slicerVideoRef.current && selectedShot) {
+                              slicerVideoRef.current.currentTime =
+                                selectedShot.begin;
+                              setSlicerTime(selectedShot.begin);
+                            }
+                          }}
+                          className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300"
+                          title="Về đầu cảnh"
+                        >
+                          Đầu cảnh
+                        </button>
+                        <button
+                          onClick={() => {
+                            if (slicerVideoRef.current && selectedShot) {
+                              slicerVideoRef.current.currentTime =
+                                selectedShot.end;
+                              setSlicerTime(selectedShot.end);
+                            }
+                          }}
+                          className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300"
+                          title="Về cuối cảnh"
+                        >
+                          Cuối cảnh
+                        </button>
+                      </div>
+
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => handleSplitAtTime(slicerTime)}
+                          className="px-2.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 text-xs font-semibold flex items-center gap-1"
+                          title="Tách đôi shot tại con trỏ (phím S)"
+                        >
+                          <Scissors className="w-3 h-3" />
+                          <span>Tách (S)</span>
+                        </button>
+                        {selectedShotId && (
+                          <button
+                            onClick={() => handleMergeWithNext(selectedShotId)}
+                            className="px-2.5 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40 text-xs font-semibold"
+                            title="Gộp với shot kế tiếp"
+                          >
+                            Gộp sau
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
 
                   {/* Interactive Timeline Ribbon */}
-                  <div className="space-y-1.5">
+                  <div className="space-y-1.5 pt-3 border-t border-slate-800/80">
                     <div className="flex items-center justify-between text-[11px] text-slate-400">
                       <span>Thanh timeline phân đoạn (Click để chọn cảnh)</span>
                       <span className="font-mono text-emerald-400">
@@ -1708,6 +2717,10 @@ export default function LachVidStudioPage() {
                             key={shot.id}
                             onClick={() => {
                               setSelectedShotId(shot.id);
+                              if (shot.category) {
+                                setSplitEditingCategory(shot.category);
+                                setAccordionShotId(shot.id);
+                              }
                               if (slicerVideoRef.current) {
                                 slicerVideoRef.current.currentTime = shot.begin;
                               }
@@ -1724,7 +2737,7 @@ export default function LachVidStudioPage() {
                             }}
                             className={`h-full rounded-md border text-[10px] font-mono truncate px-1 flex items-center justify-center transition ${
                               isSel
-                                ? "ring-2 ring-white z-10"
+                                ? "ring-2 ring-white z-10 font-bold"
                                 : "opacity-80 hover:opacity-100"
                             }`}
                             title={`${shot.label} (${shot.begin.toFixed(1)}s - ${shot.end.toFixed(1)}s)`}
@@ -1738,402 +2751,52 @@ export default function LachVidStudioPage() {
                     </div>
                   </div>
                 </div>
+              </div>
 
-                {/* ======================================================== */}
-                {/* RIGHT COLUMN (7/12): SHOT LIST EDITOR & PER-SHOT INSPECTOR */}
-                {/* ======================================================== */}
-                <div className="lg:col-span-7 space-y-4">
-                  {/* Detailed Shot List Table */}
-                  <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                        <Scissors className="w-4 h-4 text-rose-400" />
-                        <span>
-                          Danh sách {state.shots.length} cảnh cắt (Chỉnh mốc
-                          giây từng 0.1s)
-                        </span>
-                      </h3>
-                      <button
-                        onClick={() => {
-                          const lastEnd =
-                            state.shots[state.shots.length - 1]?.end || 0;
-                          const maxDur = state.sourceVideo?.duration || 30;
-                          const newBegin =
-                            lastEnd < maxDur - 1
-                              ? lastEnd
-                              : Math.max(0, maxDur - 4);
-                          const newShot: Shot = {
-                            id: `shot_${Date.now()}`,
-                            sourceVideoId: state.sourceVideo?.id || "src_vid",
-                            label: `Cảnh #${state.shots.length + 1}`,
-                            begin: Math.round(newBegin * 10) / 10,
-                            end:
-                              Math.round(Math.min(maxDur, newBegin + 4) * 10) /
-                              10,
-                            category: "product",
-                            edits: {
-                              flipH: false,
-                              lockFlipH: false,
-                              speed: 1,
-                              zoom: false,
-                            },
-                          };
-                          persistState({
-                            ...state,
-                            shots: [...state.shots, newShot],
-                          });
-                          setSelectedShotId(newShot.id);
-                        }}
-                        className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition"
-                      >
-                        <span>+ Thêm shot thủ công</span>
-                      </button>
-                    </div>
-
-                    {/* Scrollable Rows of Shots */}
-                    <div className="max-h-[300px] overflow-y-auto space-y-2 pr-1">
-                      {state.shots.map((shot, idx) => {
-                        const isSel = shot.id === selectedShotId;
-                        const rawDur = Math.max(0.1, shot.end - shot.begin);
-                        const minDur =
-                          (shot.category
-                            ? categoryMinDurations[shot.category]
-                            : null) ?? 3.0;
-                        const speed = shot.edits?.speed || 1.0;
-                        const effectiveDur = (rawDur / speed).toFixed(1);
-                        const isSlowMo = speed < 0.999;
-                        return (
-                          <div
-                            key={shot.id}
-                            onClick={() => {
-                              setSelectedShotId(shot.id);
-                              if (slicerVideoRef.current) {
-                                slicerVideoRef.current.currentTime = shot.begin;
-                              }
-                              setSlicerTime(shot.begin);
-                            }}
-                            className={`p-2.5 rounded-xl border flex flex-wrap items-center justify-between gap-2 cursor-pointer transition ${
-                              isSel
-                                ? "bg-slate-800/90 border-rose-500/80 shadow-md shadow-rose-500/10"
-                                : "bg-slate-950/60 border-slate-800 hover:border-slate-700"
-                            }`}
-                          >
-                            {/* Number & Label */}
-                            <div className="flex items-center gap-2 min-w-[150px] flex-1">
-                              <span className="w-5 h-5 rounded-md bg-slate-900 border border-slate-700 text-[10px] font-mono flex items-center justify-center text-slate-400 shrink-0">
-                                {idx + 1}
-                              </span>
-                              <input
-                                type="text"
-                                value={shot.label}
-                                onClick={(e) => e.stopPropagation()}
-                                onChange={(e) => {
-                                  const updated = state.shots.map((s) =>
-                                    s.id === shot.id
-                                      ? { ...s, label: e.target.value }
-                                      : s,
-                                  );
-                                  persistState({ ...state, shots: updated });
-                                }}
-                                className="bg-transparent text-xs font-semibold text-slate-100 focus:outline-none border-b border-transparent focus:border-rose-500 flex-1 truncate"
-                              />
-                            </div>
-
-                            {/* Precise Numeric Time Inputs (begin -> end) */}
-                            <div
-                              className="flex items-center gap-1 text-xs font-mono"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              {/* Begin input & quick button */}
-                              <input
-                                type="number"
-                                step="0.1"
-                                min="0"
-                                value={shot.begin}
-                                onChange={(e) =>
-                                  handleUpdateShotTime(
-                                    shot.id,
-                                    "begin",
-                                    Number(e.target.value),
-                                  )
-                                }
-                                className="w-14 px-1 py-0.5 rounded bg-slate-900 border border-slate-700 text-center text-slate-200 text-xs"
-                              />
-                              <button
-                                onClick={() =>
-                                  handleUpdateShotTime(
-                                    shot.id,
-                                    "begin",
-                                    slicerTime,
-                                  )
-                                }
-                                className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[9px] text-slate-400"
-                                title="Lấy con trỏ video làm điểm bắt đầu"
-                              >
-                                [Đầu
-                              </button>
-                              <span className="text-slate-600">→</span>
-                              {/* End input & quick button */}
-                              <input
-                                type="number"
-                                step="0.1"
-                                min={shot.begin + 0.2}
-                                value={shot.end}
-                                onChange={(e) =>
-                                  handleUpdateShotTime(
-                                    shot.id,
-                                    "end",
-                                    Number(e.target.value),
-                                  )
-                                }
-                                className="w-14 px-1 py-0.5 rounded bg-slate-900 border border-slate-700 text-center text-slate-200 text-xs"
-                              />
-                              <button
-                                onClick={() =>
-                                  handleUpdateShotTime(
-                                    shot.id,
-                                    "end",
-                                    slicerTime,
-                                  )
-                                }
-                                className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[9px] text-slate-400"
-                                title="Lấy con trỏ video làm điểm kết thúc"
-                              >
-                                Cuối]
-                              </button>
-                              <div className="flex flex-col items-end min-w-[70px] text-right ml-1">
-                                <span
-                                  className={`text-[11px] font-bold font-mono ${
-                                    isSlowMo
-                                      ? "text-amber-400"
-                                      : "text-emerald-400"
-                                  }`}
-                                  title={`Thời lượng thực tế: ${effectiveDur}s (Tối thiểu yêu cầu: ${minDur}s)`}
-                                >
-                                  ⏱️ {effectiveDur}s
-                                </span>
-                                <span className="text-[9px] text-slate-400 font-mono">
-                                  {isSlowMo
-                                    ? `Slow ${speed.toFixed(2)}x (Gốc ${rawDur.toFixed(1)}s)`
-                                    : `Gốc ${rawDur.toFixed(1)}s (≥${minDur}s)`}
-                                </span>
-                              </div>
-                            </div>
-
-                            {/* 1-5 Category Buttons */}
-                            <div
-                              className="flex items-center gap-1"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              {SHOT_CATEGORIES.map((c) => {
-                                const active = shot.category === c.id;
-                                return (
-                                  <button
-                                    key={c.id}
-                                    onClick={() =>
-                                      handleCategoryChange(shot.id, c.id)
-                                    }
-                                    className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border transition ${
-                                      active
-                                        ? c.badgeClass
-                                        : "bg-slate-900 text-slate-500 border-slate-800 hover:text-slate-300"
-                                    }`}
-                                    title={`Gán ${c.label} (Phím ${c.hotkey})`}
-                                  >
-                                    {c.hotkey}.{c.id.slice(0, 3).toUpperCase()}
-                                  </button>
-                                );
-                              })}
-                            </div>
-
-                            {/* Row Action Buttons: Play & Delete */}
-                            <div
-                              className="flex items-center gap-1"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <button
-                                onClick={() => handlePlayActiveShot(shot)}
-                                className="p-1 rounded bg-slate-800 hover:bg-rose-500 text-slate-300 hover:text-white transition"
-                                title="Phát riêng cảnh này"
-                              >
-                                <Play className="w-3 h-3" />
-                              </button>
-                              <button
-                                onClick={() => handleDeleteShot(shot.id)}
-                                className="p-1 text-slate-500 hover:text-rose-400 transition"
-                                title="Xoá cảnh này"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
+              {/* 100% WIDTH EXPORT ACTION BAR CARD */}
+              <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 space-y-4">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div>
+                    <h3 className="text-sm font-bold text-white">
+                      Xuất toàn bộ các cảnh đã tinh chỉnh về máy tính
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Cắt siêu tốc bằng FFmpeg, giữ nguyên chất lượng 100%, bảo toàn mốc giây và mirror đã chỉnh
+                    </p>
                   </div>
 
-                  {/* PER-SHOT INSPECTOR (Mirror flipH, Lock text, Speed, Zoom) */}
-                  {selectedShot && (
-                    <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 space-y-3">
-                      <div className="flex items-center justify-between">
-                        <h4 className="text-xs font-bold uppercase tracking-wider text-rose-400 flex items-center gap-2">
-                          <Sliders className="w-4 h-4" />
-                          <span>
-                            Chỉnh sửa riêng cho cảnh đang chọn: &ldquo;
-                            {selectedShot.label}&rdquo;
-                          </span>
-                        </h4>
-                        <span className="text-[11px] font-mono text-slate-400">
-                          {selectedShot.begin}s → {selectedShot.end}s (
-                          {(selectedShot.end - selectedShot.begin).toFixed(1)}s)
-                        </span>
-                      </div>
-
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                        {/* Mirror flipH */}
-                        <button
-                          onClick={() => handleToggleFlipH(selectedShot.id)}
-                          className={`p-2.5 rounded-xl border flex items-center justify-between transition ${
-                            selectedShot.edits.flipH
-                              ? "bg-fuchsia-500/20 border-fuchsia-500/50 text-fuchsia-200"
-                              : "bg-slate-950 border-slate-800 text-slate-300"
-                          }`}
-                        >
-                          <span className="flex items-center gap-1.5 font-medium">
-                            <FlipHorizontal className="w-4 h-4" />
-                            Mirror (flipH)
-                          </span>
-                          <span className="font-mono text-[11px] font-bold">
-                            {selectedShot.edits.flipH ? "ON" : "OFF"}
-                          </span>
-                        </button>
-
-                        {/* Lock flipH (Keep text readable) */}
-                        <button
-                          onClick={() => handleToggleLockFlipH(selectedShot.id)}
-                          className={`p-2.5 rounded-xl border flex items-center justify-between transition ${
-                            selectedShot.edits.lockFlipH
-                              ? "bg-amber-500/20 border-amber-500/50 text-amber-200"
-                              : "bg-slate-950 border-slate-800 text-slate-300"
-                          }`}
-                          title="Khoá không cho phép lật ngang nếu cảnh có chữ/tên thương hiệu"
-                        >
-                          <span className="flex items-center gap-1.5 font-medium">
-                            {selectedShot.edits.lockFlipH ? (
-                              <Lock className="w-4 h-4 text-amber-400" />
-                            ) : (
-                              <Unlock className="w-4 h-4 text-slate-500" />
-                            )}
-                            Khoá chữ (L)
-                          </span>
-                          <span className="font-mono text-[11px] font-bold">
-                            {selectedShot.edits.lockFlipH ? "LOCKED" : "FREE"}
-                          </span>
-                        </button>
-
-                        {/* Playback Speed */}
-                        <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex flex-col justify-between">
-                          <div className="flex items-center justify-between text-[11px] text-slate-400">
-                            <span>Tốc độ (Speed)</span>
-                            <span className="font-mono text-slate-200 font-bold">
-                              {selectedShot.edits.speed}x
-                            </span>
-                          </div>
-                          <input
-                            type="range"
-                            min="0.5"
-                            max="2.0"
-                            step="0.05"
-                            value={selectedShot.edits.speed}
-                            onChange={(e) =>
-                              handleSetSpeed(
-                                selectedShot.id,
-                                Number(e.target.value),
-                              )
-                            }
-                            className="w-full accent-rose-500 mt-1"
-                          />
-                        </div>
-
-                        {/* Ken Burns Zoom */}
-                        <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex flex-col justify-between">
-                          <div className="flex items-center justify-between text-[11px] text-slate-400">
-                            <span>Ken Burns zoom</span>
-                            <span className="font-mono text-slate-200 font-bold">
-                              {typeof selectedShot.edits.zoom === "object"
-                                ? `${selectedShot.edits.zoom.depth}x`
-                                : selectedShot.edits.zoom
-                                  ? "1.2x"
-                                  : "Tắt"}
-                            </span>
-                          </div>
-                          <input
-                            type="range"
-                            min="1.0"
-                            max="1.5"
-                            step="0.05"
-                            value={
-                              typeof selectedShot.edits.zoom === "object"
-                                ? selectedShot.edits.zoom.depth
-                                : selectedShot.edits.zoom
-                                  ? 1.2
-                                  : 1.0
-                            }
-                            onChange={(e) => {
-                              const depth = Number(e.target.value);
-                              handleSetZoom(
-                                selectedShot.id,
-                                depth <= 1.01 ? false : depth,
-                              );
-                            }}
-                            className="w-full accent-rose-500 mt-1"
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Export Action Bar (Save Folder / ZIP) */}
-                  <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <div className="text-xs font-bold text-white">
-                        Xuất toàn bộ các cảnh đã tinh chỉnh về máy tính
-                      </div>
-                      <p className="text-[11px] text-slate-400">
-                        Cắt siêu tốc bằng FFmpeg, giữ nguyên chất lượng 100%,
-                        bảo toàn mốc giây và mirror đã chỉnh
-                      </p>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        onClick={handleSliceAndDownloadZip}
-                        disabled={isSlicing}
-                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition"
-                      >
-                        <Download className="w-4 h-4 text-rose-400" />
-                        <span>Tải ZIP toàn bộ (5 folder)</span>
-                      </button>
-                      <button
-                        onClick={handleDirectSaveToFolder}
-                        disabled={isSlicing}
-                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow-lg shadow-emerald-600/20"
-                      >
-                        <FolderDown className="w-4 h-4" />
-                        <span>Lưu thẳng vào thư mục máy tính</span>
-                      </button>
-                      <button
-                        onClick={handleNextVideo}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow-lg shadow-indigo-600/20"
-                      >
-                        <Plus className="w-4 h-4" />
-                        <span>Tách video tiếp theo</span>
-                      </button>
-                    </div>
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <button
+                      type="button"
+                      onClick={handleSliceAndDownloadZip}
+                      disabled={isSlicing}
+                      className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition disabled:opacity-50"
+                    >
+                      <Download className="w-4 h-4 text-rose-400" />
+                      <span>Tải ZIP toàn bộ (5 folder)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDirectSaveToFolder}
+                      disabled={isSlicing}
+                      className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow-lg shadow-emerald-600/20 disabled:opacity-50"
+                    >
+                      <FolderDown className="w-4 h-4" />
+                      <span>Lưu thẳng vào thư mục máy tính</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleNextVideo}
+                      className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow-lg shadow-indigo-600/20"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>Tách video tiếp theo</span>
+                    </button>
                   </div>
                 </div>
               </div>
-            )}
+            </div>
+          )}
           </div>
         )}
 

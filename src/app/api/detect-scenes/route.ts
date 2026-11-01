@@ -164,6 +164,8 @@ export async function POST(req: NextRequest) {
         label: `${catLabel} - Cảnh #${generatedShots.length + 1}`,
         begin: curStart,
         end: segEnd,
+        rawBegin: curStart,
+        rawEnd: segEnd,
         category: cat,
         edits: {
           flipH: false,
@@ -189,6 +191,8 @@ export async function POST(req: NextRequest) {
       label: `End (CTA) - Cảnh #${generatedShots.length + 1}`,
       begin: endStart,
       end: totalVideoDur,
+      rawBegin: endStart,
+      rawEnd: totalVideoDur,
       category: "end",
       edits: {
         flipH: false,

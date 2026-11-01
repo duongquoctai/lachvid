@@ -147,6 +147,8 @@ export interface Shot {
   label: string;
   begin: number; // seconds in source video
   end: number; // seconds in source video
+  rawBegin?: number; // original detected start second in source video
+  rawEnd?: number; // original detected end second in source video
   category: ShotCategory | null; // null while still an unclassified draft segment
   edits: ShotEdits;
 }
