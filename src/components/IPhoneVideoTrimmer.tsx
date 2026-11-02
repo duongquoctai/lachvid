@@ -3,10 +3,14 @@
 import React, { useRef, useState, useCallback, useEffect } from "react";
 import { RotateCcw } from "lucide-react";
 
-interface IPhoneVideoTrimmerProps {
+export interface IPhoneVideoTrimmerProps {
   videoBegin: number;
   videoEnd: number;
-  maxDuration: number;
+  maxDuration?: number;
+  totalDuration?: number;
+  rawBegin?: number;
+  rawEnd?: number;
+  contextPadding?: number;
   onChange: (begin: number, end: number) => void;
   onSeekPreview?: (targetSec: number) => void;
   onScrubStart?: () => void;
@@ -21,6 +25,10 @@ export default function IPhoneVideoTrimmer({
   videoBegin,
   videoEnd,
   maxDuration,
+  totalDuration,
+  rawBegin,
+  rawEnd,
+  contextPadding = 6.0,
   onChange,
   onSeekPreview,
   onScrubStart,
@@ -32,20 +40,34 @@ export default function IPhoneVideoTrimmer({
 }: IPhoneVideoTrimmerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [activeDrag, setActiveDrag] = useState<"begin" | "end" | "middle" | null>(null);
-  const dragStartRef = useRef<{
-    startX: number;
-    initialBegin: number;
-    initialEnd: number;
-    trackWidth: number;
-  }>({ startX: 0, initialBegin: 0, initialEnd: 0, trackWidth: 1 });
 
-  const safeMax = Math.max(0.5, maxDuration || 10);
-  const safeBegin = Math.max(0, Math.min(safeMax - minClipDuration, videoBegin || 0));
-  const safeEnd = Math.max(safeBegin + minClipDuration, Math.min(safeMax, videoEnd || safeMax));
+  // Total limit of the video timeline
+  const safeTotal = Math.max(0.5, totalDuration ?? maxDuration ?? 10);
+  const safeBegin = Math.max(0, Math.min(safeTotal - minClipDuration, videoBegin || 0));
+  const safeEnd = Math.max(safeBegin + minClipDuration, Math.min(safeTotal, videoEnd || safeTotal));
 
-  const beginPercent = Math.max(0, Math.min(100, (safeBegin / safeMax) * 100));
-  const endPercent = Math.max(0, Math.min(100, (safeEnd / safeMax) * 100));
+  // Phương án A: Context padding window xung quanh shot
+  const hasRaw = rawBegin !== undefined && rawEnd !== undefined;
+  const baseRawBegin = hasRaw ? rawBegin! : safeBegin;
+  const baseRawEnd = hasRaw ? rawEnd! : safeEnd;
+
+  // View window: mở rộng thêm vùng đệm ngữ cảnh trước & sau shot
+  const windowStart = Math.max(0, Math.min(baseRawBegin, safeBegin) - contextPadding);
+  const windowEnd = Math.min(safeTotal, Math.max(baseRawEnd, safeEnd) + contextPadding);
+  const windowSpan = Math.max(0.2, windowEnd - windowStart);
+
+  // Calculate percentage positions on the visible track
+  const beginPercent = Math.max(0, Math.min(100, ((safeBegin - windowStart) / windowSpan) * 100));
+  const endPercent = Math.max(0, Math.min(100, ((safeEnd - windowStart) / windowSpan) * 100));
   const widthPercent = Math.max(0, endPercent - beginPercent);
+
+  // Ghost markers positions (mốc cảnh gốc AI phát hiện)
+  const rawBeginPercent = hasRaw
+    ? ((baseRawBegin - windowStart) / windowSpan) * 100
+    : null;
+  const rawEndPercent = hasRaw
+    ? ((baseRawEnd - windowStart) / windowSpan) * 100
+    : null;
 
   // Helper to round seconds to step precision (e.g. 0.1s)
   const roundSec = useCallback(
@@ -55,6 +77,24 @@ export default function IPhoneVideoTrimmer({
     },
     [step]
   );
+
+  const dragStartRef = useRef<{
+    startX: number;
+    initialBegin: number;
+    initialEnd: number;
+    trackWidth: number;
+    windowSpan: number;
+    windowStart: number;
+    windowEnd: number;
+  }>({
+    startX: 0,
+    initialBegin: 0,
+    initialEnd: 0,
+    trackWidth: 1,
+    windowSpan: 1,
+    windowStart: 0,
+    windowEnd: 1,
+  });
 
   const handlePointerDown = (
     e: React.PointerEvent,
@@ -70,6 +110,9 @@ export default function IPhoneVideoTrimmer({
       initialBegin: safeBegin,
       initialEnd: safeEnd,
       trackWidth: Math.max(10, rect.width),
+      windowSpan,
+      windowStart,
+      windowEnd,
     };
     setActiveDrag(type);
 
@@ -83,27 +126,36 @@ export default function IPhoneVideoTrimmer({
     if (!activeDrag) return;
 
     const handlePointerMove = (e: PointerEvent) => {
-      const { startX, initialBegin, initialEnd, trackWidth } = dragStartRef.current;
+      const {
+        startX,
+        initialBegin,
+        initialEnd,
+        trackWidth,
+        windowSpan: dragSpan,
+        windowStart: dragWinStart,
+        windowEnd: dragWinEnd,
+      } = dragStartRef.current;
+
       const deltaPx = e.clientX - startX;
-      const deltaSec = (deltaPx / trackWidth) * safeMax;
+      const deltaSec = (deltaPx / trackWidth) * dragSpan;
 
       if (activeDrag === "begin") {
         let newBegin = roundSec(initialBegin + deltaSec);
-        newBegin = Math.max(0, Math.min(safeEnd - minClipDuration, newBegin));
+        newBegin = Math.max(dragWinStart, Math.min(safeEnd - minClipDuration, newBegin));
         onChange(newBegin, safeEnd);
         if (onScrubMove) onScrubMove(newBegin);
         if (onSeekPreview) onSeekPreview(newBegin);
       } else if (activeDrag === "end") {
         let newEnd = roundSec(initialEnd + deltaSec);
-        newEnd = Math.max(safeBegin + minClipDuration, Math.min(safeMax, newEnd));
+        newEnd = Math.max(safeBegin + minClipDuration, Math.min(dragWinEnd, newEnd));
         onChange(safeBegin, newEnd);
         if (onScrubMove) onScrubMove(newEnd);
         if (onSeekPreview) onSeekPreview(newEnd);
       } else if (activeDrag === "middle") {
         const span = initialEnd - initialBegin;
         let newBegin = roundSec(initialBegin + deltaSec);
-        if (newBegin < 0) newBegin = 0;
-        if (newBegin + span > safeMax) newBegin = safeMax - span;
+        if (newBegin < dragWinStart) newBegin = dragWinStart;
+        if (newBegin + span > dragWinEnd) newBegin = dragWinEnd - span;
         const newEnd = roundSec(newBegin + span);
         onChange(newBegin, newEnd);
         if (onScrubMove) onScrubMove(newBegin);
@@ -122,49 +174,91 @@ export default function IPhoneVideoTrimmer({
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
     };
-  }, [activeDrag, safeBegin, safeEnd, safeMax, minClipDuration, onChange, onSeekPreview, onScrubMove, onScrubEnd, roundSec]);
+  }, [
+    activeDrag,
+    safeBegin,
+    safeEnd,
+    minClipDuration,
+    onChange,
+    onSeekPreview,
+    onScrubMove,
+    onScrubEnd,
+    roundSec,
+  ]);
 
   // Adjust begin / end via buttons
   const stepBegin = (amount: number) => {
-    const next = roundSec(Math.max(0, Math.min(safeEnd - minClipDuration, safeBegin + amount)));
+    const next = roundSec(
+      Math.max(0, Math.min(safeEnd - minClipDuration, safeBegin + amount))
+    );
     onChange(next, safeEnd);
     if (onSeekPreview) onSeekPreview(next);
     onScrubEnd?.();
   };
 
   const stepEnd = (amount: number) => {
-    const next = roundSec(Math.max(safeBegin + minClipDuration, Math.min(safeMax, safeEnd + amount)));
+    const next = roundSec(
+      Math.max(safeBegin + minClipDuration, Math.min(safeTotal, safeEnd + amount))
+    );
     onChange(safeBegin, next);
     if (onSeekPreview) onSeekPreview(next);
     onScrubEnd?.();
   };
 
-  const handleResetFull = () => {
-    onChange(0, safeMax);
-    if (onSeekPreview) onSeekPreview(0);
+  // Nút về cảnh gốc
+  const handleReset = () => {
+    if (hasRaw && rawBegin !== undefined && rawEnd !== undefined) {
+      onChange(rawBegin, rawEnd);
+      if (onSeekPreview) onSeekPreview(rawBegin);
+    } else {
+      onChange(0, safeTotal);
+      if (onSeekPreview) onSeekPreview(0);
+    }
     onScrubEnd?.();
   };
 
+  const isModifiedFromRaw =
+    hasRaw &&
+    rawBegin !== undefined &&
+    rawEnd !== undefined &&
+    (Math.abs(safeBegin - rawBegin) > 0.05 || Math.abs(safeEnd - rawEnd) > 0.05);
+
   return (
-    <div className={`space-y-2 p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 ${className}`}>
+    <div
+      className={`space-y-2 p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 ${className}`}
+    >
       {/* Header bar of trimmer */}
       <div className="flex items-center justify-between text-xs">
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <span className="font-semibold text-slate-200 text-[11px]">
             Cắt bớt đầu / cuối (Kéo 2 đầu):
           </span>
           <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/30">
             {roundSec(safeEnd - safeBegin).toFixed(1)}s
           </span>
+          {isModifiedFromRaw && rawBegin !== undefined && rawEnd !== undefined && (
+            <span
+              className="text-[10px] font-mono text-indigo-300/90 ml-1"
+              title={`Cảnh gốc: ${rawBegin.toFixed(1)}s → ${rawEnd.toFixed(1)}s`}
+            >
+              (Gốc: {roundSec(rawEnd - rawBegin).toFixed(1)}s)
+            </span>
+          )}
         </div>
+
+        {/* Nút về cảnh gốc */}
         <button
           type="button"
-          onClick={handleResetFull}
+          onClick={handleReset}
           className="text-[10px] text-slate-400 hover:text-amber-300 inline-flex items-center gap-1 transition"
-          title="Khôi phục toàn bộ cảnh gốc"
+          title={
+            hasRaw
+              ? "Khôi phục lại mốc cảnh gốc ban đầu"
+              : "Khôi phục toàn bộ cảnh"
+          }
         >
           <RotateCcw className="w-3 h-3" />
-          <span>Trọn cảnh</span>
+          <span>{hasRaw ? "Về cảnh gốc" : "Trọn cảnh"}</span>
         </button>
       </div>
 
@@ -192,6 +286,29 @@ export default function IPhoneVideoTrimmer({
           className="absolute top-0 bottom-0 right-0 bg-slate-950/75 pointer-events-none transition-all duration-75"
           style={{ left: `${endPercent}%` }}
         />
+
+        {/* Ghost markers - Vạch dấu mờ mốc cảnh gốc AI phát hiện */}
+        {hasRaw &&
+          rawBeginPercent !== null &&
+          rawBeginPercent >= 0 &&
+          rawBeginPercent <= 100 && (
+            <div
+              className="absolute top-0 bottom-0 w-[2px] border-l-2 border-dashed border-indigo-400/50 pointer-events-none z-10"
+              style={{ left: `${rawBeginPercent}%` }}
+              title={`Mốc bắt đầu cảnh gốc: ${rawBegin?.toFixed(1)}s`}
+            />
+          )}
+
+        {hasRaw &&
+          rawEndPercent !== null &&
+          rawEndPercent >= 0 &&
+          rawEndPercent <= 100 && (
+            <div
+              className="absolute top-0 bottom-0 w-[2px] border-l-2 border-dashed border-indigo-400/50 pointer-events-none z-10"
+              style={{ left: `${rawEndPercent}%` }}
+              title={`Mốc kết thúc cảnh gốc: ${rawEnd?.toFixed(1)}s`}
+            />
+          )}
 
         {/* Selected Active Region (Amber Frame - iPhone Style) */}
         <div
@@ -272,7 +389,10 @@ export default function IPhoneVideoTrimmer({
             onChange={(e) => {
               const val = parseFloat(e.target.value);
               if (!isNaN(val)) {
-                const next = Math.max(0, Math.min(safeEnd - minClipDuration, roundSec(val)));
+                const next = Math.max(
+                  0,
+                  Math.min(safeEnd - minClipDuration, roundSec(val))
+                );
                 onChange(next, safeEnd);
                 if (onSeekPreview) onSeekPreview(next);
               }
@@ -308,12 +428,15 @@ export default function IPhoneVideoTrimmer({
             type="number"
             step="0.1"
             min={safeBegin + minClipDuration}
-            max={safeMax}
+            max={safeTotal}
             value={safeEnd}
             onChange={(e) => {
               const val = parseFloat(e.target.value);
               if (!isNaN(val)) {
-                const next = Math.max(safeBegin + minClipDuration, Math.min(safeMax, roundSec(val)));
+                const next = Math.max(
+                  safeBegin + minClipDuration,
+                  Math.min(safeTotal, roundSec(val))
+                );
                 onChange(safeBegin, next);
                 if (onSeekPreview) onSeekPreview(next);
               }
@@ -323,7 +446,7 @@ export default function IPhoneVideoTrimmer({
           <button
             type="button"
             onClick={() => stepEnd(0.1)}
-            disabled={safeEnd >= safeMax}
+            disabled={safeEnd >= safeTotal}
             className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 font-mono text-[10px]"
             title="Tiến 0.1s"
           >

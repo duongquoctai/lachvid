@@ -5,6 +5,8 @@ import shutil
 import tempfile
 import threading
 import time
+import urllib.request
+import urllib.parse
 import zipfile
 from typing import List, Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -365,12 +367,64 @@ class RenderBatchRequest(BaseModel):
     session_id: Optional[str] = None
     videos: List[RenderComposedVideoItem]
 
-def resolve_disk_path(file_path: Optional[str], url: Optional[str]) -> Optional[str]:
-    """Tìm đường dẫn thực tế trên đĩa từ file_path hoặc url."""
+def extract_drive_file_id(url: str) -> Optional[str]:
+    if not url:
+        return None
+    m = re.search(r"/api/drive-stream/([a-zA-Z0-9_-]{20,})", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]{20,})", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]{20,})", url)
+    if m:
+        return m.group(1)
+    if re.match(r"^[a-zA-Z0-9_-]{25,50}$", url.strip()):
+        return url.strip()
+    return None
+
+def download_drive_file(file_id: str, dest_path: str) -> bool:
+    direct_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    req = urllib.request.Request(
+        direct_url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content_type = resp.headers.get("Content-Type", "").lower()
+            if "text/html" in content_type:
+                return False
+            with open(dest_path, "wb") as f:
+                shutil.copyfileobj(resp, f)
+        return os.path.exists(dest_path) and os.path.getsize(dest_path) > 1000
+    except Exception:
+        if os.path.exists(dest_path):
+            try:
+                os.remove(dest_path)
+            except Exception:
+                pass
+        return False
+
+def resolve_disk_path(
+    file_path: Optional[str],
+    url: Optional[str],
+    drive_cache_dir: Optional[str] = None
+) -> Optional[str]:
+    """Tìm đường dẫn thực tế trên đĩa từ file_path hoặc url (tải tạm từ Google Drive vào cache tự hủy nếu cần)."""
     if file_path and os.path.exists(file_path):
         return os.path.abspath(file_path)
     if url:
         clean = url.split("?")[0].strip()
+
+        # Check if Google Drive file
+        drive_id = extract_drive_file_id(url)
+        if drive_id and drive_cache_dir:
+            cached_file = os.path.join(drive_cache_dir, f"drive_{drive_id}.mp4")
+            if os.path.exists(cached_file) and os.path.getsize(cached_file) > 1000:
+                return cached_file
+            if download_drive_file(drive_id, cached_file):
+                return cached_file
+
         # Check sessions path
         base_sessions = get_base_sessions_dir()
         if "/api/media/sessions/" in clean:
@@ -415,6 +469,8 @@ def render_composed_endpoint(req: RenderBatchRequest):
         session_id = req.session_id or "render"
 
         with tempfile.TemporaryDirectory() as batch_dir:
+            drive_cache_dir = os.path.join(batch_dir, "_drive_cache")
+            os.makedirs(drive_cache_dir, exist_ok=True)
             rendered_files = []
 
             for idx, v_item in enumerate(req.videos):
@@ -427,7 +483,7 @@ def render_composed_endpoint(req: RenderBatchRequest):
                     total_duration = 0.0
 
                     for s_idx, slot in enumerate(v_item.slots):
-                        resolved_src = resolve_disk_path(slot.file_path, slot.url)
+                        resolved_src = resolve_disk_path(slot.file_path, slot.url, drive_cache_dir=drive_cache_dir)
                         if not resolved_src:
                             raise HTTPException(
                                 status_code=404,
@@ -498,7 +554,11 @@ def render_composed_endpoint(req: RenderBatchRequest):
                     ]
                     subprocess.run(cmd_concat, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
 
-                    voice_path = resolve_disk_path(v_item.voice_file_path, v_item.voice_url)
+                    voice_path = resolve_disk_path(
+                        v_item.voice_file_path,
+                        v_item.voice_url,
+                        drive_cache_dir=drive_cache_dir,
+                    )
                     if voice_path:
                         cmd_final = [
                             ffmpeg_exe, "-y",

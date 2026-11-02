@@ -9,6 +9,9 @@ import {
 } from "@/types/lachvid";
 import { Pause, Play, RotateCcw, Volume2, VolumeX } from "lucide-react";
 
+// In-memory Blob URL cache for drive streams (0ms latency, zero server disk)
+const driveBlobCache = new Map<string, string>();
+
 interface PreviewPlayer916Props {
   composed: ComposedVideo;
   sourceVideo: SourceVideo | null;
@@ -83,9 +86,39 @@ export default function PreviewPlayer916({
   // In slot mode: always use Video A.
   const isVideoAActive = isSlotMode ? true : activeSlotIndex % 2 === 0;
 
+  const [, setBlobReadyTick] = useState(0);
+
+  // Background fetch Drive stream into browser Blob URL (0ms latency, zero server disk)
+  useEffect(() => {
+    let active = true;
+    for (const slot of composed.slots) {
+      const url = slot.localUrl;
+      if (url && url.startsWith("/api/drive-stream/") && !driveBlobCache.has(url)) {
+        fetch(url)
+          .then((res) => (res.ok ? res.blob() : null))
+          .then((blob) => {
+            if (blob && active) {
+              const blobUrl = URL.createObjectURL(blob);
+              driveBlobCache.set(url, blobUrl);
+              setBlobReadyTick((t) => t + 1);
+            }
+          })
+          .catch(() => {});
+      }
+    }
+    return () => {
+      active = false;
+    };
+  }, [composed]);
+
   const getSlotMediaUrl = useCallback(
-    (slot?: (typeof composed)["slots"][0]) =>
-      slot?.localUrl || sourceVideo?.localUrl || "",
+    (slot?: (typeof composed)["slots"][0]) => {
+      const raw = slot?.localUrl || sourceVideo?.localUrl || "";
+      if (raw && driveBlobCache.has(raw)) {
+        return driveBlobCache.get(raw)!;
+      }
+      return raw;
+    },
     [sourceVideo?.localUrl]
   );
 

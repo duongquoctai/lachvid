@@ -303,6 +303,8 @@ export interface CategoryVideoItem {
   zvidRemoteUrl?: string | null;
   isExternal?: boolean;
   lockFlipH?: boolean;
+  driveFileId?: string;
+  sourceType?: "drive" | "local";
 }
 
 export type CategoryPools = Record<ShotCategory, CategoryVideoItem[]>;
