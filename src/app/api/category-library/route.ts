@@ -12,7 +12,11 @@ import {
   writeProjectState,
 } from "@/lib/store";
 import { CategoryPools, CategoryVideoItem, MultiVoiceItem, ShotCategory } from "@/types/lachvid";
-import { extractGoogleDriveFileId, probeGoogleDriveClipMetadata } from "@/lib/drive";
+import {
+  extractGoogleDriveFileId,
+  probeGoogleDriveClipMetadata,
+  probeGoogleDriveVoiceMetadata,
+} from "@/lib/drive";
 
 const VALID_CATS: ShotCategory[] = ["open", "product", "texture", "apply", "end"];
 
@@ -42,7 +46,7 @@ export async function GET(req: NextRequest) {
 // Helper to run promises in parallel with concurrency limit
 async function pMap<T, R>(
   items: T[],
-  fn: (item: T) => Promise<R>,
+  fn: (item: T, index: number) => Promise<R>,
   concurrency = 6
 ): Promise<R[]> {
   const results: R[] = [];
@@ -51,7 +55,7 @@ async function pMap<T, R>(
   async function worker() {
     while (index < items.length) {
       const curIdx = index++;
-      results[curIdx] = await fn(items[curIdx]);
+      results[curIdx] = await fn(items[curIdx], curIdx);
     }
   }
 
@@ -99,27 +103,28 @@ export async function POST(req: NextRequest) {
 
   // Ingest Google Drive links (0 MB Disk)
   if (action === "ingest_drive_links") {
-    let categoryLinksMap: Partial<Record<ShotCategory, string[]>> = {};
+    let categoryLinksMap: Partial<Record<ShotCategory | "voice", string[]>> = {};
 
     if (jsonData?.categoryLinks && typeof jsonData.categoryLinks === "object") {
-      categoryLinksMap = jsonData.categoryLinks as Partial<Record<ShotCategory, string[]>>;
+      categoryLinksMap = jsonData.categoryLinks as Partial<Record<ShotCategory | "voice", string[]>>;
     } else if (jsonData?.targetCategory && Array.isArray(jsonData?.links)) {
-      const cat = jsonData.targetCategory as ShotCategory;
-      if (VALID_CATS.includes(cat)) {
-        categoryLinksMap[cat] = jsonData.links as string[];
+      const cat = jsonData.targetCategory as string;
+      if (VALID_CATS.includes(cat as ShotCategory) || cat === "voice") {
+        categoryLinksMap[cat as ShotCategory | "voice"] = jsonData.links as string[];
       }
     } else if (formData) {
-      const targetCat = (formData.get("targetCategory") as ShotCategory) || "product";
+      const targetCat = (formData.get("targetCategory") as string) || "product";
       const rawLinks = (formData.get("links") as string) || "";
-      if (VALID_CATS.includes(targetCat)) {
-        categoryLinksMap[targetCat] = rawLinks
+      if (VALID_CATS.includes(targetCat as ShotCategory) || targetCat === "voice") {
+        categoryLinksMap[targetCat as ShotCategory | "voice"] = rawLinks
           .split(/[\r\n,]+/)
           .map((s) => s.trim())
           .filter(Boolean);
       }
     }
 
-    const tasks: { category: ShotCategory; fileId: string }[] = [];
+    const videoTasks: { category: ShotCategory; fileId: string }[] = [];
+    const voiceTasks: { fileId: string }[] = [];
     let duplicateCount = 0;
 
     for (const cat of VALID_CATS) {
@@ -134,22 +139,33 @@ export async function POST(req: NextRequest) {
         const alreadyExists = currentCatPool.some(
           (it) => it.driveFileId === fileId || it.id.includes(fileId.slice(0, 10))
         );
-        if (alreadyExists) {
+        if (alreadyExists || videoTasks.some((t) => t.category === cat && t.fileId === fileId)) {
           duplicateCount++;
           continue;
         }
 
-        // Avoid adding multiple times in the same incoming payload
-        if (tasks.some((t) => t.category === cat && t.fileId === fileId)) {
-          duplicateCount++;
-          continue;
-        }
-
-        tasks.push({ category: cat, fileId });
+        videoTasks.push({ category: cat, fileId });
       }
     }
 
-    if (tasks.length === 0) {
+    const voiceLinks = categoryLinksMap["voice"] || [];
+    const currentVoices: MultiVoiceItem[] = state.multiVoiceTracks || [];
+    for (const raw of voiceLinks) {
+      const fileId = extractGoogleDriveFileId(raw);
+      if (!fileId) continue;
+
+      const alreadyExists = currentVoices.some(
+        (v) => v.driveFileId === fileId || v.id.includes(fileId.slice(0, 10))
+      );
+      if (alreadyExists || voiceTasks.some((t) => t.fileId === fileId)) {
+        duplicateCount++;
+        continue;
+      }
+
+      voiceTasks.push({ fileId });
+    }
+
+    if (videoTasks.length === 0 && voiceTasks.length === 0) {
       return NextResponse.json({
         success: true,
         sessionId,
@@ -157,28 +173,44 @@ export async function POST(req: NextRequest) {
         duplicateCount,
         errors: [],
         categoryPools: pools,
+        multiVoiceTracks: currentVoices,
         message: duplicateCount > 0 ? "Toàn bộ link đã có sẵn trong kho." : "Không có link hợp lệ.",
       });
     }
 
-    // Probe metadata concurrently in RAM (up to 6 parallel)
-    const probeResults = await pMap(
-      tasks,
-      async (task) => {
-        const probe = await probeGoogleDriveClipMetadata(task.fileId);
-        return {
-          category: task.category,
-          probe,
-        };
-      },
-      6
-    );
-
-    const addedItems: CategoryVideoItem[] = [];
     const errors: { fileId: string; category: string; error: string }[] = [];
+    const addedVideoItems: CategoryVideoItem[] = [];
+    const addedVoiceItems: MultiVoiceItem[] = [];
 
-    for (const res of probeResults) {
-      const { category, probe } = res;
+    // Probe all video and voice tasks simultaneously in RAM (up to 24 parallel workers)
+    const [videoProbeResults, voiceProbeResults] = await Promise.all([
+      videoTasks.length > 0
+        ? pMap(
+            videoTasks,
+            async (task, idx) => {
+              const probe = await probeGoogleDriveClipMetadata(task.fileId);
+              return { category: task.category, probe, idx };
+            },
+            24
+          )
+        : Promise.resolve([]),
+      voiceTasks.length > 0
+        ? pMap(
+            voiceTasks,
+            async (task, idx) => {
+              const probe = await probeGoogleDriveVoiceMetadata(
+                task.fileId,
+                currentVoices.length + idx + 1
+              );
+              return { probe, idx };
+            },
+            24
+          )
+        : Promise.resolve([]),
+    ]);
+
+    for (const res of videoProbeResults) {
+      const { category, probe, idx } = res;
       if (!probe.success) {
         errors.push({
           fileId: probe.fileId,
@@ -190,12 +222,11 @@ export async function POST(req: NextRequest) {
 
       const safeBase = probe.fileName.replace(/\.[^/.]+$/, "");
       const item: CategoryVideoItem = {
-        id: `drive_${category}_${probe.fileId.slice(0, 10)}_${Date.now().toString(36)}`,
+        id: `drive_${category}_${probe.fileId.slice(0, 12)}_${idx}_${Date.now().toString(36)}`,
         name: safeBase,
         fileName: probe.fileName,
         category,
         localUrl: `/api/drive-stream/${probe.fileId}`,
-        // localPath is deliberately undefined: 0 MB disk used
         duration: probe.duration || 4.0,
         sizeBytes: probe.sizeBytes,
         lockFlipH: probe.lockFlipH,
@@ -204,20 +235,83 @@ export async function POST(req: NextRequest) {
       };
 
       pools[category].push(item);
-      addedItems.push(item);
+      addedVideoItems.push(item);
+    }
+
+    for (const res of voiceProbeResults) {
+      const { probe, idx } = res;
+      if (!probe.success) {
+        errors.push({
+          fileId: probe.fileId,
+          category: "voice",
+          error: probe.error || "Không thể tải metadata voice từ Google Drive",
+        });
+        continue;
+      }
+
+      const voiceItem: MultiVoiceItem = {
+        id: `drive_voice_${probe.fileId.slice(0, 12)}_${idx}_${Date.now().toString(36)}`,
+        name: probe.name,
+        fileName: probe.fileName,
+        localUrl: `/api/drive-stream/${probe.fileId}`,
+        localPath: "",
+        duration: probe.duration || 20.0,
+        sourceType: "drive",
+        driveFileId: probe.fileId,
+        driveRawUrl: `https://drive.google.com/file/d/${probe.fileId}/view`,
+      };
+
+      currentVoices.push(voiceItem);
+      addedVoiceItems.push(voiceItem);
     }
 
     state.categoryPools = pools;
+    state.multiVoiceTracks = currentVoices;
     writeProjectState(state, sessionId);
 
     return NextResponse.json({
       success: true,
       sessionId,
-      addedCount: addedItems.length,
+      addedCount: addedVideoItems.length + addedVoiceItems.length,
       duplicateCount,
       errors,
       categoryPools: pools,
+      multiVoiceTracks: currentVoices,
     });
+  }
+
+  // Remove single voice
+  if (action === "remove_voice") {
+    const voiceId = (formData?.get("voiceId") || jsonData?.voiceId) as string;
+    const currentVoices = state.multiVoiceTracks || [];
+    const targetVoice = currentVoices.find((v) => v.id === voiceId);
+    if (targetVoice?.localPath && fs.existsSync(targetVoice.localPath)) {
+      try {
+        fs.unlinkSync(targetVoice.localPath);
+      } catch {
+        // Ignore
+      }
+    }
+    state.multiVoiceTracks = currentVoices.filter((v) => v.id !== voiceId);
+    writeProjectState(state, sessionId);
+    return NextResponse.json({ success: true, sessionId, multiVoiceTracks: state.multiVoiceTracks });
+  }
+
+  // Clear all voices
+  if (action === "clear_voices") {
+    const currentVoices = state.multiVoiceTracks || [];
+    for (const v of currentVoices) {
+      if (v.localPath && fs.existsSync(v.localPath)) {
+        try {
+          fs.unlinkSync(v.localPath);
+        } catch {
+          // Ignore
+        }
+      }
+    }
+    state.multiVoiceTracks = [];
+    writeProjectState(state, sessionId);
+    return NextResponse.json({ success: true, sessionId, multiVoiceTracks: [] });
   }
 
   // Clear single category
@@ -237,7 +331,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ success: true, sessionId, categoryPools: pools });
   }
 
-  // Clear all categories
+  // Clear all categories, voices, and combinations
   if (action === "clear_all") {
     clearSessionCategories(sessionId);
     pools.open = [];
@@ -247,12 +341,14 @@ export async function POST(req: NextRequest) {
     pools.end = [];
     state.categoryPools = pools;
     state.multiVoiceTracks = [];
+    state.composedVideos = [];
     writeProjectState(state, sessionId);
     return NextResponse.json({
       success: true,
       sessionId,
       categoryPools: pools,
       multiVoiceTracks: [],
+      composedVideos: [],
     });
   }
 
@@ -317,10 +413,34 @@ export async function POST(req: NextRequest) {
     for (const file of files) {
       if (!file || typeof file === "string" || !file.name) continue;
 
+      const fileName = path.basename(file.name);
+      if (targetCategory === "voice") {
+        const safeName = fileName.replace(/\s+/g, "_");
+        const ext = path.extname(safeName).toLowerCase() || ".mp3";
+        const id = `voice_${crypto.randomBytes(4).toString("hex")}`;
+        const savedFileName = `${id}_${safeName}`;
+        const filePath = path.join(sessionPaths.voicesDir, savedFileName);
+        const bytes = await file.arrayBuffer();
+        fs.writeFileSync(filePath, Buffer.from(bytes));
+
+        const newVoice: MultiVoiceItem = {
+          id,
+          name: safeName.replace(ext, ""),
+          fileName: savedFileName,
+          localUrl: `/api/media/sessions/${sessionId}/voices/${savedFileName}`,
+          localPath: filePath,
+          duration: 20,
+          sourceType: "local",
+        };
+        const curVoices = state.multiVoiceTracks || [];
+        curVoices.push(newVoice);
+        state.multiVoiceTracks = curVoices;
+        continue;
+      }
+
       let detectedCat: ShotCategory = "product";
       const relativePath = (file as unknown as { webkitRelativePath?: string }).webkitRelativePath || "";
       const lowerRel = relativePath.toLowerCase();
-      const fileName = path.basename(file.name);
       const lowerName = fileName.toLowerCase();
 
       if (lowerRel.includes("/open/") || lowerRel.includes("\\open\\") || lowerName.startsWith("open_") || targetCategory === "open") {
@@ -379,6 +499,7 @@ export async function POST(req: NextRequest) {
       sessionId,
       addedCount: addedItems.length,
       categoryPools: pools,
+      multiVoiceTracks: state.multiVoiceTracks || [],
     });
   }
 

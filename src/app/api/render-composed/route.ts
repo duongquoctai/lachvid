@@ -12,7 +12,8 @@ const PYTHON_BACKEND_URL =
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
-    const sessionId = sanitizeSessionId(body.sessionId || getSessionIdFromHeaders(req.headers));
+    const headerSessionId = getSessionIdFromHeaders(req.headers);
+    const sessionId = sanitizeSessionId(headerSessionId || body.sessionId);
     const state = readProjectState(sessionId);
 
     const composedVideos: ComposedVideo[] =
@@ -26,12 +27,18 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const multiVoicePool = Array.isArray(body.multiVoiceTracks)
+      ? body.multiVoiceTracks
+      : state.multiVoiceTracks || [];
+
     // Prepare payload for Python backend
     const videosPayload = composedVideos.map((comp) => {
       let voiceFilePath = "";
       let voiceUrl = "";
       if (comp.voiceTrackId) {
-        const found = state.multiVoiceTracks?.find((v) => v.id === comp.voiceTrackId);
+        const found =
+          multiVoicePool.find((v: { id: string }) => v.id === comp.voiceTrackId) ||
+          state.multiVoiceTracks?.find((v) => v.id === comp.voiceTrackId);
         if (found) {
           voiceFilePath = found.localPath || "";
           voiceUrl = found.localUrl || "";
@@ -77,8 +84,7 @@ export async function POST(req: NextRequest) {
 
     const contentType = pyRes.headers.get("content-type") || "";
     if (contentType.includes("application/zip")) {
-      const zipArrayBuffer = await pyRes.arrayBuffer();
-      return new NextResponse(zipArrayBuffer, {
+      return new NextResponse(pyRes.body, {
         status: 200,
         headers: {
           "Content-Type": "application/zip",
@@ -88,9 +94,8 @@ export async function POST(req: NextRequest) {
     }
 
     if (contentType.includes("video/mp4")) {
-      const mp4ArrayBuffer = await pyRes.arrayBuffer();
       const filename = composedVideos[0]?.name ? `${composedVideos[0].name}.mp4` : "rendered.mp4";
-      return new NextResponse(mp4ArrayBuffer, {
+      return new NextResponse(pyRes.body, {
         status: 200,
         headers: {
           "Content-Type": "video/mp4",

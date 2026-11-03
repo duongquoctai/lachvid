@@ -48,13 +48,15 @@ export interface ParsedFiveColumnLinks {
   texture: string[];
   apply: string[];
   end: string[];
+  voice?: string[];
   totalExtracted: number;
   skippedRows: number;
 }
 
 /**
- * Parses multi-row, 5-column clipboard text copied directly from Excel.
+ * Parses multi-row, up to 6-column clipboard text copied directly from Excel.
  * In Excel copy-paste, columns are separated by \t and rows by \n.
+ * Column 1..5: open, product, texture, apply, end. Column 6: voice.
  */
 export function parseExcelFiveColumnClipboard(text: string): ParsedFiveColumnLinks {
   const result: ParsedFiveColumnLinks = {
@@ -63,6 +65,7 @@ export function parseExcelFiveColumnClipboard(text: string): ParsedFiveColumnLin
     texture: [],
     apply: [],
     end: [],
+    voice: [],
     totalExtracted: 0,
     skippedRows: 0,
   };
@@ -84,6 +87,20 @@ export function parseExcelFiveColumnClipboard(text: string): ParsedFiveColumnLin
     "cảnh",
     "nhóm",
     "category",
+    "voice",
+    "lồng tiếng",
+    "audio",
+    "thoại",
+    "mp3",
+  ];
+
+  const columnKeys: Array<ShotCategory | "voice"> = [
+    "open",
+    "product",
+    "texture",
+    "apply",
+    "end",
+    "voice",
   ];
 
   for (let rowIdx = 0; rowIdx < lines.length; rowIdx++) {
@@ -103,16 +120,19 @@ export function parseExcelFiveColumnClipboard(text: string): ParsedFiveColumnLin
       }
     }
 
-    // Distribute up to 5 columns
-    for (let colIdx = 0; colIdx < Math.min(cells.length, 5); colIdx++) {
+    // Distribute up to 6 columns
+    for (let colIdx = 0; colIdx < Math.min(cells.length, 6); colIdx++) {
       const cellContent = cells[colIdx];
       if (!cellContent) continue;
 
       const fileId = extractGoogleDriveFileId(cellContent);
       if (fileId) {
-        const cat = CATEGORY_COLUMNS[colIdx];
-        if (cat) {
-          result[cat].push(fileId);
+        const key = columnKeys[colIdx];
+        if (key === "voice") {
+          result.voice?.push(fileId);
+          result.totalExtracted++;
+        } else if (key) {
+          result[key].push(fileId);
           result.totalExtracted++;
         }
       }
@@ -127,60 +147,89 @@ export function parseExcelFiveColumnClipboard(text: string): ParsedFiveColumnLin
  */
 export function parseMp4DurationFromBuffer(buffer: Buffer): number | null {
   try {
-    let offset = 0;
-    const len = buffer.length;
+    let searchStart = 0;
+    while (searchStart < buffer.length - 24) {
+      const idx = buffer.indexOf("mvhd", searchStart);
+      if (idx === -1) break;
 
-    while (offset + 8 <= len) {
-      const boxSize = buffer.readUInt32BE(offset);
-      const boxType = buffer.toString("latin1", offset + 4, offset + 8);
-
-      if (boxSize === 0) break; // Until EOF
-      const actualSize = boxSize === 1 ? Number(buffer.readBigUInt64BE(offset + 8)) : boxSize;
-      if (actualSize <= 0 || isNaN(actualSize)) break;
-
-      if (boxType === "moov") {
-        // Search inside moov for mvhd
-        let moovOffset = offset + (boxSize === 1 ? 16 : 8);
-        const moovEnd = Math.min(len, offset + actualSize);
-
-        while (moovOffset + 8 <= moovEnd) {
-          const subSize = buffer.readUInt32BE(moovOffset);
-          const subType = buffer.toString("latin1", moovOffset + 4, moovOffset + 8);
-
-          if (subSize <= 0) break;
-
-          if (subType === "mvhd") {
-            const mvhdDataOffset = moovOffset + 8;
-            if (mvhdDataOffset + 24 <= len) {
-              const version = buffer.readUInt8(mvhdDataOffset);
-              if (version === 0) {
-                // version 0: 1 byte ver + 3 bytes flags + 4 bytes ctime + 4 bytes mtime + 4 bytes timescale + 4 bytes duration
-                const timescale = buffer.readUInt32BE(mvhdDataOffset + 12);
-                const durationUnits = buffer.readUInt32BE(mvhdDataOffset + 16);
-                if (timescale > 0) {
-                  return Math.round((durationUnits / timescale) * 100) / 100;
-                }
-              } else if (version === 1) {
-                // version 1: 1 byte ver + 3 bytes flags + 8 bytes ctime + 8 bytes mtime + 4 bytes timescale + 8 bytes duration
-                const timescale = buffer.readUInt32BE(mvhdDataOffset + 20);
-                const durationUnits = Number(buffer.readBigUInt64BE(mvhdDataOffset + 24));
-                if (timescale > 0) {
-                  return Math.round((durationUnits / timescale) * 100) / 100;
-                }
-              }
+      const mvhdDataOffset = idx + 4;
+      if (mvhdDataOffset + 24 <= buffer.length) {
+        const version = buffer.readUInt8(mvhdDataOffset);
+        if (version === 0) {
+          const timescale = buffer.readUInt32BE(mvhdDataOffset + 12);
+          const durationUnits = buffer.readUInt32BE(mvhdDataOffset + 16);
+          if (timescale >= 100 && durationUnits > 0) {
+            const sec = durationUnits / timescale;
+            if (sec > 0.1 && sec < 7200) {
+              return Math.round(sec * 10) / 10;
             }
-            break;
           }
-
-          moovOffset += subSize;
+        } else if (version === 1) {
+          const timescale = buffer.readUInt32BE(mvhdDataOffset + 20);
+          const durationUnits = Number(buffer.readBigUInt64BE(mvhdDataOffset + 24));
+          if (timescale >= 100 && durationUnits > 0) {
+            const sec = durationUnits / timescale;
+            if (sec > 0.1 && sec < 7200) {
+              return Math.round(sec * 10) / 10;
+            }
+          }
         }
-        break;
       }
-
-      offset += actualSize;
+      searchStart = idx + 1;
     }
   } catch {
     // If parsing fails, ignore and return null
+  }
+  return null;
+}
+
+/**
+ * Helper to estimate MP3 duration from MPEG frame header bitrate & file size
+ */
+export function parseMp3DurationFromBuffer(buffer: Buffer, totalSizeBytes: number): number | null {
+  try {
+    if (totalSizeBytes <= 0 || buffer.length < 16) return null;
+    let offset = 0;
+
+    // Skip ID3v2 tag if present at start
+    if (
+      buffer.length >= 10 &&
+      buffer[0] === 0x49 && // 'I'
+      buffer[1] === 0x44 && // 'D'
+      buffer[2] === 0x33    // '3'
+    ) {
+      const id3Size =
+        ((buffer[6] & 0x7f) << 21) |
+        ((buffer[7] & 0x7f) << 14) |
+        ((buffer[8] & 0x7f) << 7) |
+        (buffer[9] & 0x7f);
+      offset = 10 + id3Size;
+    }
+
+    const bitratesV1L3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+    const bitratesV2L3 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
+
+    for (let i = Math.max(0, offset); i < buffer.length - 4; i++) {
+      if (buffer[i] === 0xff && (buffer[i + 1] & 0xe0) === 0xe0) {
+        const versionBits = (buffer[i + 1] >> 3) & 0x03;
+        const layerBits = (buffer[i + 1] >> 1) & 0x03;
+        const bitrateIdx = (buffer[i + 2] >> 4) & 0x0f;
+        const sampleRateIdx = (buffer[i + 2] >> 2) & 0x03;
+        if (versionBits === 1 || layerBits !== 1 || bitrateIdx === 0 || bitrateIdx === 15 || sampleRateIdx === 3) {
+          continue;
+        }
+        const kbps = versionBits === 3 ? bitratesV1L3[bitrateIdx] : bitratesV2L3[bitrateIdx];
+        if (kbps > 0) {
+          const audioBytes = Math.max(0, totalSizeBytes - offset);
+          const sec = (audioBytes * 8) / (kbps * 1000);
+          if (sec > 0.3 && sec < 7200) {
+            return Math.round(sec * 10) / 10;
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore
   }
   return null;
 }
@@ -195,13 +244,20 @@ export interface DriveClipProbeResult {
   error?: string;
 }
 
+// In-memory cache to avoid re-probing identical Google Drive fileIds
+const clipProbeCache = new Map<string, DriveClipProbeResult>();
+const voiceProbeCache = new Map<string, DriveVoiceProbeResult>();
+
 /**
- * Probes Google Drive clip metadata in RAM by reading only first 128KB.
- * 0 MB disk used.
+ * Probes Google Drive clip metadata in RAM by reading first 64KB and tail 128KB only if needed.
+ * Reuses resolved redirect URL to avoid double redirect latency. 0 MB disk used.
  */
 export async function probeGoogleDriveClipMetadata(
   fileId: string
 ): Promise<DriveClipProbeResult> {
+  const cached = clipProbeCache.get(fileId);
+  if (cached) return cached;
+
   const directUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
   try {
@@ -211,7 +267,7 @@ export async function probeGoogleDriveClipMetadata(
     const res = await fetch(directUrl, {
       method: "GET",
       headers: {
-        Range: "bytes=0-131071", // Read first 128 KB
+        Range: "bytes=0-65535", // Read first 64 KB (faststart mvhd is in first few KB)
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       },
@@ -234,7 +290,6 @@ export async function probeGoogleDriveClipMetadata(
     }
 
     const contentType = (res.headers.get("content-type") || "").toLowerCase();
-    // If Google returned HTML, it means the file is private or requires Google login
     if (contentType.includes("text/html")) {
       return {
         success: false,
@@ -247,7 +302,6 @@ export async function probeGoogleDriveClipMetadata(
       };
     }
 
-    // Extract filename from Content-Disposition header
     let fileName = `drive_${fileId.slice(0, 8)}.mp4`;
     const cd = res.headers.get("content-disposition") || "";
     const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?"?([^";\r\n]+)"?/i);
@@ -258,13 +312,6 @@ export async function probeGoogleDriveClipMetadata(
     const arrayBuffer = await res.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    // Extract exact duration from MP4 faststart mvhd atom
-    let duration = parseMp4DurationFromBuffer(buffer) || 4.0;
-    if (duration <= 0.1 || duration > 3600) {
-      duration = 4.0;
-    }
-
-    // Total file size from Content-Range or Content-Length
     let totalSizeBytes = buffer.length;
     const contentRange = res.headers.get("content-range") || "";
     const crMatch = contentRange.match(/\/(\d+)$/);
@@ -275,10 +322,47 @@ export async function probeGoogleDriveClipMetadata(
       if (cl) totalSizeBytes = parseInt(cl, 10);
     }
 
+    let duration = parseMp4DurationFromBuffer(buffer) || 0;
+
+    // If moov atom is at the end of the file, probe the last 128KB using the already-redirected URL
+    if ((!duration || duration <= 0) && totalSizeBytes > 65536) {
+      try {
+        const tailBytes = 131072;
+        const tailStart = Math.max(0, totalSizeBytes - tailBytes);
+        const resolvedUrl = res.url || directUrl;
+        const tailCtrl = new AbortController();
+        const tailTimer = setTimeout(() => tailCtrl.abort(), 6000);
+        const tailRes = await fetch(resolvedUrl, {
+          method: "GET",
+          headers: {
+            Range: `bytes=${tailStart}-${totalSizeBytes - 1}`,
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          },
+          redirect: "follow",
+          signal: tailCtrl.signal,
+        });
+        clearTimeout(tailTimer);
+        if (tailRes.ok || tailRes.status === 206) {
+          const tailBuf = Buffer.from(await tailRes.arrayBuffer());
+          const tailDur = parseMp4DurationFromBuffer(tailBuf);
+          if (tailDur && tailDur > 0.1) {
+            duration = tailDur;
+          }
+        }
+      } catch {
+        // Fallback
+      }
+    }
+
+    if (!duration || duration <= 0.1 || duration > 7200) {
+      duration = 4.0;
+    }
+
     const lowerName = fileName.toLowerCase();
     const lockFlipH = lowerName.includes("_lock");
 
-    return {
+    const result: DriveClipProbeResult = {
       success: true,
       fileId,
       fileName,
@@ -286,6 +370,8 @@ export async function probeGoogleDriveClipMetadata(
       sizeBytes: totalSizeBytes,
       lockFlipH,
     };
+    clipProbeCache.set(fileId, result);
+    return result;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     return {
@@ -295,6 +381,127 @@ export async function probeGoogleDriveClipMetadata(
       duration: 4.0,
       sizeBytes: 0,
       lockFlipH: false,
+      error: `Lỗi kết nối tới Google Drive: ${msg}`,
+    };
+  }
+}
+
+export interface DriveVoiceProbeResult {
+  success: boolean;
+  fileId: string;
+  name: string;
+  fileName: string;
+  duration: number;
+  sizeBytes: number;
+  error?: string;
+}
+
+/**
+ * Probes Google Drive voice/audio metadata in RAM using a single 32KB range request. 0 MB disk used.
+ */
+export async function probeGoogleDriveVoiceMetadata(
+  fileId: string,
+  indexFallback: number = 1
+): Promise<DriveVoiceProbeResult> {
+  const cached = voiceProbeCache.get(fileId);
+  if (cached) return cached;
+
+  const directUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch(directUrl, {
+      method: "GET",
+      headers: {
+        Range: "bytes=0-32767", // Read first 32 KB only
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!res.ok && res.status !== 206) {
+      return {
+        success: false,
+        fileId,
+        name: `Voice ${indexFallback}`,
+        fileName: `voice_${fileId.slice(0, 8)}.mp3`,
+        duration: 20.0,
+        sizeBytes: 0,
+        error: `HTTP ${res.status}: Không thể truy cập file Google Drive`,
+      };
+    }
+
+    const contentType = (res.headers.get("content-type") || "").toLowerCase();
+    if (contentType.includes("text/html")) {
+      return {
+        success: false,
+        fileId,
+        name: `Voice ${indexFallback}`,
+        fileName: `voice_${fileId.slice(0, 8)}.mp3`,
+        duration: 20.0,
+        sizeBytes: 0,
+        error: "Link chưa mở quyền công khai (Anyone with the link can view)",
+      };
+    }
+
+    let fileName = `voice_${fileId.slice(0, 8)}.mp3`;
+    const cd = res.headers.get("content-disposition") || "";
+    const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?"?([^";\r\n]+)"?/i);
+    if (fnMatch && fnMatch[1]) {
+      fileName = decodeURIComponent(fnMatch[1].trim()).replace(/\+/g, " ");
+    }
+
+    const arrayBuffer = await res.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    let totalSizeBytes = buffer.length;
+    const contentRange = res.headers.get("content-range") || "";
+    const crMatch = contentRange.match(/\/(\d+)$/);
+    if (crMatch && crMatch[1]) {
+      totalSizeBytes = parseInt(crMatch[1], 10);
+    } else {
+      const cl = res.headers.get("content-length");
+      if (cl) totalSizeBytes = parseInt(cl, 10);
+    }
+
+    // Parse MP3 frame header bitrate duration or MP4/M4A mvhd duration in 1 pass
+    let duration =
+      parseMp3DurationFromBuffer(buffer, totalSizeBytes) ||
+      parseMp4DurationFromBuffer(buffer) ||
+      0;
+
+    if (!duration || duration <= 0.1 || duration > 7200) {
+      duration = 20.0;
+    }
+
+    const ext = fileName.includes(".") ? fileName.substring(fileName.lastIndexOf(".")) : "";
+    const name = ext ? fileName.slice(0, -ext.length) : fileName;
+
+    const result: DriveVoiceProbeResult = {
+      success: true,
+      fileId,
+      name,
+      fileName,
+      duration,
+      sizeBytes: totalSizeBytes,
+    };
+    voiceProbeCache.set(fileId, result);
+    return result;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      fileId,
+      name: `Voice ${indexFallback}`,
+      fileName: `voice_${fileId.slice(0, 8)}.mp3`,
+      duration: 20.0,
+      sizeBytes: 0,
       error: `Lỗi kết nối tới Google Drive: ${msg}`,
     };
   }

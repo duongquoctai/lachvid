@@ -56,24 +56,73 @@ async function ensureAssetsUploadedAndRefreshPayloads(apiKey?: string) {
   }
 
   if (changed) {
+    const isPoolMix = Boolean(
+      state.categoryPools &&
+        Object.values(state.categoryPools).some((p) => p && p.length > 0)
+    );
     const shotMap = new Map<string, Shot>();
     for (const s of state.shots) {
       shotMap.set(s.id, s);
+    }
+    if (state.categoryPools) {
+      const cats: Array<"open" | "product" | "texture" | "apply" | "end"> = [
+        "open",
+        "product",
+        "texture",
+        "apply",
+        "end",
+      ];
+      for (const cat of cats) {
+        for (const item of state.categoryPools[cat] || []) {
+          shotMap.set(item.id, {
+            id: item.id,
+            sourceVideoId: item.id,
+            label: item.name || item.fileName,
+            begin: 0,
+            end: item.duration || 4.0,
+            category: cat,
+            edits: {
+              speed: 1,
+              flipH: false,
+              lockFlipH: Boolean(item.lockFlipH),
+              zoom: false,
+              transition: null,
+              transitionDuration: 0,
+              customSrc: item.zvidRemoteUrl || item.localUrl,
+              customLocalUrl: item.localUrl,
+              customLocalPath: item.localPath,
+            },
+          });
+        }
+      }
     }
 
     state.composedVideos = state.composedVideos.map((comp, idx) => {
       const tupleShots = comp.shotIds.map((id) => shotMap.get(id));
       if (tupleShots.every(Boolean)) {
+        const tupleTyped = tupleShots as [Shot, Shot, Shot, Shot, Shot];
         const rebuilt = buildComposedVideo({
           index: idx,
-          tuple: tupleShots as [Shot, Shot, Shot, Shot, Shot],
-          sourceVideo: state.sourceVideo!,
+          tuple: tupleTyped,
+          sourceVideo: state.sourceVideo || {
+            id: "pool_mix",
+            name: "Category Pool Mix",
+            fileName: "pool_mix.mp4",
+            localUrl: tupleTyped[0]?.edits?.customLocalUrl || "",
+            localPath: "",
+            sizeBytes: 0,
+            duration: 20,
+            width: 1080,
+            height: 1920,
+            createdAt: new Date().toISOString(),
+          },
           voiceTrack: state.voiceTrack,
           syncMode: state.syncMode,
           diversityConfig: state.diversityConfig,
           categoryMinDurations: state.categoryMinDurations,
           existingJobId: comp.jobId,
           existingId: comp.id,
+          preserveOriginalClips: isPoolMix,
         });
         return {
           ...rebuilt,

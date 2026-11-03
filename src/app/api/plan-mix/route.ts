@@ -15,6 +15,7 @@ import {
   CategoryPools,
   ComposedVideo,
   DiversityConfig,
+  MultiVoiceItem,
   Shot,
   VoiceTrack,
 } from "@/types/lachvid";
@@ -70,6 +71,12 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const isCategoryPool = poolShots.length >= 5;
+    const preserveOriginalClips =
+      body.preserveOriginalClips !== undefined
+        ? Boolean(body.preserveOriginalClips)
+        : isCategoryPool;
+
     const diversityConfig: DiversityConfig = {
       ...state.diversityConfig,
       ...(body.diversityConfig || {}),
@@ -78,11 +85,32 @@ export async function POST(req: NextRequest) {
           state.diversityConfig.targetOutputDuration ||
           20
       ),
-      targetCount: Number(
-        body.diversityConfig?.targetCount ||
-          state.diversityConfig.targetCount ||
-          3
+      targetCount: Math.min(
+        50,
+        Math.max(
+          1,
+          Number(
+            body.diversityConfig?.targetCount ||
+              state.diversityConfig.targetCount ||
+              3
+          )
+        )
       ),
+      enableAutoVariantEdits:
+        isCategoryPool || preserveOriginalClips
+          ? false
+          : Boolean(
+              body.diversityConfig?.enableAutoVariantEdits ??
+                state.diversityConfig.enableAutoVariantEdits
+            ),
+      randomTransitionDuration:
+        isCategoryPool || preserveOriginalClips
+          ? 0
+          : Number(
+              body.diversityConfig?.randomTransitionDuration ??
+                state.diversityConfig.randomTransitionDuration ??
+                0
+            ),
     };
 
     const plan = planDiverseCombinations(shotsToUse, diversityConfig);
@@ -100,24 +128,53 @@ export async function POST(req: NextRequest) {
 
     const syncMode: AudioVideoSyncMode = body.syncMode || state.syncMode || "video_master";
 
-    // Multi-voice distribution
-    const multiVoices = state.multiVoiceTracks || [];
-    const hasVoices = multiVoices.length > 0;
+    // Multi-voice distribution (balanced round-robin + unique pairing with OPEN hook)
+    const mixVoiceMode: "none" | "rotate" = body.mixVoiceMode ?? "rotate";
+    const multiVoices: MultiVoiceItem[] = body.multiVoiceTracks || state.multiVoiceTracks || [];
+    const hasVoices = mixVoiceMode === "rotate" && multiVoices.length > 0;
+
+    const voiceUsageCounts: Record<string, number> = {};
+    const openVoicePairCounts: Record<string, number> = {};
+    let lastVoiceId: string | null = null;
 
     const composedVideos: ComposedVideo[] = plan.tuples.map((tuple, index) => {
-      let voiceForThisVideo: VoiceTrack | null = state.voiceTrack;
+      let voiceForThisVideo: VoiceTrack | null = null;
       if (hasVoices) {
-        const chosenVoice = multiVoices[index % multiVoices.length];
+        const openId = tuple[0]?.id || "open";
+        let bestVoice = multiVoices[index % multiVoices.length];
+        let bestVoiceScore = Infinity;
+
+        for (let vIdx = 0; vIdx < multiVoices.length; vIdx++) {
+          const candidateVoice = multiVoices[(index + vIdx) % multiVoices.length];
+          const vUse = voiceUsageCounts[candidateVoice.id] || 0;
+          const pairKey = `${openId}|${candidateVoice.id}`;
+          const pairUse = openVoicePairCounts[pairKey] || 0;
+          const repeatPenalty =
+            multiVoices.length > 1 && candidateVoice.id === lastVoiceId ? 200 : 0;
+          const score = vUse * 100 + pairUse * 60 + repeatPenalty;
+          if (score < bestVoiceScore) {
+            bestVoiceScore = score;
+            bestVoice = candidateVoice;
+          }
+        }
+
+        voiceUsageCounts[bestVoice.id] = (voiceUsageCounts[bestVoice.id] || 0) + 1;
+        openVoicePairCounts[`${openId}|${bestVoice.id}`] =
+          (openVoicePairCounts[`${openId}|${bestVoice.id}`] || 0) + 1;
+        lastVoiceId = bestVoice.id;
+
         voiceForThisVideo = {
-          id: chosenVoice.id,
-          name: chosenVoice.name,
-          fileName: chosenVoice.fileName,
-          localUrl: chosenVoice.localUrl,
-          localPath: chosenVoice.localPath || "",
+          id: bestVoice.id,
+          name: bestVoice.name,
+          fileName: bestVoice.fileName,
+          localUrl: bestVoice.localUrl,
+          localPath: bestVoice.localPath || "",
           sizeBytes: 0,
-          duration: chosenVoice.duration || 20,
+          duration: bestVoice.duration || 20,
           createdAt: new Date().toISOString(),
         };
+      } else if (mixVoiceMode !== "none" && state.voiceTrack) {
+        voiceForThisVideo = state.voiceTrack;
       }
 
       return buildComposedVideo({
@@ -139,9 +196,12 @@ export async function POST(req: NextRequest) {
         syncMode,
         diversityConfig,
         categoryMinDurations: state.categoryMinDurations,
+        preserveOriginalClips,
       });
     });
 
+    state.categoryPools = pools;
+    state.multiVoiceTracks = multiVoices;
     state.composedVideos = composedVideos;
     state.diversityConfig = diversityConfig;
     writeProjectState(state, sessionId);

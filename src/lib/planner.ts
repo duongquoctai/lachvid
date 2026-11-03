@@ -132,33 +132,73 @@ export function planDiverseCombinations(
     byCat.apply.length *
     byCat.end.length;
 
-  const rand = createSeededRandom(config.seed || 42);
+  const rand = createSeededRandom(config.seed || Date.now());
 
-  // Enumerate all candidate tuples if space <= 10,000 (5^5 = 3125 fits easily in memory)
+  // Shuffle each category pool first so order is never biased by import sequence
+  for (const cat of CATEGORY_ORDER) {
+    const arr = byCat[cat];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      const tmp = arr[i];
+      arr[i] = arr[j];
+      arr[j] = tmp;
+    }
+  }
+
+  // Generate candidate pool:
+  // - If total space <= 5,000, enumerate all combinations exactly.
+  // - If total space > 5,000 (e.g. 10^5 = 100,000), use stratified Latin-square + random sampling
+  //   so every clip in every category (especially OPEN) is uniformly represented.
   const allCandidates: [Shot, Shot, Shot, Shot, Shot][] = [];
-  const limitEnumeration = 10000;
+  const limitEnumeration = 8000;
 
-  outer: for (const sOpen of byCat.open) {
-    for (const sProd of byCat.product) {
-      for (const sTex of byCat.texture) {
-        for (const sApp of byCat.apply) {
-          for (const sEnd of byCat.end) {
-            allCandidates.push([sOpen, sProd, sTex, sApp, sEnd]);
-            if (allCandidates.length >= limitEnumeration) {
-              break outer;
+  if (maxPossibleCombinations <= 5000) {
+    for (const sOpen of byCat.open) {
+      for (const sProd of byCat.product) {
+        for (const sTex of byCat.texture) {
+          for (const sApp of byCat.apply) {
+            for (const sEnd of byCat.end) {
+              allCandidates.push([sOpen, sProd, sTex, sApp, sEnd]);
             }
           }
         }
       }
     }
-  }
+    for (let i = allCandidates.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      const tmp = allCandidates[i];
+      allCandidates[i] = allCandidates[j];
+      allCandidates[j] = tmp;
+    }
+  } else {
+    const seenKeys = new Set<string>();
+    const nOpen = byCat.open.length;
+    const nProd = byCat.product.length;
+    const nTex = byCat.texture.length;
+    const nApp = byCat.apply.length;
+    const nEnd = byCat.end.length;
 
-  // Shuffle candidates deterministically using Fisher-Yates
-  for (let i = allCandidates.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    const tmp = allCandidates[i];
-    allCandidates[i] = allCandidates[j];
-    allCandidates[j] = tmp;
+    // Phase 1: Stratified Latin-hypercube sweeps so every open/product/texture/apply/end clip appears evenly
+    const sweeps = Math.min(limitEnumeration, Math.max((config.targetCount || 20) * 40, 3000));
+    for (let idx = 0; idx < sweeps * 2 && allCandidates.length < limitEnumeration; idx++) {
+      const oIdx = idx % nOpen;
+      const cycle = Math.floor(idx / nOpen);
+      const pIdx = (oIdx + cycle * 3 + Math.floor(rand() * nProd)) % nProd;
+      const tIdx = (oIdx * 2 + cycle * 5 + Math.floor(rand() * nTex)) % nTex;
+      const aIdx = (oIdx * 3 + cycle * 7 + Math.floor(rand() * nApp)) % nApp;
+      const eIdx = (oIdx * 5 + cycle * 11 + Math.floor(rand() * nEnd)) % nEnd;
+
+      const sOpen = byCat.open[oIdx];
+      const sProd = byCat.product[pIdx];
+      const sTex = byCat.texture[tIdx];
+      const sApp = byCat.apply[aIdx];
+      const sEnd = byCat.end[eIdx];
+      const key = `${sOpen.id}|${sProd.id}|${sTex.id}|${sApp.id}|${sEnd.id}`;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        allCandidates.push([sOpen, sProd, sTex, sApp, sEnd]);
+      }
+    }
   }
 
   const selected: [Shot, Shot, Shot, Shot, Shot][] = [];
@@ -170,7 +210,6 @@ export function planDiverseCombinations(
 
   const targetN = Math.min(config.targetCount, maxPossibleCombinations);
   const minHamming = Math.max(1, Math.min(5, config.minHammingDistance));
-  const maxFreq = Math.max(1, config.maxShotFrequency);
 
   const usedCandidateIndices = new Set<number>();
 
@@ -178,51 +217,97 @@ export function planDiverseCombinations(
     let bestIdx = -1;
     let bestScore = Infinity;
 
-    for (let i = 0; i < allCandidates.length; i++) {
-      if (usedCandidateIndices.has(i)) continue;
-      const cand = allCandidates[i];
-      const candIds: [string, string, string, string, string] = [
-        cand[0].id,
-        cand[1].id,
-        cand[2].id,
-        cand[3].id,
-        cand[4].id,
-      ];
+    const nextOrdinal = selected.length + 1;
+    // Ideal round-robin cap per category at this point in the sequence
+    const idealCapByCat = CATEGORY_ORDER.map((cat) =>
+      Math.ceil(nextOrdinal / Math.max(1, byCat[cat].length))
+    );
 
-      // Check per-shot frequency cap (accounting for case where same shot ID is somehow in multiple slots)
-      let exceedsFreq = false;
-      let usageSum = 0;
-      for (let k = 0; k < 5; k++) {
-        const currentUse = shotUsageCounts[candIds[k]] || 0;
-        if (currentUse + 1 > maxFreq) {
-          exceedsFreq = true;
-          break;
+    const prevTupleIds = selectedIds.length > 0 ? selectedIds[selectedIds.length - 1] : null;
+    let currentMinHamming = minHamming;
+    let allowOverIdealCap = 0;
+
+    while (bestIdx === -1 && currentMinHamming >= 1) {
+      for (let i = 0; i < allCandidates.length; i++) {
+        if (usedCandidateIndices.has(i)) continue;
+        const cand = allCandidates[i];
+        const candIds: [string, string, string, string, string] = [
+          cand[0].id,
+          cand[1].id,
+          cand[2].id,
+          cand[3].id,
+          cand[4].id,
+        ];
+
+        // 1. Check strict uniqueness and pairwise Hamming distance
+        let isDuplicate = false;
+        let minDistanceToPrev = 5;
+        let totalDistanceSum = 0;
+        for (const prevIds of selectedIds) {
+          const dist = computeHammingDistance(candIds, prevIds);
+          totalDistanceSum += dist;
+          if (dist < minDistanceToPrev) minDistanceToPrev = dist;
+          if (dist === 0) {
+            isDuplicate = true;
+            break;
+          }
         }
-        usageSum += currentUse;
-      }
-      if (exceedsFreq) continue;
+        if (isDuplicate) continue;
+        if (minDistanceToPrev < currentMinHamming) continue;
 
-      // Check pairwise Hamming distance against all already selected tuples
-      let violatesHamming = false;
-      for (const prevIds of selectedIds) {
-        if (computeHammingDistance(candIds, prevIds) < minHamming) {
-          violatesHamming = true;
-          break;
+        // 2. Check per-category round-robin balance
+        let overCapCount = 0;
+        let usageScore = 0;
+        for (let k = 0; k < 5; k++) {
+          const u = shotUsageCounts[candIds[k]] || 0;
+          if (u + 1 > idealCapByCat[k] + allowOverIdealCap) {
+            overCapCount++;
+          }
+          // Weight slot 0 (OPEN hook) higher so opening clips rotate strictly
+          const slotWeight = k === 0 ? 35 : 15;
+          usageScore += u * slotWeight;
+        }
+        if (overCapCount > 0) continue;
+
+        // 3. Penalize repeating the same clip as the immediately preceding video
+        let consecutiveRepeatPenalty = 0;
+        if (prevTupleIds) {
+          if (candIds[0] === prevTupleIds[0] && byCat.open.length > 1) {
+            consecutiveRepeatPenalty += 500;
+          }
+          for (let k = 1; k < 5; k++) {
+            if (candIds[k] === prevTupleIds[k] && byCat[CATEGORY_ORDER[k]].length > 1) {
+              consecutiveRepeatPenalty += 80;
+            }
+          }
+        }
+
+        const avgDistance = selectedIds.length > 0 ? totalDistanceSum / selectedIds.length : 5;
+        const score =
+          usageScore +
+          consecutiveRepeatPenalty -
+          minDistanceToPrev * 12 -
+          avgDistance * 4;
+
+        if (score < bestScore) {
+          bestScore = score;
+          bestIdx = i;
         }
       }
-      if (violatesHamming) continue;
 
-      // Prefer candidates with lowest cumulative shot usage so shots are balanced evenly
-      if (usageSum < bestScore) {
-        bestScore = usageSum;
-        bestIdx = i;
-        if (usageSum === 0) break; // Optimal unused shot combination
+      if (bestIdx === -1) {
+        if (allowOverIdealCap < 2) {
+          allowOverIdealCap++;
+        } else {
+          allowOverIdealCap = 0;
+          currentMinHamming--;
+        }
       }
     }
 
     if (bestIdx === -1) {
       warnings.push(
-        `Đã dừng ở ${selected.length}/${targetN} video do ràng buộc độ đa dạng (Min Hamming = ${minHamming}, Max lặp shot = ${maxFreq}) đã bão hoà trên tập shots hiện tại.`
+        `Đã tạo tối đa ${selected.length}/${targetN} video (đã dùng hết các tổ hợp độc nhất có thể).`
       );
       break;
     }
@@ -270,11 +355,9 @@ function round3(n: number): number {
 }
 
 /**
- * Builds a complete ComposedVideo & ZvidRenderPayload from a 5-shot tuple,
- * applying Layer-1 (per-shot) + Layer-2 (variant) edits, transition overlap math,
- * and fitting output duration to targetOutputDuration (default 20s):
- * - Priority 1: Trim excess duration on shots that are longer than their Category Min Duration
- * - Priority 2: Fine-tune speed slightly so total output duration matches targetOutputDuration (e.g. 20.0s)
+ * Builds a complete ComposedVideo & ZvidRenderPayload from a 5-shot tuple.
+ * When preserveOriginalClips is true, keeps 100% of the clips' original speed (1.0),
+ * full duration (no cut/slow-motion), and no random variant edits.
  */
 export function buildComposedVideo(params: {
   index: number;
@@ -286,6 +369,7 @@ export function buildComposedVideo(params: {
   categoryMinDurations?: CategoryMinDurations;
   existingJobId?: string;
   existingId?: string;
+  preserveOriginalClips?: boolean;
 }): ComposedVideo {
   const {
     index,
@@ -297,6 +381,7 @@ export function buildComposedVideo(params: {
     categoryMinDurations,
     existingJobId,
     existingId,
+    preserveOriginalClips = false,
   } = params;
 
   const minDurs: CategoryMinDurations = {
@@ -311,9 +396,28 @@ export function buildComposedVideo(params: {
     const isLast = idx === 4;
     const category = CATEGORY_ORDER[idx];
     const minCatDur = minDurs[category] ?? DEFAULT_CATEGORY_MIN_DURATIONS[category];
-    const originalClipLen = Math.max(0.2, shot.end - shot.begin);
+    const originalClipLen = Math.max(0.1, shot.end - shot.begin);
 
-    // Ensure speed satisfies the category minimum duration if raw clip is shorter than minCatDur
+    // If preserveOriginalClips is true (Khâu 2): keep 100% original clip speed, bounds and no auto edits
+    if (preserveOriginalClips) {
+      return {
+        shot,
+        category,
+        minCatDur,
+        originalClipLen,
+        baseClipLen: originalClipLen,
+        videoEnd: shot.end,
+        speed: shot.edits.speed && shot.edits.speed > 0 ? round3(shot.edits.speed) : 1.0,
+        flipH: Boolean(shot.edits.flipH),
+        zoom: shot.edits.zoom || false,
+        cropParams: shot.edits.cropParams,
+        filter: shot.edits.filter,
+        transition: null,
+        transitionDuration: 0,
+      };
+    }
+
+    // Default behavior for Khâu 1 / auto-slow-motion
     const autoSlowSpeed = computeShotSpeedForMinDuration(originalClipLen, minCatDur);
     let speed =
       shot.edits.speed && shot.edits.speed !== 1
@@ -336,7 +440,7 @@ export function buildComposedVideo(params: {
         flipH = !flipH;
       }
 
-      // Slight Ken Burns zoom depth variation (1.08 to 1.24)
+      // Ken Burns zoom depth variation (1.08 to 1.24)
       if (!zoom) {
         if (rand() > 0.35) {
           zoom = { depth: round3(1.08 + rand() * 0.16) };
@@ -349,10 +453,9 @@ export function buildComposedVideo(params: {
         };
       }
 
-      // Subtle color filter variation to evade duplicate hash/perceptual detection
-      const bShift = Math.round((rand() - 0.5) * 8); // -4 to +4
-      const cShift = Math.round((rand() - 0.5) * 10); // -5 to +5
-      const sShift = Math.round((rand() - 0.5) * 12); // -6 to +6
+      const bShift = Math.round((rand() - 0.5) * 8);
+      const cShift = Math.round((rand() - 0.5) * 10);
+      const sShift = Math.round((rand() - 0.5) * 12);
       const mergedFilter = {
         ...(filter || {}),
         brightness: Math.max(-100, Math.min(100, (filter?.brightness || 0) + bShift)),

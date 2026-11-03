@@ -316,6 +316,9 @@ export interface MultiVoiceItem {
   localUrl: string;
   localPath?: string;
   duration: number;
+  sourceType?: "drive" | "local";
+  driveFileId?: string;
+  driveRawUrl?: string;
 }
 
 export interface ProjectState {

@@ -32,6 +32,22 @@ app.add_middleware(
 # Concurrency Semaphore: Max 3 heavy FFmpeg / PySceneDetect tasks in parallel
 WORKER_SEMAPHORE = threading.BoundedSemaphore(3)
 
+# Real-time render progress tracker: session_id -> { current, total, percent, current_name }
+RENDER_PROGRESS = {}
+
+@app.get("/render-progress/{session_id}")
+async def get_render_progress(session_id: str):
+    progress = RENDER_PROGRESS.get(session_id)
+    if not progress:
+        return {"active": False, "current": 0, "total": 0, "percent": 0, "current_name": ""}
+    return {
+        "active": True,
+        "current": progress.get("current", 0),
+        "total": progress.get("total", 0),
+        "percent": progress.get("percent", 0),
+        "current_name": progress.get("current_name", ""),
+    }
+
 # -------------------------------------------------------------
 # BACKGROUND CLEANUP JANITOR (TTL 30 mins, Max 5GB)
 # -------------------------------------------------------------
@@ -419,9 +435,12 @@ def resolve_disk_path(
         # Check if Google Drive file
         drive_id = extract_drive_file_id(url)
         if drive_id and drive_cache_dir:
-            cached_file = os.path.join(drive_cache_dir, f"drive_{drive_id}.mp4")
+            cached_file = os.path.join(drive_cache_dir, f"drive_{drive_id}.media")
+            cached_file_old = os.path.join(drive_cache_dir, f"drive_{drive_id}.mp4")
             if os.path.exists(cached_file) and os.path.getsize(cached_file) > 1000:
                 return cached_file
+            if os.path.exists(cached_file_old) and os.path.getsize(cached_file_old) > 1000:
+                return cached_file_old
             if download_drive_file(drive_id, cached_file):
                 return cached_file
 
@@ -463,162 +482,240 @@ def render_composed_endpoint(req: RenderBatchRequest):
 
     with WORKER_SEMAPHORE:
         import subprocess
+        import hashlib
+        from concurrent.futures import ThreadPoolExecutor
         import imageio_ffmpeg
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
         session_id = req.session_id or "render"
 
-        with tempfile.TemporaryDirectory() as batch_dir:
-            drive_cache_dir = os.path.join(batch_dir, "_drive_cache")
-            os.makedirs(drive_cache_dir, exist_ok=True)
-            rendered_files = []
+        # Initialize progress tracker for this session
+        RENDER_PROGRESS[session_id] = {
+            "current": 0,
+            "total": len(req.videos),
+            "current_name": "",
+            "percent": 0,
+        }
 
-            for idx, v_item in enumerate(req.videos):
-                safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", v_item.name).strip("_") or f"video_{idx+1}"
-                final_mp4_name = f"{safe_name}.mp4"
-                final_mp4_path = os.path.join(batch_dir, final_mp4_name)
+        try:
+            with tempfile.TemporaryDirectory() as batch_dir:
+                drive_cache_dir = os.path.join(batch_dir, "_drive_cache")
+                chunk_cache_dir = os.path.join(batch_dir, "_chunk_cache")
+                os.makedirs(drive_cache_dir, exist_ok=True)
+                os.makedirs(chunk_cache_dir, exist_ok=True)
 
-                with tempfile.TemporaryDirectory() as chunk_dir:
-                    chunk_files: List[str] = []
-                    total_duration = 0.0
+                # Pre-download all unique Google Drive files in parallel (up to 12 threads)
+                unique_drive_ids = set()
+                for v_item in req.videos:
+                    if v_item.voice_url:
+                        did = extract_drive_file_id(v_item.voice_url)
+                        if did:
+                            unique_drive_ids.add(did)
+                    for slot in v_item.slots:
+                        if slot.url:
+                            did = extract_drive_file_id(slot.url)
+                            if did:
+                                unique_drive_ids.add(did)
 
-                    for s_idx, slot in enumerate(v_item.slots):
-                        resolved_src = resolve_disk_path(slot.file_path, slot.url, drive_cache_dir=drive_cache_dir)
-                        if not resolved_src:
-                            raise HTTPException(
-                                status_code=404,
-                                detail=f"Không tìm thấy file nguồn cho cảnh {slot.category.upper()} của video {v_item.name}"
-                            )
+                if unique_drive_ids:
+                    def _prefetch_drive(fid: str):
+                        target = os.path.join(drive_cache_dir, f"drive_{fid}.media")
+                        if not (os.path.exists(target) and os.path.getsize(target) > 1000):
+                            download_drive_file(fid, target)
 
-                        v_begin = max(0.0, slot.video_begin)
-                        v_end = slot.video_end
-                        if v_end <= v_begin:
-                            dur_probe = subprocess.run([ffmpeg_exe, "-i", resolved_src], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", dur_probe.stderr)
-                            if match:
-                                h, m, s = match.groups()
-                                v_end = int(h) * 3600 + int(m) * 60 + float(s)
-                            else:
-                                v_end = v_begin + 4.0
+                    with ThreadPoolExecutor(max_workers=min(12, len(unique_drive_ids))) as pool:
+                        list(pool.map(_prefetch_drive, unique_drive_ids))
 
-                        raw_clip_len = max(0.2, v_end - v_begin)
-                        speed = max(0.1, min(5.0, slot.speed or 1.0))
-                        display_dur = raw_clip_len / speed
-                        total_duration += display_dur
+                is_single = len(req.videos) == 1
+                zip_buffer = io.BytesIO() if not is_single else None
+                zipf = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_STORED) if not is_single else None
+                single_mp4_bytes = b""
+                single_mp4_name = ""
+                rendered_count = 0
+                chunk_dur_cache = {}
 
-                        vf_filters = []
-                        if abs(speed - 1.0) > 0.01:
-                            vf_filters.append(f"setpts={1.0 / speed:.4f}*PTS")
-                        if slot.flip_h:
-                            vf_filters.append("hflip")
-                        vf_filters.append("scale=1080:1920:force_original_aspect_ratio=decrease")
-                        vf_filters.append("pad=1080:1920:(ow-iw)/2:(oh-ih)/2")
-                        vf_filters.append("setsar=1")
-                        vf_filters.append("fps=30")
+                for idx, v_item in enumerate(req.videos):
+                    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", v_item.name).strip("_") or f"video_{idx+1}"
+                    final_mp4_name = f"{safe_name}.mp4"
+                    final_mp4_path = os.path.join(batch_dir, final_mp4_name)
 
-                        chunk_file = os.path.join(chunk_dir, f"slot_{s_idx}_{slot.category}.mp4")
+                    with tempfile.TemporaryDirectory() as chunk_dir:
+                        chunk_files: List[str] = []
+                        total_duration = 0.0
 
-                        cmd_chunk = [
-                            ffmpeg_exe, "-y",
-                            "-ss", f"{v_begin:.3f}",
-                            "-to", f"{v_end:.3f}",
-                            "-i", resolved_src,
-                            "-vf", ",".join(vf_filters),
-                            "-an",
-                            "-c:v", "libx264",
-                            "-preset", "veryfast",
-                            "-crf", "20",
-                            chunk_file
-                        ]
+                        for s_idx, slot in enumerate(v_item.slots):
+                            resolved_src = resolve_disk_path(slot.file_path, slot.url, drive_cache_dir=drive_cache_dir)
+                            if not resolved_src:
+                                raise HTTPException(
+                                    status_code=404,
+                                    detail=f"Không tìm thấy file nguồn cho cảnh {slot.category.upper()} của video {v_item.name}"
+                                )
+
+                            v_begin = max(0.0, slot.video_begin)
+                            v_end = slot.video_end
+                            if v_end <= v_begin:
+                                dur_probe = subprocess.run([ffmpeg_exe, "-i", resolved_src], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", dur_probe.stderr)
+                                if match:
+                                    h, m, s = match.groups()
+                                    v_end = int(h) * 3600 + int(m) * 60 + float(s)
+                                else:
+                                    v_end = v_begin + 4.0
+
+                            raw_clip_len = max(0.2, v_end - v_begin)
+                            speed = max(0.1, min(5.0, slot.speed or 1.0))
+                            display_dur = raw_clip_len / speed
+
+                            # Check ephemeral batch chunk cache so shared clips across 50 combinations encode only ONCE
+                            chunk_sig = f"{resolved_src}|{v_begin:.3f}|{v_end:.3f}|{speed:.4f}|{int(bool(slot.flip_h))}"
+                            chunk_hash = hashlib.md5(chunk_sig.encode("utf-8")).hexdigest()[:16]
+                            cached_chunk_path = os.path.join(chunk_cache_dir, f"chunk_{chunk_hash}.mp4")
+
+                            if os.path.exists(cached_chunk_path) and os.path.getsize(cached_chunk_path) > 1000:
+                                chunk_files.append(cached_chunk_path)
+                                total_duration += chunk_dur_cache.get(chunk_hash, display_dur)
+                                continue
+
+                            total_duration += display_dur
+                            chunk_dur_cache[chunk_hash] = display_dur
+
+                            vf_filters = []
+                            if abs(speed - 1.0) > 0.01:
+                                vf_filters.append(f"setpts={1.0 / speed:.4f}*PTS")
+                            if slot.flip_h:
+                                vf_filters.append("hflip")
+                            vf_filters.append("scale=1080:1920:force_original_aspect_ratio=decrease")
+                            vf_filters.append("pad=1080:1920:(ow-iw)/2:(oh-ih)/2")
+                            vf_filters.append("setsar=1")
+                            vf_filters.append("fps=30")
+
+                            cmd_chunk = [
+                                ffmpeg_exe, "-y",
+                                "-ss", f"{v_begin:.3f}",
+                                "-to", f"{v_end:.3f}",
+                                "-i", resolved_src,
+                                "-vf", ",".join(vf_filters),
+                                "-an",
+                                "-c:v", "libx264",
+                                "-preset", "veryfast",
+                                "-crf", "23",
+                                "-maxrate", "4M",
+                                "-bufsize", "8M",
+                                "-pix_fmt", "yuv420p",
+                                cached_chunk_path
+                            ]
+
+                            try:
+                                subprocess.run(cmd_chunk, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                                chunk_files.append(cached_chunk_path)
+                            except subprocess.CalledProcessError as e:
+                                err_msg = e.stderr.decode("utf-8", errors="ignore")
+                                raise HTTPException(status_code=500, detail=f"Lỗi khi xử lý cảnh {slot.category}: {err_msg[:300]}")
+
+                        concat_list = os.path.join(chunk_dir, "concat.txt")
+                        with open(concat_list, "w") as f:
+                            for c in chunk_files:
+                                f.write(f"file '{c}'\n")
+
+                        voice_path = resolve_disk_path(
+                            v_item.voice_file_path,
+                            v_item.voice_url,
+                            drive_cache_dir=drive_cache_dir,
+                        )
+
+                        # Solution 4: Single-pass Concat & Audio Mux (No intermediate concat_no_audio.mp4)
+                        if voice_path:
+                            cmd_final = [
+                                ffmpeg_exe, "-y",
+                                "-f", "concat",
+                                "-safe", "0",
+                                "-i", concat_list,
+                                "-i", voice_path,
+                                "-filter_complex", "[1:a]apad[aout]",
+                                "-map", "0:v",
+                                "-map", "[aout]",
+                                "-c:v", "copy",
+                                "-c:a", "aac",
+                                "-t", f"{total_duration:.3f}",
+                                "-movflags", "+faststart",
+                                final_mp4_path
+                            ]
+                        else:
+                            cmd_final = [
+                                ffmpeg_exe, "-y",
+                                "-f", "concat",
+                                "-safe", "0",
+                                "-i", concat_list,
+                                "-f", "lavfi",
+                                "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                                "-map", "0:v",
+                                "-map", "1:a",
+                                "-c:v", "copy",
+                                "-c:a", "aac",
+                                "-t", f"{total_duration:.3f}",
+                                "-shortest",
+                                "-movflags", "+faststart",
+                                final_mp4_path
+                            ]
 
                         try:
-                            subprocess.run(cmd_chunk, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-                            chunk_files.append(chunk_file)
+                            subprocess.run(cmd_final, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
                         except subprocess.CalledProcessError as e:
                             err_msg = e.stderr.decode("utf-8", errors="ignore")
-                            raise HTTPException(status_code=500, detail=f"Lỗi khi xử lý cảnh {slot.category}: {err_msg[:300]}")
+                            raise HTTPException(status_code=500, detail=f"Lỗi khi ghép audio cho {v_item.name}: {err_msg[:300]}")
 
-                    concat_list = os.path.join(chunk_dir, "concat.txt")
-                    with open(concat_list, "w") as f:
-                        for c in chunk_files:
-                            f.write(f"file '{c}'\n")
-
-                    no_audio_concat = os.path.join(chunk_dir, "concat_no_audio.mp4")
-                    cmd_concat = [
-                        ffmpeg_exe, "-y",
-                        "-f", "concat",
-                        "-safe", "0",
-                        "-i", concat_list,
-                        "-c", "copy",
-                        no_audio_concat
-                    ]
-                    subprocess.run(cmd_concat, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-
-                    voice_path = resolve_disk_path(
-                        v_item.voice_file_path,
-                        v_item.voice_url,
-                        drive_cache_dir=drive_cache_dir,
-                    )
-                    if voice_path:
-                        cmd_final = [
-                            ffmpeg_exe, "-y",
-                            "-i", no_audio_concat,
-                            "-i", voice_path,
-                            "-map", "0:v",
-                            "-map", "1:a",
-                            "-c:v", "copy",
-                            "-c:a", "aac",
-                            "-t", f"{total_duration:.3f}",
-                            "-movflags", "+faststart",
-                            final_mp4_path
-                        ]
+                    # If single video requested, read directly and record for return
+                    if is_single:
+                        with open(final_mp4_path, "rb") as f:
+                            single_mp4_bytes = f.read()
+                        single_mp4_name = final_mp4_name
+                        try:
+                            os.remove(final_mp4_path)
+                        except OSError:
+                            pass
                     else:
-                        cmd_final = [
-                            ffmpeg_exe, "-y",
-                            "-i", no_audio_concat,
-                            "-f", "lavfi",
-                            "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                            "-c:v", "copy",
-                            "-c:a", "aac",
-                            "-shortest",
-                            "-movflags", "+faststart",
-                            final_mp4_path
-                        ]
-
-                    try:
-                        subprocess.run(cmd_final, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-                        rendered_files.append((final_mp4_path, final_mp4_name))
-                    except subprocess.CalledProcessError as e:
-                        err_msg = e.stderr.decode("utf-8", errors="ignore")
-                        raise HTTPException(status_code=500, detail=f"Lỗi khi ghép audio cho {v_item.name}: {err_msg[:300]}")
+                        # Solution 1: Immediately archive into ZIP and remove MP4 from disk
+                        zipf.write(final_mp4_path, arcname=final_mp4_name)
+                        try:
+                            os.remove(final_mp4_path)
+                        except OSError:
+                            pass
+                        rendered_count += 1
+                        RENDER_PROGRESS[session_id] = {
+                            "current": rendered_count,
+                            "total": len(req.videos),
+                            "percent": round((rendered_count / len(req.videos)) * 100),
+                            "current_name": v_item.name,
+                        }
 
             # If single video requested, return direct MP4
-            if len(rendered_files) == 1 and len(req.videos) == 1:
-                with open(rendered_files[0][0], "rb") as f:
-                    mp4_bytes = f.read()
+            if is_single and single_mp4_bytes:
                 return Response(
-                    content=mp4_bytes,
+                    content=single_mp4_bytes,
                     media_type="video/mp4",
                     headers={
-                        "Content-Disposition": f'attachment; filename="{rendered_files[0][1]}"',
+                        "Content-Disposition": f'attachment; filename="{single_mp4_name}"',
                     },
                 )
 
-            # If batch, package into in-memory ZIP
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-                for file_path, file_name in rendered_files:
-                    zipf.write(file_path, arcname=file_name)
+            # If batch, finalize ZIP and return
+            if zipf:
+                zipf.close()
 
             zip_buffer.seek(0)
+            zip_bytes = zip_buffer.getvalue()
+            zip_buffer.close()
+
             return Response(
-                content=zip_buffer.getvalue(),
+                content=zip_bytes,
                 media_type="application/zip",
                 headers={
                     "Content-Disposition": f'attachment; filename="lachvid_rendered_{session_id}.zip"',
-                    "X-Total-Rendered": str(len(rendered_files)),
+                    "X-Total-Rendered": str(rendered_count),
                 },
             )
+        finally:
+            RENDER_PROGRESS.pop(session_id, None)
 
 if __name__ == "__main__":
     import uvicorn
