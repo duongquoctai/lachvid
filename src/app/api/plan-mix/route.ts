@@ -19,11 +19,13 @@ import {
   Shot,
   VoiceTrack,
 } from "@/types/lachvid";
+import { getRenderedHistory } from "@/lib/db";
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
     const sessionId = sanitizeSessionId(body.sessionId || getSessionIdFromHeaders(req.headers));
+    const projectId = (body.projectId as string) || "";
     const state = readProjectState(sessionId);
 
     const pools: CategoryPools = body.categoryPools || state.categoryPools || {
@@ -113,7 +115,14 @@ export async function POST(req: NextRequest) {
             ),
     };
 
-    const plan = planDiverseCombinations(shotsToUse, diversityConfig);
+    // Load rendered history if projectId provided
+    let historyTuples: string[] = [];
+    if (projectId) {
+      const records = await getRenderedHistory(projectId);
+      historyTuples = records.map((r) => r.tupleKey);
+    }
+
+    const plan = planDiverseCombinations(shotsToUse, diversityConfig, historyTuples);
     if (plan.tuples.length === 0) {
       return NextResponse.json(
         {

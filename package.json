@@ -12,6 +12,7 @@
     "lint": "eslint ."
   },
   "dependencies": {
+    "@sqlitecloud/drivers": "^1.0.982",
     "geist": "^1.8.2",
     "jszip": "^3.10.2",
     "lucide-react": "^1.64.0",

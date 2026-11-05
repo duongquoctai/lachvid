@@ -143,39 +143,27 @@ export function parseExcelFiveColumnClipboard(text: string): ParsedFiveColumnLin
 }
 
 /**
- * Helper to parse MP4 Duration from mvhd atom in buffer
+ * Helper to parse MP4/MOV Duration from mvhd atom in buffer
  */
 export function parseMp4DurationFromBuffer(buffer: Buffer): number | null {
   try {
-    let searchStart = 0;
-    while (searchStart < buffer.length - 24) {
-      const idx = buffer.indexOf("mvhd", searchStart);
-      if (idx === -1) break;
-
-      const mvhdDataOffset = idx + 4;
-      if (mvhdDataOffset + 24 <= buffer.length) {
-        const version = buffer.readUInt8(mvhdDataOffset);
-        if (version === 0) {
-          const timescale = buffer.readUInt32BE(mvhdDataOffset + 12);
-          const durationUnits = buffer.readUInt32BE(mvhdDataOffset + 16);
-          if (timescale >= 100 && durationUnits > 0) {
-            const sec = durationUnits / timescale;
-            if (sec > 0.1 && sec < 7200) {
-              return Math.round(sec * 10) / 10;
-            }
-          }
-        } else if (version === 1) {
-          const timescale = buffer.readUInt32BE(mvhdDataOffset + 20);
-          const durationUnits = Number(buffer.readBigUInt64BE(mvhdDataOffset + 24));
-          if (timescale >= 100 && durationUnits > 0) {
-            const sec = durationUnits / timescale;
-            if (sec > 0.1 && sec < 7200) {
-              return Math.round(sec * 10) / 10;
-            }
-          }
+    const mvhdIdx = buffer.indexOf("mvhd");
+    if (mvhdIdx !== -1 && mvhdIdx + 28 <= buffer.length) {
+      const mvhdDataOffset = mvhdIdx + 4;
+      const version = buffer.readUInt8(mvhdDataOffset);
+      if (version === 0 && mvhdDataOffset + 20 <= buffer.length) {
+        const timescale = buffer.readUInt32BE(mvhdDataOffset + 12);
+        const durationUnits = buffer.readUInt32BE(mvhdDataOffset + 16);
+        if (timescale > 0) {
+          return Math.round((durationUnits / timescale) * 100) / 100;
+        }
+      } else if (version === 1 && mvhdDataOffset + 32 <= buffer.length) {
+        const timescale = buffer.readUInt32BE(mvhdDataOffset + 20);
+        const durationUnits = Number(buffer.readBigUInt64BE(mvhdDataOffset + 24));
+        if (timescale > 0) {
+          return Math.round((durationUnits / timescale) * 100) / 100;
         }
       }
-      searchStart = idx + 1;
     }
   } catch {
     // If parsing fails, ignore and return null
@@ -249,8 +237,9 @@ const clipProbeCache = new Map<string, DriveClipProbeResult>();
 const voiceProbeCache = new Map<string, DriveVoiceProbeResult>();
 
 /**
- * Probes Google Drive clip metadata in RAM by reading first 64KB and tail 128KB only if needed.
- * Reuses resolved redirect URL to avoid double redirect latency. 0 MB disk used.
+ * Probes Google Drive clip metadata in RAM.
+ * Checks head (128KB) or tail (128KB) for mvhd atom to extract exact duration.
+ * 0 MB disk used.
  */
 export async function probeGoogleDriveClipMetadata(
   fileId: string
@@ -262,7 +251,7 @@ export async function probeGoogleDriveClipMetadata(
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
+    const timeout = setTimeout(() => controller.abort(), 12000);
 
     const res = await fetch(directUrl, {
       method: "GET",
@@ -310,9 +299,10 @@ export async function probeGoogleDriveClipMetadata(
     }
 
     const arrayBuffer = await res.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const headBuffer = Buffer.from(arrayBuffer);
 
-    let totalSizeBytes = buffer.length;
+    // Total file size from Content-Range or Content-Length
+    let totalSizeBytes = headBuffer.length;
     const contentRange = res.headers.get("content-range") || "";
     const crMatch = contentRange.match(/\/(\d+)$/);
     if (crMatch && crMatch[1]) {
@@ -322,17 +312,14 @@ export async function probeGoogleDriveClipMetadata(
       if (cl) totalSizeBytes = parseInt(cl, 10);
     }
 
-    let duration = parseMp4DurationFromBuffer(buffer) || 0;
+    // Try extracting duration from head buffer
+    let duration = parseMp4DurationFromBuffer(headBuffer);
 
-    // If moov atom is at the end of the file, probe the last 128KB using the already-redirected URL
-    if ((!duration || duration <= 0) && totalSizeBytes > 65536) {
+    // If moov/mvhd is at the end of the file (common in QuickTime MOV/iPhone videos), fetch the last 128 KB
+    if (!duration && totalSizeBytes > 131072) {
       try {
-        const tailBytes = 131072;
-        const tailStart = Math.max(0, totalSizeBytes - tailBytes);
-        const resolvedUrl = res.url || directUrl;
-        const tailCtrl = new AbortController();
-        const tailTimer = setTimeout(() => tailCtrl.abort(), 6000);
-        const tailRes = await fetch(resolvedUrl, {
+        const tailStart = Math.max(0, totalSizeBytes - 131072);
+        const tailRes = await fetch(directUrl, {
           method: "GET",
           headers: {
             Range: `bytes=${tailStart}-${totalSizeBytes - 1}`,
@@ -340,22 +327,17 @@ export async function probeGoogleDriveClipMetadata(
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
           },
           redirect: "follow",
-          signal: tailCtrl.signal,
         });
-        clearTimeout(tailTimer);
         if (tailRes.ok || tailRes.status === 206) {
           const tailBuf = Buffer.from(await tailRes.arrayBuffer());
-          const tailDur = parseMp4DurationFromBuffer(tailBuf);
-          if (tailDur && tailDur > 0.1) {
-            duration = tailDur;
-          }
+          duration = parseMp4DurationFromBuffer(tailBuf);
         }
       } catch {
-        // Fallback
+        // ignore tail probe failure
       }
     }
 
-    if (!duration || duration <= 0.1 || duration > 7200) {
+    if (!duration || duration <= 0.1 || duration > 3600) {
       duration = 4.0;
     }
 
