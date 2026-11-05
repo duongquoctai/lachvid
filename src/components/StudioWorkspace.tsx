@@ -7,7 +7,6 @@ import React, {
   useRef,
   useState,
 } from "react";
-import Link from "next/link";
 import JSZip from "jszip";
 import {
   AudioVideoSyncMode,
@@ -29,6 +28,7 @@ import {
 import { CATEGORY_ORDER, recalculateComposedVideo } from "@/lib/planner";
 import PreviewPlayer916 from "@/components/PreviewPlayer916";
 import IPhoneVideoTrimmer from "@/components/IPhoneVideoTrimmer";
+import Link from "next/link";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -68,6 +68,7 @@ import {
   Shuffle,
   Sliders,
   Sparkles,
+  Square,
   Trash2,
   Unlock,
   Upload,
@@ -78,6 +79,11 @@ import {
   parseExcelFiveColumnClipboard,
   extractGoogleDriveFileId,
 } from "@/lib/drive";
+
+interface StudioWorkspaceProps {
+  projectId: string;
+  projectName?: string;
+}
 
 const createDefaultState = (): ProjectState => ({
   sourceVideo: null,
@@ -100,17 +106,12 @@ const createDefaultState = (): ProjectState => ({
     maxShotFrequency: 5,
     enableAutoVariantEdits: false,
     randomTransitionDuration: 0,
-    seed: 2026,
+    seed: 42,
   },
   composedVideos: [],
   zvidPlanLimits: null,
   zvidUploadUsage: null,
 });
-
-interface StudioWorkspaceProps {
-  projectId: string;
-  projectName?: string;
-}
 
 export default function StudioWorkspace({
   projectId,
@@ -120,10 +121,8 @@ export default function StudioWorkspace({
     projectName || "",
   );
   const [projectRenderedCount, setProjectRenderedCount] = useState<number>(0);
-
   const [mainTab, setMainTab] = useState<"split" | "mix">("split");
   const [state, setState] = useState<ProjectState>(() => createDefaultState());
-  const [showClearPoolsModal, setShowClearPoolsModal] = useState<boolean>(false);
 
   // Tab 1 (Split) states
   const [selectedShotId, setSelectedShotId] = useState<string | null>(null);
@@ -180,24 +179,37 @@ export default function StudioWorkspace({
   const [isScrubbing, setIsScrubbing] = useState<boolean>(false);
   const [scrubSourceSec, setScrubSourceSec] = useState<number | null>(null);
   const [playTrigger, setPlayTrigger] = useState<number>(0);
+  const [pauseTrigger, setPauseTrigger] = useState<number>(0);
+  const [isPreviewPlaying, setIsPreviewPlaying] = useState<boolean>(false);
+  const [renderProgress, setRenderProgress] = useState<{
+    current: number;
+    total: number;
+    name: string;
+    percent: number;
+  } | null>(null);
+  const [isRenderingBatch, setIsRenderingBatch] = useState<boolean>(false);
 
   // Google Drive Ingest states
   const [excelPasteText, setExcelPasteText] = useState<string>("");
   const [isIngestingDrive, setIsIngestingDrive] = useState<boolean>(false);
   const [singleCategoryDriveModal, setSingleCategoryDriveModal] = useState<{
-    category: ShotCategory;
+    category: ShotCategory | "voice";
     text: string;
   } | null>(null);
   const [showSecondaryUploadMode, setShowSecondaryUploadMode] =
     useState<boolean>(false);
+  const [showClearConfirmModal, setShowClearConfirmModal] =
+    useState<boolean>(false);
+  const [isClearingAll, setIsClearingAll] = useState<boolean>(false);
+
+  // Audition voice state
+  const [auditionVoiceId, setAuditionVoiceId] = useState<string | null>(null);
+  const auditionAudioRef = useRef<HTMLAudioElement | null>(null);
 
   const parsedExcel = useMemo(() => {
     return parseExcelFiveColumnClipboard(excelPasteText);
   }, [excelPasteText]);
 
-  // Zvid API & Modals
-  const [apiKey, setApiKey] = useState<string>("");
-  const [hasEnvKey, setHasEnvKey] = useState(false);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [toasts, setToasts] = useState<
     Array<{
@@ -206,7 +218,6 @@ export default function StudioWorkspace({
       text: string;
     }>
   >([]);
-  const [showJsonModal, setShowJsonModal] = useState(false);
 
   const addToast = useCallback(
     (toast: { type: "info" | "success" | "error"; text: string } | null) => {
@@ -226,6 +237,38 @@ export default function StudioWorkspace({
 
   // Backwards-compatible alias so existing logic continues to work seamlessly
   const setStatusBanner = addToast;
+
+  // Block F5 / reload / tab close when rendering batch
+  useEffect(() => {
+    if (!isRenderingBatch) return;
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue =
+        "Quá trình kết xuất video đang diễn ra. Nếu rời khỏi trang, tiến trình sẽ bị hủy. Bạn có chắc muốn rời đi?";
+      return e.returnValue;
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (
+        e.key === "F5" ||
+        ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "r")
+      ) {
+        e.preventDefault();
+        setStatusBanner({
+          type: "error",
+          text: "Đang trong quá trình render video! Vui lòng không làm mới (F5) trang để tránh mất tiến trình.",
+        });
+      }
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isRenderingBatch, setStatusBanner]);
 
   // Hidden file inputs
   const singleVideoInputRef = useRef<HTMLInputElement | null>(null);
@@ -252,13 +295,15 @@ export default function StudioWorkspace({
         }
         if (data.project?.settings) {
           const s = data.project.settings;
-          if (typeof s.targetMixDuration === "number") setTargetMixDuration(s.targetMixDuration);
-          if (typeof s.targetMixCount === "number") setTargetMixCount(s.targetMixCount);
-          if (s.mixVoiceMode) setMixVoiceMode(s.mixVoiceMode);
-        }
-        if (data.categoryPools) {
-          setCategoryPools(data.categoryPools);
-          setState((prev) => ({ ...prev, categoryPools: data.categoryPools }));
+          if (typeof s.targetMixDuration === "number") {
+            setTargetMixDuration(s.targetMixDuration);
+          }
+          if (typeof s.targetMixCount === "number") {
+            setTargetMixCount(s.targetMixCount);
+          }
+          if (s.mixVoiceMode === "none" || s.mixVoiceMode === "rotate") {
+            setMixVoiceMode(s.mixVoiceMode);
+          }
         }
         if (typeof data.renderedCount === "number") {
           setProjectRenderedCount(data.renderedCount);
@@ -279,7 +324,6 @@ export default function StudioWorkspace({
       .then((data) => {
         if (data.state) {
           setState(data.state);
-          setHasEnvKey(Boolean(data.hasEnvApiKey));
           if (data.state.shots?.length > 0) {
             setSelectedShotId(data.state.shots[0].id);
           }
@@ -307,7 +351,7 @@ export default function StudioWorkspace({
         if (data.multiVoiceTracks) setMultiVoices(data.multiVoiceTracks);
       })
       .catch(() => {});
-  }, [sessionId, projectId]);
+  }, [sessionId]);
 
   const persistState = useCallback(
     async (nextState: ProjectState) => {
@@ -341,8 +385,89 @@ export default function StudioWorkspace({
         // ignore transient save error
       }
     },
-    [sessionId, projectId, targetMixDuration, targetMixCount, mixVoiceMode],
+    [sessionId],
   );
+
+  // Auto-detect and sync exact video duration from browser decoder for all category pool items
+  const probedItemIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    let active = true;
+    for (const cat of CATEGORY_ORDER) {
+      for (const item of categoryPools[cat] || []) {
+        if (!item.localUrl || probedItemIdsRef.current.has(item.id)) continue;
+        probedItemIdsRef.current.add(item.id);
+
+        const v = document.createElement("video");
+        v.preload = "metadata";
+        v.src = item.localUrl;
+        v.onloadedmetadata = () => {
+          if (!active || !v.duration || isNaN(v.duration) || v.duration <= 0.1)
+            return;
+          const exactDur = Math.round(v.duration * 10) / 10;
+          if (Math.abs(exactDur - item.duration) > 0.05) {
+            setCategoryPools((prev) => {
+              const currentList = prev[cat] || [];
+              const updated = currentList.map((it) =>
+                it.id === item.id ? { ...it, duration: exactDur } : it,
+              );
+              return { ...prev, [cat]: updated };
+            });
+          }
+        };
+      }
+    }
+
+    return () => {
+      active = false;
+    };
+  }, [categoryPools]);
+
+  // Auto-detect and sync exact voice duration from browser decoder for all multiVoice items
+  const probedVoiceIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    let active = true;
+    for (const voice of multiVoices) {
+      if (!voice.localUrl || probedVoiceIdsRef.current.has(voice.id)) continue;
+      probedVoiceIdsRef.current.add(voice.id);
+
+      const a = document.createElement("audio");
+      a.preload = "metadata";
+      a.src = voice.localUrl;
+      a.onloadedmetadata = () => {
+        if (!active || !a.duration || isNaN(a.duration) || a.duration <= 0.1)
+          return;
+        const exactDur = Math.round(a.duration * 10) / 10;
+        if (Math.abs(exactDur - voice.duration) > 0.05) {
+          setMultiVoices((prev) =>
+            prev.map((v) =>
+              v.id === voice.id ? { ...v, duration: exactDur } : v,
+            ),
+          );
+        }
+      };
+    }
+    return () => {
+      active = false;
+    };
+  }, [multiVoices]);
+
+  const handleToggleAuditionVoice = (v: MultiVoiceItem) => {
+    if (auditionVoiceId === v.id && auditionAudioRef.current) {
+      auditionAudioRef.current.pause();
+      setAuditionVoiceId(null);
+      return;
+    }
+    if (!auditionAudioRef.current) {
+      auditionAudioRef.current = new Audio();
+      auditionAudioRef.current.onended = () => setAuditionVoiceId(null);
+    }
+    auditionAudioRef.current.src = v.localUrl;
+    auditionAudioRef.current.currentTime = 0;
+    auditionAudioRef.current.play().catch(() => {});
+    setAuditionVoiceId(v.id);
+  };
 
   const categoryMinDurations: CategoryMinDurations = useMemo(() => {
     return {
@@ -421,6 +546,29 @@ export default function StudioWorkspace({
       state.composedVideos[0]
     );
   }, [state, selectedComposedId]);
+
+  const selectedVoiceTrack: VoiceTrack | null = useMemo(() => {
+    if (!selectedComposed?.voiceTrackId) return null;
+    const found = multiVoices.find(
+      (v) => v.id === selectedComposed.voiceTrackId,
+    );
+    if (found) {
+      return {
+        id: found.id,
+        name: found.name,
+        fileName: found.fileName,
+        localUrl: found.localUrl,
+        localPath: found.localPath || "",
+        sizeBytes: 0,
+        duration: found.duration || 20,
+        createdAt: "",
+      };
+    }
+    if (state?.voiceTrack?.id === selectedComposed.voiceTrackId) {
+      return state.voiceTrack;
+    }
+    return null;
+  }, [selectedComposed, multiVoices, state]);
 
   // Category counts
   const categoryStats = useMemo(() => {
@@ -1118,7 +1266,7 @@ export default function StudioWorkspace({
 
     setIsIngestingDrive(true);
     setBusyMessage(
-      `Đang nạp và kiểm tra ${parsedExcel.totalExtracted} link Google Drive từ 5 category...`,
+      `Đang nạp và kiểm tra ${parsedExcel.totalExtracted} link Google Drive từ các cột...`,
     );
     setStatusBanner(null);
 
@@ -1139,22 +1287,27 @@ export default function StudioWorkspace({
             texture: parsedExcel.texture,
             apply: parsedExcel.apply,
             end: parsedExcel.end,
+            voice: parsedExcel.voice || [],
           },
         }),
       });
 
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi khi nạp link Google Drive");
+      if (!res.ok)
+        throw new Error(data.error || "Lỗi khi nạp link Google Drive");
 
       if (data.categoryPools) {
         setCategoryPools(data.categoryPools);
       }
+      if (data.multiVoiceTracks) {
+        setMultiVoices(data.multiVoiceTracks);
+      }
 
       setExcelPasteText("");
 
-      let resultMsg = `Đã nạp thành công ${data.addedCount} clip từ Google Drive vào kho!`;
+      let resultMsg = `Đã nạp thành công ${data.addedCount} file từ Google Drive vào kho!`;
       if (data.duplicateCount > 0) {
-        resultMsg += ` (Đã bỏ qua ${data.duplicateCount} clip bị trùng)`;
+        resultMsg += ` (Đã bỏ qua ${data.duplicateCount} file bị trùng)`;
       }
       if (data.errors && data.errors.length > 0) {
         resultMsg += ` — Lưu ý: Có ${data.errors.length} link chưa mở quyền công khai.`;
@@ -1173,9 +1326,9 @@ export default function StudioWorkspace({
     }
   };
 
-  // Nạp link Google Drive vào 1 cột category cụ thể
+  // Nạp link Google Drive vào 1 cột category hoặc voice cụ thể
   const handleIngestSingleCategoryDrive = async (
-    category: ShotCategory,
+    category: ShotCategory | "voice",
     text: string,
   ) => {
     const rawLinks = text
@@ -1194,9 +1347,11 @@ export default function StudioWorkspace({
       return;
     }
 
+    const catLabel =
+      category === "voice" ? "Voice (lồng tiếng)" : category.toUpperCase();
     setIsIngestingDrive(true);
     setBusyMessage(
-      `Đang nạp ${validFileIds.length} link vào mục ${category.toUpperCase()}...`,
+      `Đang nạp ${validFileIds.length} link vào mục ${catLabel}...`,
     );
     setStatusBanner(null);
 
@@ -1217,16 +1372,20 @@ export default function StudioWorkspace({
       });
 
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi khi nạp link Google Drive");
+      if (!res.ok)
+        throw new Error(data.error || "Lỗi khi nạp link Google Drive");
 
       if (data.categoryPools) {
         setCategoryPools(data.categoryPools);
       }
+      if (data.multiVoiceTracks) {
+        setMultiVoices(data.multiVoiceTracks);
+      }
       setSingleCategoryDriveModal(null);
 
-      let msg = `Đã nạp thành công ${data.addedCount} clip vào mục ${category.toUpperCase()}!`;
+      let msg = `Đã nạp thành công ${data.addedCount} file vào mục ${catLabel}!`;
       if (data.duplicateCount > 0) {
-        msg += ` (Đã bỏ qua ${data.duplicateCount} clip bị trùng)`;
+        msg += ` (Đã bỏ qua ${data.duplicateCount} file bị trùng)`;
       }
       setStatusBanner({
         type: "success",
@@ -1268,6 +1427,7 @@ export default function StudioWorkspace({
     try {
       const fd = new FormData();
       fd.append("sessionId", sessionId);
+      if (projectId) fd.append("projectId", projectId);
       for (let i = 0; i < files.length; i++) {
         fd.append("files", files[i]);
       }
@@ -1323,6 +1483,7 @@ export default function StudioWorkspace({
     try {
       const fd = new FormData();
       fd.append("sessionId", sessionId);
+      if (projectId) fd.append("projectId", projectId);
       fd.append("targetCategory", category);
       for (let i = 0; i < files.length; i++) {
         fd.append("files", files[i]);
@@ -1358,6 +1519,7 @@ export default function StudioWorkspace({
     try {
       const fd = new FormData();
       fd.append("sessionId", sessionId);
+      if (projectId) fd.append("projectId", projectId);
       fd.append("action", "upload_voice");
       for (let i = 0; i < files.length; i++) {
         fd.append("files", files[i]);
@@ -1388,59 +1550,80 @@ export default function StudioWorkspace({
     cat: ShotCategory,
     itemId: string,
   ) => {
-    try {
-      const res = await fetch("/api/category-library", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-session-id": sessionId },
-        body: JSON.stringify({
-          action: "remove_item",
-          sessionId,
-          projectId,
-          category: cat,
-          itemId,
-        }),
-      });
-      const data = await res.json();
-      if (data.categoryPools) {
-        setCategoryPools(data.categoryPools);
-        setState((prev) => ({ ...prev, categoryPools: data.categoryPools }));
-      }
-    } catch {
-      // ignore
-    }
+    const fd = new FormData();
+    fd.append("sessionId", sessionId);
+    fd.append("action", "remove_item");
+    fd.append("category", cat);
+    fd.append("itemId", itemId);
+    if (projectId) fd.append("projectId", projectId);
+    const res = await fetch("/api/category-library", {
+      method: "POST",
+      headers: { "x-session-id": sessionId },
+      body: fd,
+    });
+    const data = await res.json();
+    if (data.categoryPools) setCategoryPools(data.categoryPools);
   };
 
-  const handleConfirmClearPools = async () => {
-    setShowClearPoolsModal(false);
-    setBusyMessage("Đang xóa toàn bộ kho clip...");
+  const handleRemoveVoiceItem = async (voiceId: string) => {
+    if (auditionVoiceId === voiceId && auditionAudioRef.current) {
+      auditionAudioRef.current.pause();
+      setAuditionVoiceId(null);
+    }
+    const fd = new FormData();
+    fd.append("sessionId", sessionId);
+    fd.append("action", "remove_voice");
+    fd.append("voiceId", voiceId);
+    if (projectId) fd.append("projectId", projectId);
+    const res = await fetch("/api/category-library", {
+      method: "POST",
+      headers: { "x-session-id": sessionId },
+      body: fd,
+    });
+    const data = await res.json();
+    if (data.multiVoiceTracks) setMultiVoices(data.multiVoiceTracks);
+  };
+
+  // Confirm and thoroughly clear all categories, voices, and combinations
+  const handleConfirmClearAll = async () => {
+    setIsClearingAll(true);
     try {
+      const fd = new FormData();
+      fd.append("action", "clear_all");
+      fd.append("sessionId", sessionId);
+      if (projectId) fd.append("projectId", projectId);
       const res = await fetch("/api/category-library", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "clear_all",
-          sessionId,
-          projectId,
-        }),
+        headers: { "x-session-id": sessionId },
+        body: fd,
       });
       const d = await res.json();
-      if (d.categoryPools) {
-        setCategoryPools(d.categoryPools);
-        setState((prev) => ({
-          ...prev,
-          categoryPools: d.categoryPools,
-          composedVideos: [],
-        }));
-      }
+      if (d.categoryPools) setCategoryPools(d.categoryPools);
+      setMultiVoices([]);
+      setSelectedComposedId(null);
+      setExcelPasteText("");
+      setState((prev) => ({
+        ...prev,
+        categoryPools: d.categoryPools || {
+          open: [],
+          product: [],
+          texture: [],
+          apply: [],
+          end: [],
+        },
+        multiVoiceTracks: [],
+        composedVideos: [],
+      }));
+      setShowClearConfirmModal(false);
       setStatusBanner({
         type: "success",
-        text: "Đã xóa sạch toàn bộ kho clip 5 category của dự án!",
+        text: "Đã xóa trắng toàn bộ kho clip và các tổ hợp video.",
       });
-    } catch (err) {
+    } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setStatusBanner({ type: "error", text: msg });
     } finally {
-      setBusyMessage(null);
+      setIsClearingAll(false);
     }
   };
 
@@ -1461,6 +1644,8 @@ export default function StudioWorkspace({
       "Đang tính toán các tổ hợp đa dạng tối ưu (Hamming distance, Speed Scale)...",
     );
     setStatusBanner(null);
+    const clampedMixCount = Math.max(1, Math.min(50, targetMixCount || 10));
+
     try {
       const res = await fetch("/api/plan-mix", {
         method: "POST",
@@ -1472,12 +1657,17 @@ export default function StudioWorkspace({
           sessionId,
           projectId: projectId || undefined,
           categoryPools,
+          multiVoiceTracks: multiVoices,
+          mixVoiceMode,
           diversityConfig: {
-            targetCount: targetMixCount,
-            minHammingDistance: 2, // Tối đa 3/5 cảnh trùng nhau => diff >= 2
-            maxShotFrequency: Math.max(2, Math.ceil(targetMixCount / 3)),
+            targetCount: clampedMixCount,
+            minHammingDistance: 2,
+            maxShotFrequency: Math.max(2, Math.ceil(clampedMixCount / 3)),
             seed: Date.now(),
+            enableAutoVariantEdits: false,
+            randomTransitionDuration: 0,
           },
+          preserveOriginalClips: true,
         }),
       });
       const data = await res.json();
@@ -1553,6 +1743,50 @@ export default function StudioWorkspace({
     });
   };
 
+  const handleChangeComposedVoice = (
+    composedId: string,
+    voiceId: string | null,
+  ) => {
+    if (!state) return;
+    const targetComp = state.composedVideos.find((c) => c.id === composedId);
+    if (!targetComp) return;
+
+    let chosenVoice: VoiceTrack | null = null;
+    if (voiceId) {
+      const found = multiVoices.find((v) => v.id === voiceId);
+      if (found) {
+        chosenVoice = {
+          id: found.id,
+          name: found.name,
+          fileName: found.fileName,
+          localUrl: found.localUrl,
+          localPath: found.localPath || "",
+          sizeBytes: 0,
+          duration: found.duration || 20,
+          createdAt: "",
+        };
+      }
+    }
+
+    const updatedComp = recalculateComposedVideo(
+      targetComp,
+      -1,
+      {},
+      chosenVoice,
+      state.syncMode,
+    );
+    updatedComp.voiceTrackId = voiceId;
+
+    const updatedList = state.composedVideos.map((c) =>
+      c.id === composedId ? updatedComp : c,
+    );
+
+    persistState({
+      ...state,
+      composedVideos: updatedList,
+    });
+  };
+
   // Direct FFmpeg Render Single Composed Video
   const handleRenderSingleComposed = async (composed: ComposedVideo) => {
     setBusyMessage(`Đang xuất file MP4 hoàn chỉnh cho ${composed.name}...`);
@@ -1565,7 +1799,8 @@ export default function StudioWorkspace({
         },
         body: JSON.stringify({
           videos: [composed],
-          sessionId: `single_${composed.id}`,
+          multiVoiceTracks: multiVoices,
+          sessionId,
         }),
       });
 
@@ -1583,6 +1818,26 @@ export default function StudioWorkspace({
       a.click();
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+
+      // Ghi nhận lịch sử render vào dự án
+      if (projectId) {
+        fetch("/api/project", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "record_render",
+            projectId,
+            records: [{ tupleKey: composed.tupleKey, name: composed.name }],
+          }),
+        })
+          .then((r) => r.json())
+          .then((res) => {
+            if (res.addedCount) {
+              setProjectRenderedCount((prev) => prev + 1);
+            }
+          })
+          .catch(() => {});
+      }
 
       setStatusBanner({
         type: "success",
@@ -1602,10 +1857,41 @@ export default function StudioWorkspace({
       setStatusBanner({ type: "error", text: "Chưa có tổ hợp nào để xuất." });
       return;
     }
+    const totalCount = state.composedVideos.length;
+    setIsRenderingBatch(true);
+    setRenderProgress({
+      current: 0,
+      total: totalCount,
+      name: "Đang khởi tạo FFmpeg...",
+      percent: 0,
+    });
     setBusyMessage(
-      `Đang render ${state.composedVideos.length} video MP4 và đóng gói ZIP...`,
+      `Đang kết xuất ${totalCount} video MP4 và đóng gói ZIP...`,
     );
+
+    let pollInterval: NodeJS.Timeout | null = null;
     try {
+      pollInterval = setInterval(async () => {
+        try {
+          const pRes = await fetch(
+            `/api/render-progress?sessionId=${encodeURIComponent(sessionId)}`,
+          );
+          if (pRes.ok) {
+            const pData = await pRes.json();
+            if (pData.active && pData.total > 0) {
+              setRenderProgress({
+                current: pData.current,
+                total: pData.total,
+                name: pData.current_name || "",
+                percent: pData.percent,
+              });
+            }
+          }
+        } catch {
+          // Ignore transient polling errors
+        }
+      }, 700);
+
       const res = await fetch("/api/render-composed", {
         method: "POST",
         headers: {
@@ -1614,7 +1900,8 @@ export default function StudioWorkspace({
         },
         body: JSON.stringify({
           videos: state.composedVideos,
-          sessionId: `batch_${Date.now().toString(36)}`,
+          multiVoiceTracks: multiVoices,
+          sessionId,
         }),
       });
 
@@ -1649,8 +1936,8 @@ export default function StudioWorkspace({
           }),
         })
           .then((r) => r.json())
-          .then((data) => {
-            if (data.success) {
+          .then((res) => {
+            if (res.addedCount) {
               setProjectRenderedCount((prev) => prev + records.length);
             }
           })
@@ -1659,249 +1946,59 @@ export default function StudioWorkspace({
 
       setStatusBanner({
         type: "success",
-        text: `Đã render thành công toàn bộ ${state.composedVideos.length} video MP4 chuẩn và tải về ZIP! Đã lưu lịch sử chống trùng.`,
+        text: `Đã render thành công toàn bộ ${totalCount} video MP4 chuẩn và tải về ZIP!`,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setStatusBanner({ type: "error", text: msg });
     } finally {
+      if (pollInterval) clearInterval(pollInterval);
+      setRenderProgress(null);
+      setIsRenderingBatch(false);
       setBusyMessage(null);
     }
   };
 
-  // Direct FFmpeg Render All Composed Videos (Save directly to disk folder)
-  const handleRenderAllDirectToFolder = async () => {
-    if (!state?.composedVideos || state.composedVideos.length === 0) {
-      setStatusBanner({ type: "error", text: "Chưa có tổ hợp nào để xuất." });
-      return;
-    }
 
-    if (!("showDirectoryPicker" in window)) {
-      setStatusBanner({
-        type: "info",
-        text: "Trình duyệt chưa hỗ trợ chọn thư mục trực tiếp. Hệ thống tự động chuyển sang tải file .ZIP!",
-      });
-      await handleRenderAllComposedZip();
-      return;
-    }
 
-    try {
-      const picker = (
-        window as unknown as {
-          showDirectoryPicker?: (opts: unknown) => Promise<any>;
-        }
-      ).showDirectoryPicker;
-      if (!picker) throw new Error("showDirectoryPicker không khả dụng");
-      const rootDirHandle = await picker({ mode: "readwrite" });
 
-      setBusyMessage(
-        `Đang render ${state.composedVideos.length} video và chuẩn bị ghi vào ổ cứng...`,
-      );
-
-      const res = await fetch("/api/render-composed", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-session-id": sessionId,
-        },
-        body: JSON.stringify({
-          videos: state.composedVideos,
-          sessionId: `batch_${Date.now().toString(36)}`,
-        }),
-      });
-
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `HTTP ${res.status}`);
-      }
-
-      setBusyMessage("Đang ghi thẳng các file .mp4 vào thư mục máy tính...");
-      const zipBlob = await res.blob();
-      const zip = await JSZip.loadAsync(zipBlob);
-
-      let saved = 0;
-      for (const [fileName, zipEntry] of Object.entries(zip.files)) {
-        if (zipEntry.dir) continue;
-        const cleanName = fileName.split("/").pop() || fileName;
-        const fileBlob = await zipEntry.async("blob");
-        const fileHandle = await rootDirHandle.getFileHandle(cleanName, {
-          create: true,
-        });
-        const writable = await fileHandle.createWritable();
-        await writable.write(fileBlob);
-        await writable.close();
-        saved++;
-      }
-
-      // Ghi nhận lịch sử render vào dự án khi lưu ổ cứng thành công
-      if (projectId) {
-        const records = state.composedVideos.map((comp) => ({
-          tupleKey: comp.tupleKey,
-          name: comp.name,
-        }));
-        fetch("/api/project", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "record_render",
-            projectId,
-            records,
-          }),
-        })
-          .then((r) => r.json())
-          .then((data) => {
-            if (data.success) {
-              setProjectRenderedCount((prev) => prev + records.length);
-            }
-          })
-          .catch(() => {});
-      }
-
-      setStatusBanner({
-        type: "success",
-        text: `Tuyệt vời! Đã ghi thẳng ${saved} video MP4 hoàn chỉnh vào thư mục máy tính! Đã lưu lịch sử chống trùng.`,
-      });
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name === "AbortError") return;
-      const msg = err instanceof Error ? err.message : String(err);
-      setStatusBanner({ type: "error", text: msg });
-    } finally {
-      setBusyMessage(null);
-    }
-  };
-
-  // Zvid Account & Quota Check
-  const handleCheckZvidAccount = async () => {
-    setBusyMessage("Đang kiểm tra quota Zvid.io...");
-    try {
-      const res = await fetch("/api/zvid", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "fetch_schema_and_limits",
-          apiKey: apiKey || undefined,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Không kiểm tra được Zvid");
-      setState(data.state);
-      setStatusBanner({
-        type: "success",
-        text: `Zvid API key hợp lệ! Hạn mức bộ nhớ: ${(
-          data.limits?.maxTotalBytes /
-          1024 /
-          1024
-        ).toFixed(0)} MB.`,
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setStatusBanner({ type: "error", text: msg });
-    } finally {
-      setBusyMessage(null);
-    }
-  };
-
-  // Zvid Lazy Upload & Validate
-  const handleLazyUploadAndValidate = async () => {
-    setBusyMessage(
-      "Đang kiểm tra schema và hạn mức trước khi render (0 Credit)...",
-    );
-    try {
-      const res = await fetch("/api/zvid", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "lazy_upload_and_validate",
-          apiKey: apiKey || undefined,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Validate thất bại");
-      setState(data.state);
-      setStatusBanner({
-        type: "success",
-        text: `Đã validate toàn bộ tổ hợp thành công! Sẵn sàng render.`,
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setStatusBanner({ type: "error", text: msg });
-    } finally {
-      setBusyMessage(null);
-    }
-  };
-
-  // Zvid Batch Submit Render
-  const handleSubmitBatchRender = async (singleId?: string) => {
-    setBusyMessage(
-      singleId
-        ? "Đang gửi render cho 1 video..."
-        : `Đang gửi hàng đợi render ${state?.composedVideos.length || 0} video lên Zvid...`,
-    );
-    try {
-      const res = await fetch("/api/zvid", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "batch_submit_render",
-          apiKey: apiKey || undefined,
-          targetComposedId: singleId,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Render thất bại");
-      setState(data.state);
-      setStatusBanner({
-        type: "success",
-        text: `Đã đẩy ${data.submittedCount} video vào hàng đợi render Zvid!`,
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setStatusBanner({ type: "error", text: msg });
-    } finally {
-      setBusyMessage(null);
-    }
-  };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
       {/* Top Header & Two-Tab Navigation */}
       <header className="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800 px-6 py-3 flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-rose-500 to-indigo-500 flex items-center justify-center shadow-lg shadow-rose-500/20">
-              <Film className="w-5 h-5 text-white" />
-            </div>
-            <div>
-              <h1 className="text-base font-extrabold tracking-tight flex items-center gap-2">
-                <span>LachVid Studio</span>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40">
-                  PRO 2.0
-                </span>
-              </h1>
-              <p className="text-xs text-slate-400">
-                Hệ thống tách video slicer & trộn lách content mỹ phẩm
-              </p>
-            </div>
+        <div className="flex items-center gap-3">
+          <Link
+            href="/"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs font-medium text-slate-300 hover:text-white transition"
+            title="Quay lại danh sách dự án"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span>Dự án</span>
+          </Link>
+          {/* Current Project Pill */}
+          <div className="hidden sm:flex items-center gap-2 px-3 py-1 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-xs">
+            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
+            <span className="font-bold text-white">{currentProjectName || "Dự án"}</span>
+            {projectRenderedCount > 0 && (
+              <span className="text-[11px] font-mono text-indigo-300 bg-indigo-950/60 px-1.5 py-0.5 rounded border border-indigo-800/60">
+                Đã render {projectRenderedCount} video
+              </span>
+            )}
           </div>
-
-          {/* Current Project Pill / Switcher */}
-          <div className="flex items-center gap-2 pl-3 border-l border-slate-800">
-            <Link
-              href="/"
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-xs font-semibold text-slate-300 border border-slate-700/60 transition"
-            >
-              <ArrowLeft className="w-3.5 h-3.5 text-slate-400" />
-              <span>Danh sách dự án</span>
-            </Link>
-            <div className="px-3 py-1 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 text-xs font-medium flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="font-bold text-white">{currentProjectName || "Dự án"}</span>
-              {projectRenderedCount > 0 && (
-                <span className="text-[10px] bg-indigo-950/80 px-1.5 py-0.5 rounded text-indigo-300 border border-indigo-800">
-                  Đã render {projectRenderedCount} video
-                </span>
-              )}
-            </div>
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-rose-500 to-indigo-500 flex items-center justify-center shadow-lg shadow-rose-500/20">
+            <Film className="w-5 h-5 text-white" />
+          </div>
+          <div>
+            <h1 className="text-base font-extrabold tracking-tight flex items-center gap-2">
+              <span>LachVid Studio</span>
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40">
+                PRO 2.0
+              </span>
+            </h1>
+            <p className="text-xs text-slate-400">
+              Hệ thống tách video slicer & trộn lách content mỹ phẩm
+            </p>
           </div>
         </div>
 
@@ -3303,10 +3400,14 @@ export default function StudioWorkspace({
                 <div>
                   <h2 className="text-sm font-bold flex items-center gap-2 text-white">
                     <Cloud className="w-5 h-5 text-sky-400" />
-                    <span>Kho video theo 5 category (Google Drive & máy tính)</span>
+                    <span>
+                      Kho video theo 5 category (Google Drive & máy tính)
+                    </span>
                   </h2>
                   <p className="text-xs text-slate-400 mt-0.5">
-                    Mode chính: Dán bảng 5 cột từ Excel (Google Drive) với cơ chế zero-disk stream. Mode phụ: Tải trực tiếp thư mục từ máy tính.
+                    Mode chính: Dán bảng 5 cột từ Excel (Google Drive) với cơ
+                    chế zero-disk stream. Mode phụ: Tải trực tiếp thư mục từ máy
+                    tính.
                   </p>
                 </div>
 
@@ -3321,8 +3422,9 @@ export default function StudioWorkspace({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setShowClearPoolsModal(true)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-rose-500/20 hover:text-rose-300 text-xs font-semibold text-slate-300 border border-slate-700 transition"
+                    onClick={() => setShowClearConfirmModal(true)}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-slate-100 transition shadow-md shadow-rose-600/20"
+                    title="Xóa toàn bộ clip trong kho, voice và danh sách tổ hợp"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                     <span>Xoá trắng kho</span>
@@ -3339,13 +3441,17 @@ export default function StudioWorkspace({
                     </div>
                     <div>
                       <h3 className="text-xs font-bold text-white flex items-center gap-2">
-                        <span>Dán nhanh bảng 5 cột từ Excel (Google Drive)</span>
+                        <span>
+                          Dán nhanh bảng 5 cột từ Excel (Google Drive)
+                        </span>
                         <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/40">
                           Mode chính • Zero-disk stream
                         </span>
                       </h3>
                       <p className="text-[11px] text-slate-400">
-                        Bôi đen cả bảng 5 cột (Open, Product, Texture, Apply, End) trong file Excel rồi dán (Ctrl+V) vào khung bên dưới.
+                        Bôi đen cả bảng 5 cột (Open, Product, Texture, Apply,
+                        End) trong file Excel rồi dán (Ctrl+V) vào khung bên
+                        dưới.
                       </p>
                     </div>
                   </div>
@@ -3372,8 +3478,8 @@ export default function StudioWorkspace({
                         )}
                         <span>
                           {isIngestingDrive
-                            ? "Đang nạp clip..."
-                            : `+ Nạp ${parsedExcel.totalExtracted} clip vào 5 category`}
+                            ? "Đang nạp file..."
+                            : `+ Nạp ${parsedExcel.totalExtracted} file vào kho (5 category & voice)`}
                         </span>
                       </button>
                     </div>
@@ -3385,7 +3491,7 @@ export default function StudioWorkspace({
                     rows={3}
                     value={excelPasteText}
                     onChange={(e) => setExcelPasteText(e.target.value)}
-                    placeholder="Dán vùng dữ liệu 5 cột copy từ Excel vào đây (hệ thống tự động phân tách Tab thành 5 cột Category: Open, Product, Texture, Apply, End)..."
+                    placeholder="Dán vùng dữ liệu copy từ Excel vào đây (hệ thống tự động phân tách Tab thành các cột: Open, Product, Texture, Apply, End, Voice)..."
                     className="w-full px-3.5 py-2.5 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition resize-y"
                   />
                 </div>
@@ -3393,7 +3499,9 @@ export default function StudioWorkspace({
                 {/* Live Pill Breakdown of Parsed Links */}
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-800/80 text-[11px]">
                   <div className="flex flex-wrap items-center gap-1.5 font-mono">
-                    <span className="text-slate-400 font-sans">Đã nhận diện:</span>
+                    <span className="text-slate-400 font-sans">
+                      Đã nhận diện:
+                    </span>
                     <span className="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/40">
                       1. Open: {parsedExcel.open.length}
                     </span>
@@ -3408,6 +3516,9 @@ export default function StudioWorkspace({
                     </span>
                     <span className="px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/40">
                       5. End: {parsedExcel.end.length}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
+                      6. Voice: {parsedExcel.voice?.length || 0}
                     </span>
                     {parsedExcel.skippedRows > 0 && (
                       <span className="text-slate-500 text-[10px]">
@@ -3424,32 +3535,62 @@ export default function StudioWorkspace({
                 </div>
               </div>
 
-              {/* 5 Category Columns */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-3">
+              {/* 6 Category & Voice Columns in 3x2 Grid */}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
                 {CATEGORY_ORDER.map((catKey) => {
                   const meta = SHOT_CATEGORIES.find((c) => c.id === catKey);
                   const items = categoryPools[catKey] || [];
                   return (
                     <div
                       key={catKey}
-                      className="bg-slate-950/80 border border-slate-800 rounded-xl p-3.5 flex flex-col justify-between space-y-3 min-h-[240px]"
+                      className="bg-slate-950/80 border border-slate-800 rounded-xl p-3.5 flex flex-col justify-between space-y-2.5 min-h-[220px]"
                     >
-                      <div className="flex items-center justify-between">
-                        <span
-                          className={`text-[11px] font-bold px-2 py-0.5 rounded-full border ${
-                            meta?.badgeClass ||
-                            "border-slate-700 text-slate-200"
-                          }`}
-                        >
-                          {meta?.label}
-                        </span>
-                        <span className="text-xs font-mono font-bold text-white bg-slate-900 px-2 py-0.5 rounded-md border border-slate-800">
-                          {items.length} clip
-                        </span>
+                      {/* Header: Badge & Count on left, Action buttons on right */}
+                      <div className="flex items-center justify-between gap-2 border-b border-slate-800/80 pb-2">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`text-[11px] font-bold px-2 py-0.5 rounded-full border ${
+                              meta?.badgeClass ||
+                              "border-slate-700 text-slate-200"
+                            }`}
+                          >
+                            {meta?.label}
+                          </span>
+                          <span className="text-xs font-mono font-bold text-white bg-slate-900 px-2 py-0.5 rounded-md border border-slate-800">
+                            {items.length} clip
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSingleCategoryDriveModal({
+                                category: catKey,
+                                text: "",
+                              })
+                            }
+                            className="py-1 px-2 rounded-lg bg-sky-950/60 hover:bg-sky-900/80 border border-sky-800/60 text-[10px] font-semibold text-sky-200 flex items-center gap-1 transition shadow-sm"
+                            title="Dán link Google Drive cho mục này"
+                          >
+                            <Link2 className="w-3 h-3 text-sky-400 shrink-0" />
+                            <span>Link Drive</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              categoryInputRefs.current[catKey]?.click()
+                            }
+                            className="py-1 px-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[10px] font-semibold text-slate-300 flex items-center gap-1 transition shadow-sm"
+                            title="Tải file clip từ máy tính"
+                          >
+                            <Plus className="w-3 h-3 text-slate-400 shrink-0" />
+                            <span>File</span>
+                          </button>
+                        </div>
                       </div>
 
                       {/* Items List */}
-                      <div className="flex-1 space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                      <div className="flex-1 space-y-1.5 max-h-48 overflow-y-auto pr-1">
                         {items.length === 0 ? (
                           <div className="h-full flex flex-col items-center justify-center text-center p-3 text-[11px] text-slate-500">
                             Chưa có clip nào
@@ -3458,10 +3599,10 @@ export default function StudioWorkspace({
                           items.map((it) => (
                             <div
                               key={it.id}
-                              className="p-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-[10px] flex items-center justify-between group"
+                              className="p-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-[10px] flex items-center justify-between group hover:border-slate-700 transition"
                             >
                               <span
-                                className="truncate max-w-[95px] text-slate-300 flex items-center gap-1"
+                                className="truncate max-w-[210px] text-slate-300 flex items-center gap-1"
                                 title={it.name}
                               >
                                 {it.sourceType === "drive" && (
@@ -3476,7 +3617,7 @@ export default function StudioWorkspace({
                                 )}
                                 <span>{it.name}</span>
                               </span>
-                              <div className="flex items-center gap-1">
+                              <div className="flex items-center gap-1.5">
                                 <span className="font-mono text-slate-500">
                                   {it.duration.toFixed(1)}s
                                 </span>
@@ -3494,127 +3635,194 @@ export default function StudioWorkspace({
                           ))
                         )}
                       </div>
-
-                      {/* Action Buttons for this Column: Mode chính (Link Drive) + Mode phụ (File máy) */}
-                      <div className="grid grid-cols-2 gap-1.5 pt-1 border-t border-slate-800/80">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setSingleCategoryDriveModal({
-                              category: catKey,
-                              text: "",
-                            })
-                          }
-                          className="py-1.5 px-1 rounded-lg bg-sky-950/60 hover:bg-sky-900/80 border border-sky-800/60 text-[10px] font-semibold text-sky-200 flex items-center justify-center gap-1 transition"
-                          title="Dán link Google Drive cho mục này"
-                        >
-                          <Link2 className="w-3 h-3 text-sky-400 shrink-0" />
-                          <span>+ Link Drive</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            categoryInputRefs.current[catKey]?.click()
-                          }
-                          className="py-1.5 px-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[10px] font-semibold text-slate-300 flex items-center justify-center gap-1 transition"
-                          title="Tải file clip từ máy tính"
-                        >
-                          <Plus className="w-3 h-3 text-slate-400 shrink-0" />
-                          <span>+ File máy</span>
-                        </button>
-                      </div>
                     </div>
                   );
                 })}
+
+                {/* Box 6: VOICE (LỒNG TIẾNG) */}
+                <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3.5 flex flex-col justify-between space-y-2.5 min-h-[220px]">
+                  {/* Header: Badge & Count on left, Action buttons on right */}
+                  <div className="flex items-center justify-between gap-2 border-b border-slate-800/80 pb-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] font-bold px-2 py-0.5 rounded-full border border-indigo-500/40 text-indigo-300 bg-indigo-500/10">
+                        Voice
+                      </span>
+                      <span className="text-xs font-mono font-bold text-white bg-slate-900 px-2 py-0.5 rounded-md border border-slate-800">
+                        {multiVoices.length} voice
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSingleCategoryDriveModal({
+                            category: "voice",
+                            text: "",
+                          })
+                        }
+                        className="py-1 px-2 rounded-lg bg-sky-950/60 hover:bg-sky-900/80 border border-sky-800/60 text-[10px] font-semibold text-sky-200 flex items-center gap-1 transition shadow-sm"
+                        title="Dán link Google Drive cho lồng tiếng"
+                      >
+                        <Link2 className="w-3 h-3 text-sky-400 shrink-0" />
+                        <span>Link Drive</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => voiceInputRef.current?.click()}
+                        className="py-1 px-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[10px] font-semibold text-slate-300 flex items-center gap-1 transition shadow-sm"
+                        title="Tải file voice từ máy tính"
+                      >
+                        <Plus className="w-3 h-3 text-slate-400 shrink-0" />
+                        <span>File</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Inline Voice Mode Toggle */}
+                  <div className="flex items-center justify-between px-2 py-1.5 rounded-lg bg-slate-900/70 border border-slate-800/80 text-[11px]">
+                    <span className="text-slate-400 font-medium">
+                      Chế độ lồng tiếng:
+                    </span>
+                    <div className="flex items-center gap-3">
+                      <label className="flex items-center gap-1 cursor-pointer">
+                        <input
+                          type="radio"
+                          name="boxVoiceMode"
+                          checked={mixVoiceMode === "none"}
+                          onChange={() => setMixVoiceMode("none")}
+                          className="accent-indigo-500"
+                        />
+                        <span
+                          className={
+                            mixVoiceMode === "none"
+                              ? "text-slate-200"
+                              : "text-slate-500"
+                          }
+                        >
+                          Không lồng
+                        </span>
+                      </label>
+                      <label className="flex items-center gap-1 cursor-pointer">
+                        <input
+                          type="radio"
+                          name="boxVoiceMode"
+                          checked={mixVoiceMode === "rotate"}
+                          onChange={() => setMixVoiceMode("rotate")}
+                          className="accent-indigo-500"
+                        />
+                        <span
+                          className={
+                            mixVoiceMode === "rotate"
+                              ? "text-indigo-300 font-medium"
+                              : "text-slate-500"
+                          }
+                        >
+                          Xoay vòng
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+
+                  {/* Voice Items List */}
+                  <div className="flex-1 space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                    {multiVoices.length === 0 ? (
+                      <div className="h-full flex flex-col items-center justify-center text-center p-3 text-[11px] text-slate-500">
+                        Chưa có voice nào
+                      </div>
+                    ) : (
+                      multiVoices.map((v) => (
+                        <div
+                          key={v.id}
+                          className="p-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-[10px] flex items-center justify-between group hover:border-slate-700 transition"
+                        >
+                          <div className="flex items-center gap-1.5 truncate max-w-[210px]">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleAuditionVoice(v)}
+                              className={`p-1 rounded transition shrink-0 ${
+                                auditionVoiceId === v.id
+                                  ? "bg-indigo-600 text-white"
+                                  : "text-slate-400 hover:text-indigo-300 hover:bg-slate-800"
+                              }`}
+                              title={
+                                auditionVoiceId === v.id
+                                  ? "Dừng nghe thử"
+                                  : "Nghe thử file này"
+                              }
+                            >
+                              {auditionVoiceId === v.id ? (
+                                <Square className="w-2.5 h-2.5 fill-current" />
+                              ) : (
+                                <Play className="w-2.5 h-2.5 fill-current" />
+                              )}
+                            </button>
+                            <span
+                              className="truncate text-slate-300 flex items-center gap-1"
+                              title={v.name}
+                            >
+                              {v.sourceType === "drive" && (
+                                <span title="Link Google Drive (Zero-disk stream)">
+                                  <Cloud className="w-2.5 h-2.5 text-sky-400 shrink-0" />
+                                </span>
+                              )}
+                              <span>{v.name}</span>
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-mono text-slate-500">
+                              {v.duration.toFixed(1)}s
+                            </span>
+                            <button
+                              onClick={() => handleRemoveVoiceItem(v.id)}
+                              className="text-slate-500 hover:text-rose-400 ml-1 opacity-0 group-hover:opacity-100 transition"
+                              title="Xoá voice này khỏi kho"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
 
-            {/* Mixer Settings: Video Count, Multi-Voice */}
-            <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 grid grid-cols-1 md:grid-cols-12 gap-6 items-center">
-              {/* Output Count */}
-              <div className="md:col-span-4 space-y-3">
-                <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <Clock className="w-4 h-4 text-rose-400" />
-                  <span>Số lượng output</span>
-                </h3>
-                <div>
-                  <label className="text-[11px] text-slate-400 block mb-1">
+            {/* Mixer Settings: Single Clean Row */}
+            <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+              <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 w-full sm:w-auto">
+                <div className="flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-rose-400 shrink-0" />
+                  <label className="text-xs font-bold text-white whitespace-nowrap">
                     Số video muốn tạo:
                   </label>
+                </div>
+                <div className="flex items-center gap-2">
                   <input
                     type="number"
                     min="1"
-                    max="100"
+                    max="50"
                     value={targetMixCount}
-                    onChange={(e) => setTargetMixCount(Number(e.target.value))}
-                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-center text-white focus:outline-none focus:border-rose-500"
+                    onChange={(e) =>
+                      setTargetMixCount(
+                        Math.max(1, Math.min(50, parseInt(e.target.value) || 1)),
+                      )
+                    }
+                    className="w-24 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono font-bold text-center text-white focus:outline-none focus:border-rose-500"
                   />
-                  <p className="text-[10px] text-slate-500 mt-1">
-                    Mỗi video tự do thời lượng; bạn có thể chỉnh từng cảnh bằng
-                    tay.
-                  </p>
+                  <span className="text-[11px] text-slate-400 hidden md:inline">
+                    video (Tối đa 50 video • Tự động kết hợp các cảnh và voice theo thuật toán
+                    ngẫu nhiên có kiểm soát)
+                  </span>
                 </div>
               </div>
 
-              {/* Multi-Voice Section */}
-              <div className="md:col-span-5 space-y-3 border-y md:border-y-0 md:border-x border-slate-800 py-4 md:py-0 md:px-6">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <Mic className="w-4 h-4 text-indigo-400" />
-                    <span>Lồng voice (tùy chọn)</span>
-                  </h3>
-                  <button
-                    onClick={() => voiceInputRef.current?.click()}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] font-semibold text-slate-200 border border-slate-700"
-                  >
-                    <Upload className="w-3 h-3 text-indigo-400" />
-                    <span>+ Thêm voice MP3</span>
-                  </button>
-                </div>
-                <div className="text-xs text-slate-400 flex items-center gap-4">
-                  <label className="flex items-center gap-1.5 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="voiceMode"
-                      checked={mixVoiceMode === "none"}
-                      onChange={() => setMixVoiceMode("none")}
-                      className="accent-indigo-500"
-                    />
-                    <span>Không lồng voice</span>
-                  </label>
-                  <label className="flex items-center gap-1.5 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="voiceMode"
-                      checked={mixVoiceMode === "rotate"}
-                      onChange={() => setMixVoiceMode("rotate")}
-                      className="accent-indigo-500"
-                    />
-                    <span>Xoay vòng {multiVoices.length} voice</span>
-                  </label>
-                </div>
-                {multiVoices.length > 0 && mixVoiceMode === "rotate" && (
-                  <div className="flex flex-wrap gap-1.5 max-h-16 overflow-y-auto">
-                    {multiVoices.map((v) => (
-                      <span
-                        key={v.id}
-                        className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 truncate max-w-[130px]"
-                        title={v.name}
-                      >
-                        🎵 {v.name}
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Mix Button */}
-              <div className="md:col-span-3 flex flex-col justify-center items-center">
+              <div className="w-full sm:w-auto shrink-0">
                 <button
                   onClick={handlePlanDiverseMix}
-                  className="w-full py-4 rounded-2xl bg-indigo-600 hover:opacity-95 text-white font-extrabold text-sm shadow-xl flex items-center justify-center gap-2 transition"
+                  className="w-full sm:w-auto px-6 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-xs sm:text-sm shadow-xl shadow-indigo-600/20 flex items-center justify-center gap-2 transition"
                 >
-                  <Sparkles className="w-5 h-5 animate-pulse" />
+                  <Sparkles className="w-4 h-4 animate-pulse" />
                   <span>Tạo tổ hợp trộn video</span>
                 </button>
               </div>
@@ -3638,19 +3846,12 @@ export default function StudioWorkspace({
                     <div className="flex items-center gap-2">
                       <button
                         onClick={handleRenderAllComposedZip}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition"
+                        disabled={Boolean(busyMessage)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition shadow-md shadow-emerald-600/20 disabled:opacity-50"
                         title="Render toàn bộ video bằng FFmpeg và nén ZIP tải về máy"
                       >
-                        <Download className="w-3.5 h-3.5 text-emerald-400" />
+                        <Download className="w-3.5 h-3.5" />
                         <span>Tải ZIP toàn bộ MP4</span>
-                      </button>
-                      <button
-                        onClick={handleRenderAllDirectToFolder}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition shadow-md shadow-indigo-600/20"
-                        title="Render và lưu thẳng toàn bộ file MP4 vào thư mục máy tính"
-                      >
-                        <FolderDown className="w-3.5 h-3.5" />
-                        <span>Lưu thẳng vào máy tính</span>
                       </button>
                     </div>
                   </div>
@@ -3666,6 +3867,10 @@ export default function StudioWorkspace({
                           : -1;
                       const activeSlot =
                         activeSlotIdx >= 0 ? comp.slots[activeSlotIdx] : null;
+                      const isCardPlaying =
+                        isSelected &&
+                        isPreviewPlaying &&
+                        previewMode === "full";
 
                       return (
                         <div
@@ -3691,17 +3896,38 @@ export default function StudioWorkspace({
                                 type="button"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  setSelectedComposedId(comp.id);
-                                  setEditingSlotCategory(null);
-                                  setActiveSlotFocusIndex(null);
-                                  setPreviewMode("full");
-                                  setPlayTrigger((prev) => prev + 1);
+                                  if (isCardPlaying) {
+                                    setPauseTrigger((prev) => prev + 1);
+                                  } else {
+                                    setSelectedComposedId(comp.id);
+                                    setEditingSlotCategory(null);
+                                    setActiveSlotFocusIndex(null);
+                                    setPreviewMode("full");
+                                    setPlayTrigger((prev) => prev + 1);
+                                  }
                                 }}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold shadow-md shadow-emerald-600/20 transition"
-                                title="Xem trước toàn bộ video (5 cảnh)"
+                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-white text-[11px] font-bold shadow-md transition ${
+                                  isCardPlaying
+                                    ? "bg-amber-600 hover:bg-amber-500 shadow-amber-600/20"
+                                    : "bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/20"
+                                }`}
+                                title={
+                                  isCardPlaying
+                                    ? "Tạm dừng phát thử"
+                                    : "Xem trước toàn bộ video (5 cảnh)"
+                                }
                               >
-                                <Play className="w-3 h-3 fill-current" />
-                                <span>Phát</span>
+                                {isCardPlaying ? (
+                                  <>
+                                    <Pause className="w-3 h-3 fill-current" />
+                                    <span>Tạm dừng</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Play className="w-3 h-3 fill-current" />
+                                    <span>Phát</span>
+                                  </>
+                                )}
                               </button>
                               <button
                                 onClick={(e) => {
@@ -3743,7 +3969,6 @@ export default function StudioWorkspace({
                                     setPreviewMode(
                                       willBeActive ? "slot" : "full",
                                     );
-                                    setPlayTrigger((prev) => prev + 1);
                                   }}
                                   className={`p-1.5 rounded-lg text-left border text-[10px] transition cursor-pointer ${
                                     isSlotActive
@@ -3791,6 +4016,35 @@ export default function StudioWorkspace({
                                 </button>
                               );
                             })}
+                          </div>
+
+                          {/* Voice Track Selector for this Composed Video */}
+                          <div className="mt-2 pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px]">
+                            <div className="flex items-center gap-1.5 text-slate-400">
+                              <Mic className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                              <span className="text-[10px] text-slate-300">
+                                Lồng tiếng:
+                              </span>
+                            </div>
+                            <select
+                              value={comp.voiceTrackId || ""}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) => {
+                                e.stopPropagation();
+                                handleChangeComposedVoice(
+                                  comp.id,
+                                  e.target.value || null,
+                                );
+                              }}
+                              className="bg-slate-900 border border-slate-700 text-indigo-300 text-[10px] rounded-lg px-2 py-0.5 focus:outline-none focus:border-indigo-500 max-w-[210px] truncate"
+                            >
+                              <option value="">(Không lồng voice)</option>
+                              {multiVoices.map((v) => (
+                                <option key={v.id} value={v.id}>
+                                  🎵 {v.name} ({v.duration.toFixed(1)}s)
+                                </option>
+                              ))}
+                            </select>
                           </div>
 
                           {/* Inline Scene Inspector */}
@@ -3973,7 +4227,6 @@ export default function StudioWorkspace({
                                     }}
                                     onScrubEnd={() => {
                                       setIsScrubbing(false);
-                                      setPlayTrigger((prev) => prev + 1);
                                     }}
                                     onSeekPreview={(targetSec) => {
                                       setActiveSlotFocusIndex(activeSlotIdx);
@@ -4005,26 +4258,14 @@ export default function StudioWorkspace({
                         Chuyển cảnh 0ms (Ping-Pong Video A/B)
                       </p>
                     </div>
-                    {selectedComposed && (
-                      <button
-                        onClick={() => setShowJsonModal(true)}
-                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 border border-slate-700"
-                      >
-                        <Code2 className="w-3.5 h-3.5 text-rose-400" />
-                        <span>Zvid JSON</span>
-                      </button>
-                    )}
                   </div>
 
                   {selectedComposed ? (
                     <PreviewPlayer916
-                      key={selectedComposed.id}
                       composed={selectedComposed}
                       sourceVideo={state.sourceVideo}
-                      voiceTrack={
-                        selectedComposed.voiceTrackId ? state.voiceTrack : null
-                      }
-                      enableVoice={mixVoiceMode === "rotate"}
+                      voiceTrack={selectedVoiceTrack}
+                      enableVoice={Boolean(selectedVoiceTrack)}
                       previewMode={previewMode}
                       isolatedSlotIndex={
                         previewMode === "slot" &&
@@ -4035,6 +4276,8 @@ export default function StudioWorkspace({
                       isScrubbing={isScrubbing}
                       scrubSourceSec={scrubSourceSec}
                       playTrigger={playTrigger}
+                      pauseTrigger={pauseTrigger}
+                      onPlayingChange={setIsPreviewPlaying}
                       activeSlotFocusIndex={activeSlotFocusIndex}
                       seekTimelineSec={previewSeekSec}
                       onSlotFocusChange={(idx) => {
@@ -4053,141 +4296,33 @@ export default function StudioWorkspace({
               </div>
             )}
 
-            {/* Zvid Paid API Cloud Render Queue Section */}
+            {/* Direct Local Export Section */}
             {state?.composedVideos && state.composedVideos.length > 0 && (
               <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <h3 className="text-sm font-bold flex items-center gap-2 text-white">
-                    <KeyRound className="w-4 h-4 text-rose-400" />
-                    <span>Render hàng loạt qua Zvid paid API cloud</span>
-                  </h3>
-                  {state.zvidUploadUsage && (
-                    <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-300">
-                      Zvid Storage:{" "}
-                      {(state.zvidUploadUsage.usedBytes / 1024 / 1024).toFixed(
-                        1,
-                      )}{" "}
-                      MB /{" "}
-                      {(
-                        state.zvidUploadUsage.maxTotalBytes /
-                        1024 /
-                        1024
-                      ).toFixed(0)}{" "}
-                      MB
-                    </span>
-                  )}
-                </div>
+                <div className="flex flex-wrap items-center justify-between gap-4">
+                  <div>
+                    <h3 className="text-sm font-bold flex items-center gap-2 text-white">
+                      <Download className="w-4 h-4 text-emerald-400" />
+                      <span>Xuất toàn bộ các video tổ hợp về máy tính</span>
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-1">
+                      Render trực tiếp qua FFmpeg (1080×1920 MP4) và lưu thẳng
+                      về máy không qua trung gian.
+                    </p>
+                  </div>
 
-                <div className="flex flex-wrap items-center gap-2">
-                  <input
-                    type="password"
-                    placeholder={
-                      hasEnvKey
-                        ? "Đã có ZVID_API_KEY trong môi trường (Nhập để ghi đè)"
-                        : "Nhập Zvid API Key (x-api-key từ app.zvid.io/api-keys)..."
-                    }
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    className="flex-1 min-w-[240px] px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:border-rose-500"
-                  />
-                  <button
-                    onClick={handleCheckZvidAccount}
-                    className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 border border-slate-700 transition"
-                  >
-                    Kiểm tra hạn mức Zvid
-                  </button>
-                  <button
-                    onClick={handleLazyUploadAndValidate}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 border border-indigo-500/40 text-xs font-semibold transition"
-                  >
-                    <ShieldCheck className="w-4 h-4" />
-                    <span>Validate (0 credit)</span>
-                  </button>
-                  <button
-                    onClick={() => handleSubmitBatchRender()}
-                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-500 hover:bg-rose-600 text-white text-xs font-bold transition shadow-lg shadow-rose-500/20"
-                  >
-                    <Send className="w-3.5 h-3.5" />
-                    <span>Render cả lô ({state.composedVideos.length})</span>
-                  </button>
-                </div>
-
-                {/* Render Queue Table */}
-                <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1">
-                  {state.composedVideos.map((comp, idx) => (
-                    <div
-                      key={comp.id}
-                      className="p-3 rounded-xl bg-slate-950/60 border border-slate-800 flex flex-wrap items-center justify-between gap-3"
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      onClick={handleRenderAllComposedZip}
+                      disabled={Boolean(busyMessage)}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow-lg shadow-emerald-600/20 disabled:opacity-50"
                     >
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-bold text-white">
-                            #{idx + 1} — {comp.name}
-                          </span>
-                          <span className="text-[11px] font-mono text-slate-400">
-                            ({comp.finalDuration.toFixed(1)}s •{" "}
-                            {comp.validation?.creditsRequired ??
-                              Math.ceil(comp.finalDuration)}{" "}
-                            credits)
-                          </span>
-                        </div>
-                        <div className="text-[10px] font-mono text-slate-500">
-                          jobId: {comp.jobId}
-                        </div>
-                        {comp.failedReason && (
-                          <div className="text-[11px] text-rose-400">
-                            Lỗi: {comp.failedReason}
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="flex items-center gap-2">
-                        <span
-                          className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${
-                            comp.renderState === "completed"
-                              ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
-                              : comp.renderState === "validated"
-                                ? "bg-sky-500/20 text-sky-300 border-sky-500/40"
-                                : comp.renderState === "queued" ||
-                                    comp.renderState === "active"
-                                  ? "bg-amber-500/20 text-amber-300 border-amber-500/40"
-                                  : comp.renderState === "failed" ||
-                                      comp.renderState === "ValidationFailed"
-                                    ? "bg-rose-500/20 text-rose-300 border-rose-500/40"
-                                    : "bg-slate-800 text-slate-400 border-slate-700"
-                          }`}
-                        >
-                          {comp.renderState.toUpperCase()}
-                          {comp.renderState === "active"
-                            ? ` (${comp.progress}%)`
-                            : ""}
-                        </span>
-
-                        {comp.renderState === "completed" &&
-                        (comp.localOutputUrl || comp.remoteResultUrl) ? (
-                          <a
-                            href={
-                              comp.localOutputUrl || comp.remoteResultUrl || "#"
-                            }
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-emerald-500 text-slate-950 font-bold text-xs hover:bg-emerald-400 transition"
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                            <span>Tải MP4</span>
-                          </a>
-                        ) : (
-                          <button
-                            onClick={() => handleSubmitBatchRender(comp.id)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-rose-500 hover:text-white text-slate-200 text-xs transition"
-                          >
-                            <Play className="w-3 h-3" />
-                            <span>Render lẻ</span>
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  ))}
+                      <Download className="w-3.5 h-3.5" />
+                      <span>
+                        Tải ZIP toàn bộ ({state.composedVideos.length} MP4)
+                      </span>
+                    </button>
+                  </div>
                 </div>
               </div>
             )}
@@ -4206,10 +4341,14 @@ export default function StudioWorkspace({
                 </div>
                 <div>
                   <h3 className="text-sm font-bold text-white">
-                    Dán link Google Drive cho mục {singleCategoryDriveModal.category.toUpperCase()}
+                    Dán link Google Drive cho mục{" "}
+                    {singleCategoryDriveModal.category === "voice"
+                      ? "Voice (lồng tiếng)"
+                      : singleCategoryDriveModal.category.toUpperCase()}
                   </h3>
                   <p className="text-[11px] text-slate-400">
-                    Nhập danh sách link Google Drive công khai (mỗi dòng 1 link hoặc dấu phẩy)
+                    Nhập danh sách link Google Drive công khai (mỗi dòng 1 link
+                    hoặc dấu phẩy)
                   </p>
                 </div>
               </div>
@@ -4246,11 +4385,13 @@ export default function StudioWorkspace({
               </button>
               <button
                 type="button"
-                disabled={!singleCategoryDriveModal.text.trim() || isIngestingDrive}
+                disabled={
+                  !singleCategoryDriveModal.text.trim() || isIngestingDrive
+                }
                 onClick={() =>
                   handleIngestSingleCategoryDrive(
                     singleCategoryDriveModal.category,
-                    singleCategoryDriveModal.text
+                    singleCategoryDriveModal.text,
                   )
                 }
                 className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold transition shadow-lg shadow-sky-600/20 disabled:opacity-50"
@@ -4267,77 +4408,61 @@ export default function StudioWorkspace({
         </div>
       )}
 
-      {/* Zvid Inline Payload JSON Inspector Modal */}
-      {showJsonModal && selectedComposed && (
-        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-3xl w-full max-h-[85vh] flex flex-col overflow-hidden shadow-2xl">
-            <div className="px-5 py-3.5 border-b border-slate-800 flex items-center justify-between">
-              <div>
-                <h3 className="text-sm font-bold text-white">
-                  Zvid.io inline renderPayload — {selectedComposed.name}
-                </h3>
-                <p className="text-xs text-slate-400">
-                  Chuẩn schema `POST /api/render/validate/api-key` & `POST
-                  /api/render/api-key` (jobId: {selectedComposed.jobId})
-                </p>
-              </div>
-              <button
-                onClick={() => setShowJsonModal(false)}
-                className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200"
-              >
-                Đóng
-              </button>
-            </div>
-            <pre className="p-5 text-xs font-mono text-emerald-300 overflow-auto flex-1 bg-slate-950">
-              {JSON.stringify(
-                {
-                  jobId: selectedComposed.jobId,
-                  payload: selectedComposed.zvidPayload,
-                },
-                null,
-                2,
-              )}
-            </pre>
-          </div>
-        </div>
-      )}
+      {/* Clear All Confirmation Modal */}
+      {showClearConfirmModal && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-slate-700/80 rounded-2xl max-w-md w-full p-6 space-y-5 shadow-2xl relative overflow-hidden animate-in zoom-in-95 duration-200">
+            {/* Ambient subtle glow */}
+            <div className="absolute -top-10 -right-10 w-32 h-32 bg-rose-500/15 rounded-full blur-3xl pointer-events-none" />
 
-      {/* Modal xác nhận xoá trắng kho clip */}
-      {showClearPoolsModal && (
-        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
             <div className="flex items-start gap-3.5">
-              <div className="w-10 h-10 rounded-xl bg-rose-500/20 flex items-center justify-center border border-rose-500/40 shrink-0 text-rose-400">
+              <div className="w-10 h-10 rounded-xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center shrink-0 text-rose-400">
                 <Trash2 className="w-5 h-5" />
               </div>
               <div className="space-y-1">
-                <h3 className="text-base font-bold text-white">
-                  Xác nhận xoá trắng kho clip
+                <h3 className="text-sm font-bold text-white">
+                  Xác nhận xoá trắng kho
                 </h3>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Bạn có chắc chắn muốn xóa toàn bộ clip trong 5 category (<span className="text-rose-400 font-semibold">Open</span>, <span className="text-blue-400 font-semibold">Product</span>, <span className="text-amber-400 font-semibold">Texture</span>, <span className="text-emerald-400 font-semibold">Apply</span>, <span className="text-purple-400 font-semibold">End</span>) của dự án này không?
-                </p>
-                <p className="text-[11px] text-slate-400">
-                  Dữ liệu trong SQLite Cloud và danh sách clip sẽ bị xoá vĩnh viễn. Hành động này không thể hoàn tác.
+                  Bạn có chắc chắn muốn xóa toàn bộ clip trong kho, các file voice và toàn bộ tổ hợp đã tạo để bắt đầu mẻ mới?
                 </p>
               </div>
             </div>
 
-            <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
+            <div className="rounded-xl bg-slate-950/70 border border-slate-800 p-3 space-y-1.5 text-[11px] text-slate-400">
+              <div className="flex items-center gap-2 text-rose-300 font-medium">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>Các mục sẽ bị dọn sạch vĩnh viễn:</span>
+              </div>
+              <ul className="list-disc list-inside space-y-1 pl-1 text-slate-300">
+                <li>Toàn bộ clip trong 5 thư mục (Open, Product, Texture, Apply, End)</li>
+                <li>Toàn bộ file voice lồng tiếng đã nạp</li>
+                <li>Toàn bộ danh sách tổ hợp video đã tạo trong phiên này</li>
+                <li>Dữ liệu lưu trữ trong SQLite Cloud của dự án này</li>
+              </ul>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-800">
               <button
                 type="button"
-                onClick={() => setShowClearPoolsModal(false)}
-                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition"
+                disabled={isClearingAll}
+                onClick={() => setShowClearConfirmModal(false)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition disabled:opacity-50"
               >
                 Hủy bỏ
               </button>
               <button
                 type="button"
-                onClick={handleConfirmClearPools}
-                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-white transition shadow-lg shadow-rose-600/30 flex items-center gap-1.5"
+                disabled={isClearingAll}
+                onClick={handleConfirmClearAll}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold transition shadow-lg shadow-rose-600/25 disabled:opacity-50"
               >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Xác nhận xoá</span>
+                {isClearingAll ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+                <span>{isClearingAll ? "Đang xóa..." : "Xác nhận xóa sạch"}</span>
               </button>
             </div>
           </div>
@@ -4359,19 +4484,48 @@ export default function StudioWorkspace({
             </div>
 
             {/* Title and Detail */}
-            <div className="space-y-1.5 z-10">
+            <div className="space-y-1.5 z-10 w-full">
               <h3 className="text-base font-semibold text-white tracking-wide">
-                Đang thực hiện...
+                {renderProgress ? "Đang kết xuất video..." : "Đang thực hiện..."}
               </h3>
-              <p className="text-xs text-slate-300 leading-relaxed max-w-xs font-mono">
+              <p className="text-xs text-slate-300 leading-relaxed max-w-xs mx-auto font-mono">
                 {busyMessage}
               </p>
+
+              {/* Real-time Render Progress Tracker */}
+              {renderProgress && (
+                <div className="pt-2 space-y-2 w-full">
+                  <div className="flex items-center justify-between text-xs font-mono font-bold px-1">
+                    <span className="text-emerald-400">
+                      {renderProgress.current} / {renderProgress.total} video
+                    </span>
+                    <span className="text-indigo-400 font-extrabold">
+                      {renderProgress.percent}%
+                    </span>
+                  </div>
+                  {renderProgress.name && (
+                    <div className="text-[11px] text-slate-400 truncate max-w-xs mx-auto">
+                      Đang xử lý: <span className="text-slate-200">{renderProgress.name}</span>
+                    </div>
+                  )}
+                  <div className="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden border border-slate-700/60 p-0.5">
+                    <div
+                      className="bg-gradient-to-r from-emerald-500 via-teal-500 to-indigo-500 h-full rounded-full transition-all duration-300 shadow-sm shadow-emerald-500/50"
+                      style={{
+                        width: `${Math.min(100, Math.max(0, renderProgress.percent))}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
-            {/* Animated progress bar pulse */}
-            <div className="w-full bg-slate-800/80 rounded-full h-1 overflow-hidden mt-1">
-              <div className="bg-gradient-to-r from-rose-500 via-indigo-500 to-indigo-600 h-full w-full animate-pulse" />
-            </div>
+            {/* Default animated progress bar pulse if no renderProgress */}
+            {!renderProgress && (
+              <div className="w-full bg-slate-800/80 rounded-full h-1 overflow-hidden mt-1">
+                <div className="bg-gradient-to-r from-rose-500 via-indigo-500 to-indigo-600 h-full w-full animate-pulse" />
+              </div>
+            )}
           </div>
         </div>
       )}
