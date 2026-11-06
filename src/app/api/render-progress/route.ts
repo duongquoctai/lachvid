@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getSessionIdFromHeaders, sanitizeSessionId } from "@/lib/store";
 
 const PYTHON_BACKEND_URL =
-  process.env.PYTHON_BACKEND_URL || "http://localhost:8000";
+  process.env.PYTHON_BACKEND_URL || "http://localhost:3006";
 
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);

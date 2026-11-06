@@ -7,7 +7,7 @@ import {
 } from "@/lib/store";
 
 const PYTHON_BACKEND_URL =
-  process.env.PYTHON_BACKEND_URL || "http://localhost:8000";
+  process.env.PYTHON_BACKEND_URL || "http://localhost:3006";
 
 export async function POST(req: NextRequest) {
   try {

@@ -15,7 +15,7 @@ import {
 } from "@/types/lachvid";
 
 const PYTHON_BACKEND_URL =
-  process.env.PYTHON_BACKEND_URL || "http://localhost:8000";
+  process.env.PYTHON_BACKEND_URL || "http://localhost:3006";
 
 interface PythonSceneItem {
   index: number;

@@ -8,6 +8,7 @@ const nextConfig = {
     "*.ngrok.app",
     "*.pinggy.link",
     "localhost:3000",
+    "localhost:3005",
   ],
   experimental: {
     serverActions: {

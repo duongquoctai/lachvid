@@ -55,7 +55,7 @@ SESSION_TTL_SECONDS = 30 * 60  # 30 minutes
 MAX_STORAGE_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB
 
 def get_base_sessions_dir() -> str:
-    return os.path.join(tempfile.get_tempdir(), "lachvid_sessions")
+    return os.path.join(tempfile.gettempdir(), "lachvid_sessions")
 
 def cleanup_expired_sessions_janitor():
     """Background thread that runs every 5 minutes to purge inactive sessions."""
@@ -719,4 +719,4 @@ def render_composed_endpoint(req: RenderBatchRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=3006, reload=True)
