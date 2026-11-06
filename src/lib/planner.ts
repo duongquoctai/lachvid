@@ -73,6 +73,22 @@ export interface PlannerResult {
 }
 
 /**
+ * Extracts a stable fingerprint for a shot:
+ * - If driveFileId exists: gdrive:<driveFileId>
+ * - Otherwise cleans dynamic suffix like _<timestamp>
+ */
+export function getShotFingerprint(shot: Shot): string {
+  if (shot.id.startsWith("drive_")) {
+    // If it's a drive file, parse parts: drive_category_fileId
+    const parts = shot.id.split("_");
+    if (parts.length >= 3) {
+      return `gdrive:${parts[2]}`;
+    }
+  }
+  return shot.id;
+}
+
+/**
  * Generates up to N distinct 5-shot tuples (one per category in order: open -> product -> texture -> apply -> end)
  * obeying:
  * 1. Mandatory >= 1 shot per category
@@ -80,10 +96,12 @@ export interface PlannerResult {
  * 3. Configurable minimum Hamming distance d_min between any pair of selected videos
  * 4. Configurable maximum shot frequency cap F_max across the batch
  * 5. Balanced usage scoring (prefers least-used shots first)
+ * 6. Historical anti-collision: At most 3 shots can overlap with any previously rendered video (d >= 2)
  */
 export function planDiverseCombinations(
   shots: Shot[],
-  config: DiversityConfig
+  config: DiversityConfig,
+  historyTuples: string[] = [] // Array of tupleKey ("openId|productId|textureId|applyId|endId")
 ): PlannerResult {
   const byCat: Record<ShotCategory, Shot[]> = {
     open: [],
@@ -132,72 +150,22 @@ export function planDiverseCombinations(
     byCat.apply.length *
     byCat.end.length;
 
-  const rand = createSeededRandom(config.seed || Date.now());
+  const rand = createSeededRandom(config.seed || 42);
 
-  // Shuffle each category pool first so order is never biased by import sequence
-  for (const cat of CATEGORY_ORDER) {
-    const arr = byCat[cat];
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(rand() * (i + 1));
-      const tmp = arr[i];
-      arr[i] = arr[j];
-      arr[j] = tmp;
-    }
-  }
+  const targetN = Math.min(config.targetCount, maxPossibleCombinations);
+  // Yêu cầu: tối đa 3 cảnh trùng nhau => phải khác ít nhất 2 cảnh (Hamming >= 2)
+  const minHamming = Math.max(2, Math.min(5, config.minHammingDistance || 2));
+  // Đảm bảo maxFreq đủ lớn để sinh đủ targetN (mỗi category có byCat[c].length items)
+  const minReqFreq = Math.ceil(targetN / Math.min(byCat.open.length, byCat.product.length, byCat.texture.length, byCat.apply.length, byCat.end.length));
+  const maxFreq = Math.max(minReqFreq, Math.max(1, config.maxShotFrequency));
 
-  // Generate candidate pool:
-  // - If total space <= 5,000, enumerate all combinations exactly.
-  // - If total space > 5,000 (e.g. 10^5 = 100,000), use stratified Latin-square + random sampling
-  //   so every clip in every category (especially OPEN) is uniformly represented.
-  const allCandidates: [Shot, Shot, Shot, Shot, Shot][] = [];
-  const limitEnumeration = 8000;
-
-  if (maxPossibleCombinations <= 5000) {
-    for (const sOpen of byCat.open) {
-      for (const sProd of byCat.product) {
-        for (const sTex of byCat.texture) {
-          for (const sApp of byCat.apply) {
-            for (const sEnd of byCat.end) {
-              allCandidates.push([sOpen, sProd, sTex, sApp, sEnd]);
-            }
-          }
-        }
-      }
-    }
-    for (let i = allCandidates.length - 1; i > 0; i--) {
-      const j = Math.floor(rand() * (i + 1));
-      const tmp = allCandidates[i];
-      allCandidates[i] = allCandidates[j];
-      allCandidates[j] = tmp;
-    }
-  } else {
-    const seenKeys = new Set<string>();
-    const nOpen = byCat.open.length;
-    const nProd = byCat.product.length;
-    const nTex = byCat.texture.length;
-    const nApp = byCat.apply.length;
-    const nEnd = byCat.end.length;
-
-    // Phase 1: Stratified Latin-hypercube sweeps so every open/product/texture/apply/end clip appears evenly
-    const sweeps = Math.min(limitEnumeration, Math.max((config.targetCount || 20) * 40, 3000));
-    for (let idx = 0; idx < sweeps * 2 && allCandidates.length < limitEnumeration; idx++) {
-      const oIdx = idx % nOpen;
-      const cycle = Math.floor(idx / nOpen);
-      const pIdx = (oIdx + cycle * 3 + Math.floor(rand() * nProd)) % nProd;
-      const tIdx = (oIdx * 2 + cycle * 5 + Math.floor(rand() * nTex)) % nTex;
-      const aIdx = (oIdx * 3 + cycle * 7 + Math.floor(rand() * nApp)) % nApp;
-      const eIdx = (oIdx * 5 + cycle * 11 + Math.floor(rand() * nEnd)) % nEnd;
-
-      const sOpen = byCat.open[oIdx];
-      const sProd = byCat.product[pIdx];
-      const sTex = byCat.texture[tIdx];
-      const sApp = byCat.apply[aIdx];
-      const sEnd = byCat.end[eIdx];
-      const key = `${sOpen.id}|${sProd.id}|${sTex.id}|${sApp.id}|${sEnd.id}`;
-      if (!seenKeys.has(key)) {
-        seenKeys.add(key);
-        allCandidates.push([sOpen, sProd, sTex, sApp, sEnd]);
-      }
+  // Parse history tuples to tuple arrays for fast Hamming comparison
+  const parsedHistory: [string, string, string, string, string][] = [];
+  for (const h of historyTuples) {
+    if (!h) continue;
+    const parts = h.split("|");
+    if (parts.length === 5) {
+      parsedHistory.push([parts[0], parts[1], parts[2], parts[3], parts[4]]);
     }
   }
 
@@ -208,124 +176,79 @@ export function planDiverseCombinations(
     shotUsageCounts[s.id] = 0;
   }
 
-  const targetN = Math.min(config.targetCount, maxPossibleCombinations);
-  const minHamming = Math.max(1, Math.min(5, config.minHammingDistance));
+  let attempts = 0;
+  const maxAttempts = 200000;
 
-  const usedCandidateIndices = new Set<number>();
+  while (selected.length < targetN && attempts < maxAttempts) {
+    attempts++;
 
-  while (selected.length < targetN) {
-    let bestIdx = -1;
-    let bestScore = Infinity;
-
-    const nextOrdinal = selected.length + 1;
-    // Ideal round-robin cap per category at this point in the sequence
-    const idealCapByCat = CATEGORY_ORDER.map((cat) =>
-      Math.ceil(nextOrdinal / Math.max(1, byCat[cat].length))
-    );
-
-    const prevTupleIds = selectedIds.length > 0 ? selectedIds[selectedIds.length - 1] : null;
-    let currentMinHamming = minHamming;
-    let allowOverIdealCap = 0;
-
-    while (bestIdx === -1 && currentMinHamming >= 1) {
-      for (let i = 0; i < allCandidates.length; i++) {
-        if (usedCandidateIndices.has(i)) continue;
-        const cand = allCandidates[i];
-        const candIds: [string, string, string, string, string] = [
-          cand[0].id,
-          cand[1].id,
-          cand[2].id,
-          cand[3].id,
-          cand[4].id,
-        ];
-
-        // 1. Check strict uniqueness and pairwise Hamming distance
-        let isDuplicate = false;
-        let minDistanceToPrev = 5;
-        let totalDistanceSum = 0;
-        for (const prevIds of selectedIds) {
-          const dist = computeHammingDistance(candIds, prevIds);
-          totalDistanceSum += dist;
-          if (dist < minDistanceToPrev) minDistanceToPrev = dist;
-          if (dist === 0) {
-            isDuplicate = true;
-            break;
-          }
-        }
-        if (isDuplicate) continue;
-        if (minDistanceToPrev < currentMinHamming) continue;
-
-        // 2. Check per-category round-robin balance
-        let overCapCount = 0;
-        let usageScore = 0;
-        for (let k = 0; k < 5; k++) {
-          const u = shotUsageCounts[candIds[k]] || 0;
-          if (u + 1 > idealCapByCat[k] + allowOverIdealCap) {
-            overCapCount++;
-          }
-          // Weight slot 0 (OPEN hook) higher so opening clips rotate strictly
-          const slotWeight = k === 0 ? 35 : 15;
-          usageScore += u * slotWeight;
-        }
-        if (overCapCount > 0) continue;
-
-        // 3. Penalize repeating the same clip as the immediately preceding video
-        let consecutiveRepeatPenalty = 0;
-        if (prevTupleIds) {
-          if (candIds[0] === prevTupleIds[0] && byCat.open.length > 1) {
-            consecutiveRepeatPenalty += 500;
-          }
-          for (let k = 1; k < 5; k++) {
-            if (candIds[k] === prevTupleIds[k] && byCat[CATEGORY_ORDER[k]].length > 1) {
-              consecutiveRepeatPenalty += 80;
-            }
-          }
-        }
-
-        const avgDistance = selectedIds.length > 0 ? totalDistanceSum / selectedIds.length : 5;
-        const score =
-          usageScore +
-          consecutiveRepeatPenalty -
-          minDistanceToPrev * 12 -
-          avgDistance * 4;
-
-        if (score < bestScore) {
-          bestScore = score;
-          bestIdx = i;
-        }
+    // Pick 1 shot per category, prioritizing least-used shots
+    const candidateTuple: Shot[] = [];
+    for (const cat of CATEGORY_ORDER) {
+      const items = byCat[cat];
+      let minUsage = Infinity;
+      for (const item of items) {
+        const u = shotUsageCounts[item.id] || 0;
+        if (u < minUsage) minUsage = u;
       }
-
-      if (bestIdx === -1) {
-        if (allowOverIdealCap < 2) {
-          allowOverIdealCap++;
-        } else {
-          allowOverIdealCap = 0;
-          currentMinHamming--;
-        }
-      }
-    }
-
-    if (bestIdx === -1) {
-      warnings.push(
-        `Đã tạo tối đa ${selected.length}/${targetN} video (đã dùng hết các tổ hợp độc nhất có thể).`
+      const bestCandidates = items.filter(
+        (it) => (shotUsageCounts[it.id] || 0) === minUsage
       );
-      break;
+      const chosenItem =
+        bestCandidates[Math.floor(rand() * bestCandidates.length)];
+      candidateTuple.push(chosenItem);
     }
 
-    usedCandidateIndices.add(bestIdx);
-    const chosen = allCandidates[bestIdx];
-    selected.push(chosen);
-    const chosenIds: [string, string, string, string, string] = [
-      chosen[0].id,
-      chosen[1].id,
-      chosen[2].id,
-      chosen[3].id,
-      chosen[4].id,
+    const candIds: [string, string, string, string, string] = [
+      candidateTuple[0].id,
+      candidateTuple[1].id,
+      candidateTuple[2].id,
+      candidateTuple[3].id,
+      candidateTuple[4].id,
     ];
-    selectedIds.push(chosenIds);
-    for (const id of chosenIds) {
+
+    // Check frequency cap
+    let exceedsFreq = false;
+    for (let k = 0; k < 5; k++) {
+      if ((shotUsageCounts[candIds[k]] || 0) + 1 > maxFreq) {
+        exceedsFreq = true;
+        break;
+      }
+    }
+    if (exceedsFreq) continue;
+
+    // Check anti-collision with previously rendered history (Hamming >= 2)
+    let violatesHistory = false;
+    for (const histIds of parsedHistory) {
+      if (computeHammingDistance(candIds, histIds) < 2) {
+        violatesHistory = true;
+        break;
+      }
+    }
+    if (violatesHistory) continue;
+
+    // Check pairwise Hamming distance against all already selected tuples in this batch
+    let violatesHamming = false;
+    for (const prevIds of selectedIds) {
+      if (computeHammingDistance(candIds, prevIds) < minHamming) {
+        violatesHamming = true;
+        break;
+      }
+    }
+    if (violatesHamming) continue;
+
+    // Candidate is valid! Add to selected
+    selected.push(candidateTuple as [Shot, Shot, Shot, Shot, Shot]);
+    selectedIds.push(candIds);
+    for (const id of candIds) {
       shotUsageCounts[id] = (shotUsageCounts[id] || 0) + 1;
     }
+  }
+
+  if (selected.length < targetN) {
+    warnings.push(
+      `Đã dừng ở ${selected.length}/${targetN} video do ràng buộc độ đa dạng (Min Hamming = ${minHamming}, Max lặp shot = ${maxFreq}) đã bão hoà trên tập shots hiện tại.`
+    );
   }
 
   let minPairwiseHamming = 5;
@@ -355,9 +278,11 @@ function round3(n: number): number {
 }
 
 /**
- * Builds a complete ComposedVideo & ZvidRenderPayload from a 5-shot tuple.
- * When preserveOriginalClips is true, keeps 100% of the clips' original speed (1.0),
- * full duration (no cut/slow-motion), and no random variant edits.
+ * Builds a complete ComposedVideo & ZvidRenderPayload from a 5-shot tuple,
+ * applying Layer-1 (per-shot) + Layer-2 (variant) edits, transition overlap math,
+ * and fitting output duration to targetOutputDuration (default 20s):
+ * - Priority 1: Trim excess duration on shots that are longer than their Category Min Duration
+ * - Priority 2: Fine-tune speed slightly so total output duration matches targetOutputDuration (e.g. 20.0s)
  */
 export function buildComposedVideo(params: {
   index: number;
@@ -417,7 +342,7 @@ export function buildComposedVideo(params: {
       };
     }
 
-    // Default behavior for Khâu 1 / auto-slow-motion
+    // Ensure speed satisfies the category minimum duration if raw clip is shorter than minCatDur
     const autoSlowSpeed = computeShotSpeedForMinDuration(originalClipLen, minCatDur);
     let speed =
       shot.edits.speed && shot.edits.speed !== 1
@@ -440,7 +365,7 @@ export function buildComposedVideo(params: {
         flipH = !flipH;
       }
 
-      // Ken Burns zoom depth variation (1.08 to 1.24)
+      // Slight Ken Burns zoom depth variation (1.08 to 1.24)
       if (!zoom) {
         if (rand() > 0.35) {
           zoom = { depth: round3(1.08 + rand() * 0.16) };
@@ -453,9 +378,10 @@ export function buildComposedVideo(params: {
         };
       }
 
-      const bShift = Math.round((rand() - 0.5) * 8);
-      const cShift = Math.round((rand() - 0.5) * 10);
-      const sShift = Math.round((rand() - 0.5) * 12);
+      // Subtle color filter variation to evade duplicate hash/perceptual detection
+      const bShift = Math.round((rand() - 0.5) * 8); // -4 to +4
+      const cShift = Math.round((rand() - 0.5) * 10); // -5 to +5
+      const sShift = Math.round((rand() - 0.5) * 12); // -6 to +6
       const mergedFilter = {
         ...(filter || {}),
         brightness: Math.max(-100, Math.min(100, (filter?.brightness || 0) + bShift)),

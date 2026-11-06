@@ -17,24 +17,36 @@ import {
   probeGoogleDriveClipMetadata,
   probeGoogleDriveVoiceMetadata,
 } from "@/lib/drive";
+import { getProjectCategoryPools, saveProjectCategoryPools } from "@/lib/db";
 
 const VALID_CATS: ShotCategory[] = ["open", "product", "texture", "apply", "end"];
 
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);
+  const qProjectId = url.searchParams.get("projectId");
   const qSessionId = url.searchParams.get("sessionId");
   const sessionId = sanitizeSessionId(qSessionId || getSessionIdFromHeaders(req.headers));
 
   ensureSessionDirs(sessionId);
   const state = readProjectState(sessionId);
 
-  const pools: CategoryPools = state.categoryPools || {
+  let pools: CategoryPools = state.categoryPools || {
     open: [],
     product: [],
     texture: [],
     apply: [],
     end: [],
   };
+
+  if (qProjectId) {
+    const cloudPools = await getProjectCategoryPools(qProjectId);
+    const hasItems = Object.values(cloudPools).some((arr) => arr.length > 0);
+    if (hasItems) {
+      pools = cloudPools;
+      state.categoryPools = pools;
+      writeProjectState(state, sessionId);
+    }
+  }
 
   return NextResponse.json({
     sessionId,
@@ -70,6 +82,7 @@ export async function POST(req: NextRequest) {
   const contentType = req.headers.get("content-type") || "";
   let action = "upload";
   let sessionId = "";
+  let projectId = "";
   let jsonData: Record<string, unknown> | null = null;
   let formData: FormData | null = null;
 
@@ -79,6 +92,7 @@ export async function POST(req: NextRequest) {
     sessionId = sanitizeSessionId(
       (jsonData?.sessionId as string) || getSessionIdFromHeaders(req.headers)
     );
+    projectId = (jsonData?.projectId as string) || "";
   } else {
     formData = await req.formData().catch(() => null);
     if (!formData) {
@@ -88,6 +102,7 @@ export async function POST(req: NextRequest) {
     sessionId = sanitizeSessionId(
       (formData.get("sessionId") as string) || getSessionIdFromHeaders(req.headers)
     );
+    projectId = (formData.get("projectId") as string) || "";
   }
 
   const sessionPaths = ensureSessionDirs(sessionId);
@@ -222,7 +237,7 @@ export async function POST(req: NextRequest) {
 
       const safeBase = probe.fileName.replace(/\.[^/.]+$/, "");
       const item: CategoryVideoItem = {
-        id: `drive_${category}_${probe.fileId.slice(0, 12)}_${idx}_${Date.now().toString(36)}`,
+        id: `drive_${category}_${probe.fileId}`,
         name: safeBase,
         fileName: probe.fileName,
         category,
@@ -268,6 +283,10 @@ export async function POST(req: NextRequest) {
     state.categoryPools = pools;
     state.multiVoiceTracks = currentVoices;
     writeProjectState(state, sessionId);
+
+    if (projectId) {
+      await saveProjectCategoryPools(projectId, pools);
+    }
 
     return NextResponse.json({
       success: true,
@@ -328,6 +347,10 @@ export async function POST(req: NextRequest) {
     }
     state.categoryPools = pools;
     writeProjectState(state, sessionId);
+
+    if (projectId) {
+      await saveProjectCategoryPools(projectId, pools);
+    }
     return NextResponse.json({ success: true, sessionId, categoryPools: pools });
   }
 
@@ -343,6 +366,11 @@ export async function POST(req: NextRequest) {
     state.multiVoiceTracks = [];
     state.composedVideos = [];
     writeProjectState(state, sessionId);
+
+    if (projectId) {
+      await saveProjectCategoryPools(projectId, pools);
+    }
+
     return NextResponse.json({
       success: true,
       sessionId,
@@ -369,6 +397,10 @@ export async function POST(req: NextRequest) {
     }
     state.categoryPools = pools;
     writeProjectState(state, sessionId);
+
+    if (projectId) {
+      await saveProjectCategoryPools(projectId, pools);
+    }
     return NextResponse.json({ success: true, sessionId, categoryPools: pools });
   }
 
@@ -493,6 +525,10 @@ export async function POST(req: NextRequest) {
 
     state.categoryPools = pools;
     writeProjectState(state, sessionId);
+
+    if (projectId) {
+      await saveProjectCategoryPools(projectId, pools);
+    }
 
     return NextResponse.json({
       success: true,
