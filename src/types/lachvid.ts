@@ -150,6 +150,7 @@ export interface Shot {
   rawBegin?: number; // original detected start second in source video
   rawEnd?: number; // original detected end second in source video
   category: ShotCategory | null; // null while still an unclassified draft segment
+  contentHash?: string;
   edits: ShotEdits;
 }
 
@@ -305,6 +306,7 @@ export interface CategoryVideoItem {
   lockFlipH?: boolean;
   driveFileId?: string;
   sourceType?: "drive" | "local";
+  contentHash?: string;
 }
 
 export type CategoryPools = Record<ShotCategory, CategoryVideoItem[]>;
@@ -337,5 +339,15 @@ export interface ProjectState {
     usedBytes: number;
     maxTotalBytes: number;
   } | null;
+}
+
+export interface RenderedVideoRecord {
+  id: string;
+  projectId: string;
+  tupleKey: string;
+  name?: string;
+  payload?: ComposedVideo | Record<string, unknown>;
+  status?: "unused" | "used";
+  renderedAt: string;
 }
 

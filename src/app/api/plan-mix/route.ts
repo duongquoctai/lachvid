@@ -48,6 +48,7 @@ export async function POST(req: NextRequest) {
           begin: 0,
           end: item.duration || 4.0,
           category: cat,
+          contentHash: item.contentHash,
           edits: {
             speed: 1,
             flipH: false,

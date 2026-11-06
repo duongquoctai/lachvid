@@ -1,7 +1,13 @@
 import { Database } from "@sqlitecloud/drivers";
 import fs from "node:fs";
 import path from "node:path";
-import { CategoryPools, CategoryVideoItem, ShotCategory } from "@/types/lachvid";
+import {
+  CategoryPools,
+  CategoryVideoItem,
+  MultiVoiceItem,
+  RenderedVideoRecord,
+  ShotCategory,
+} from "@/types/lachvid";
 
 export interface ProjectMeta {
   id: string;
@@ -12,14 +18,7 @@ export interface ProjectMeta {
   updatedAt: string;
   renderedCount?: number;
   poolCount?: number;
-}
-
-export interface RenderedVideoRecord {
-  id: string;
-  projectId: string;
-  tupleKey: string; // format: openFingerprint|productFingerprint|textureFingerprint|applyFingerprint|endFingerprint
-  name?: string;
-  renderedAt: string;
+  voiceCount?: number;
 }
 
 const LOCAL_FALLBACK_FILE = path.join(process.cwd(), "data", "sqlitecloud_local.json");
@@ -34,20 +33,23 @@ function ensureLocalDataDir() {
 interface LocalStorageSchema {
   projects: Record<string, ProjectMeta>;
   pools: Record<string, CategoryPools>;
+  voices: Record<string, MultiVoiceItem[]>; // projectId -> voices
   rendered: Record<string, RenderedVideoRecord[]>; // projectId -> records
 }
 
 function readLocalStorage(): LocalStorageSchema {
   ensureLocalDataDir();
   if (!fs.existsSync(LOCAL_FALLBACK_FILE)) {
-    const init: LocalStorageSchema = { projects: {}, pools: {}, rendered: {} };
+    const init: LocalStorageSchema = { projects: {}, pools: {}, voices: {}, rendered: {} };
     fs.writeFileSync(LOCAL_FALLBACK_FILE, JSON.stringify(init, null, 2), "utf8");
     return init;
   }
   try {
-    return JSON.parse(fs.readFileSync(LOCAL_FALLBACK_FILE, "utf8"));
+    const data = JSON.parse(fs.readFileSync(LOCAL_FALLBACK_FILE, "utf8"));
+    if (!data.voices) data.voices = {};
+    return data;
   } catch {
-    return { projects: {}, pools: {}, rendered: {} };
+    return { projects: {}, pools: {}, voices: {}, rendered: {} };
   }
 }
 
@@ -110,6 +112,29 @@ export async function initDatabase() {
         lock_flip_h INTEGER DEFAULT 0,
         drive_file_id TEXT,
         source_type TEXT NOT NULL,
+        content_hash TEXT,
+        created_at TEXT NOT NULL
+      );
+    `;
+
+    try {
+      await client.sql`ALTER TABLE lachvid_category_items ADD COLUMN content_hash TEXT;`;
+    } catch {
+      // ignore if already exists
+    }
+
+    await client.sql`
+      CREATE TABLE IF NOT EXISTS lachvid_voice_items (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        local_url TEXT NOT NULL,
+        local_path TEXT,
+        duration REAL NOT NULL,
+        source_type TEXT NOT NULL,
+        drive_file_id TEXT,
+        drive_raw_url TEXT,
         created_at TEXT NOT NULL
       );
     `;
@@ -120,9 +145,22 @@ export async function initDatabase() {
         project_id TEXT NOT NULL,
         tuple_key TEXT NOT NULL,
         video_name TEXT,
+        payload TEXT,
         rendered_at TEXT NOT NULL
       );
     `;
+
+    try {
+      await client.sql`ALTER TABLE lachvid_rendered_history ADD COLUMN payload TEXT;`;
+    } catch {
+      // ignore if already exists
+    }
+
+    try {
+      await client.sql`ALTER TABLE lachvid_rendered_history ADD COLUMN status TEXT DEFAULT 'unused';`;
+    } catch {
+      // ignore if already exists
+    }
 
     dbInitialized = true;
   } catch (err) {
@@ -139,12 +177,14 @@ export async function getProjects(): Promise<ProjectMeta[]> {
     return list.map((p) => {
       const rendered = local.rendered[p.id] || [];
       const pool = local.pools[p.id] || { open: [], product: [], texture: [], apply: [], end: [] };
+      const voices = local.voices?.[p.id] || [];
       const poolCount =
         pool.open.length + pool.product.length + pool.texture.length + pool.apply.length + pool.end.length;
       return {
         ...p,
         renderedCount: rendered.length,
         poolCount,
+        voiceCount: voices.length,
       };
     }).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   }
@@ -153,7 +193,8 @@ export async function getProjects(): Promise<ProjectMeta[]> {
     const rows = (await client.sql`
       SELECT p.*,
         (SELECT COUNT(*) FROM lachvid_rendered_history r WHERE r.project_id = p.id) as rendered_count,
-        (SELECT COUNT(*) FROM lachvid_category_items c WHERE c.project_id = p.id) as pool_count
+        (SELECT COUNT(*) FROM lachvid_category_items c WHERE c.project_id = p.id) as pool_count,
+        (SELECT COUNT(*) FROM lachvid_voice_items v WHERE v.project_id = p.id) as voice_count
       FROM lachvid_projects p
       ORDER BY p.updated_at DESC;
     `) as Array<{
@@ -164,6 +205,7 @@ export async function getProjects(): Promise<ProjectMeta[]> {
       updated_at: string;
       rendered_count: number;
       pool_count: number;
+      voice_count: number;
     }>;
 
     return rows.map((r) => ({
@@ -174,6 +216,7 @@ export async function getProjects(): Promise<ProjectMeta[]> {
       updatedAt: r.updated_at,
       renderedCount: Number(r.rendered_count || 0),
       poolCount: Number(r.pool_count || 0),
+      voiceCount: Number(r.voice_count || 0),
     }));
   } catch (err) {
     console.error("Lỗi khi lấy danh sách project từ SQLite Cloud:", err);
@@ -257,6 +300,46 @@ export async function updateProjectSettings(
   }
 }
 
+export async function updateProject(
+  id: string,
+  data: { name?: string; description?: string }
+): Promise<boolean> {
+  await initDatabase();
+  const now = new Date().toISOString();
+  const client = getClient();
+  if (!client) {
+    const local = readLocalStorage();
+    if (local.projects[id]) {
+      if (typeof data.name === "string" && data.name.trim()) {
+        local.projects[id].name = data.name.trim();
+      }
+      if (typeof data.description === "string") {
+        local.projects[id].description = data.description.trim();
+      }
+      local.projects[id].updatedAt = now;
+      writeLocalStorage(local);
+      return true;
+    }
+    return false;
+  }
+
+  try {
+    const existing = await getProjectById(id);
+    if (!existing) return false;
+    const name = typeof data.name === "string" && data.name.trim() ? data.name.trim() : existing.name;
+    const desc = typeof data.description === "string" ? data.description.trim() : (existing.description || "");
+    await client.sql`
+      UPDATE lachvid_projects
+      SET name = ${name}, description = ${desc}, updated_at = ${now}
+      WHERE id = ${id};
+    `;
+    return true;
+  } catch (err) {
+    console.error("Lỗi updateProject:", err);
+    return false;
+  }
+}
+
 export async function createProject(name: string, description = ""): Promise<ProjectMeta> {
   await initDatabase();
   const id = `prj_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
@@ -276,6 +359,7 @@ export async function createProject(name: string, description = ""): Promise<Pro
     const local = readLocalStorage();
     local.projects[id] = meta;
     local.pools[id] = { open: [], product: [], texture: [], apply: [], end: [] };
+    local.voices[id] = [];
     local.rendered[id] = [];
     writeLocalStorage(local);
     return meta;
@@ -300,12 +384,14 @@ export async function deleteProject(id: string): Promise<boolean> {
     const local = readLocalStorage();
     delete local.projects[id];
     delete local.pools[id];
+    delete local.voices[id];
     delete local.rendered[id];
     writeLocalStorage(local);
   } else {
     try {
       await client.sql`DELETE FROM lachvid_rendered_history WHERE project_id = ${id};`;
       await client.sql`DELETE FROM lachvid_category_items WHERE project_id = ${id};`;
+      await client.sql`DELETE FROM lachvid_voice_items WHERE project_id = ${id};`;
       await client.sql`DELETE FROM lachvid_projects WHERE id = ${id};`;
     } catch (err) {
       console.error("Lỗi deleteProject trên SQLite Cloud:", err);
@@ -353,6 +439,7 @@ export async function getProjectCategoryPools(projectId: string): Promise<Catego
       lock_flip_h: number;
       drive_file_id?: string;
       source_type: "drive" | "local";
+      content_hash?: string;
     }>;
 
     const result: CategoryPools = { open: [], product: [], texture: [], apply: [], end: [] };
@@ -370,6 +457,7 @@ export async function getProjectCategoryPools(projectId: string): Promise<Catego
           lockFlipH: Boolean(r.lock_flip_h),
           driveFileId: r.drive_file_id || undefined,
           sourceType: r.source_type,
+          contentHash: r.content_hash || undefined,
         });
       }
     }
@@ -405,11 +493,12 @@ export async function saveProjectCategoryPools(projectId: string, pools: Categor
         await client.sql`
           INSERT INTO lachvid_category_items (
             id, project_id, category, name, file_name, local_url, local_path,
-            duration, size_bytes, lock_flip_h, drive_file_id, source_type, created_at
+            duration, size_bytes, lock_flip_h, drive_file_id, source_type, content_hash, created_at
           ) VALUES (
             ${it.id}, ${projectId}, ${cat}, ${it.name}, ${it.fileName}, ${it.localUrl},
             ${it.localPath || null}, ${it.duration}, ${it.sizeBytes || null},
-            ${it.lockFlipH ? 1 : 0}, ${it.driveFileId || null}, ${it.sourceType || "drive"}, ${now}
+            ${it.lockFlipH ? 1 : 0}, ${it.driveFileId || null}, ${it.sourceType || "drive"},
+            ${it.contentHash || null}, ${now}
           );
         `;
       }
@@ -423,12 +512,97 @@ export async function saveProjectCategoryPools(projectId: string, pools: Categor
   }
 }
 
+export async function getProjectVoiceTracks(projectId: string): Promise<MultiVoiceItem[]> {
+  await initDatabase();
+  const client = getClient();
+  if (!client) {
+    const local = readLocalStorage();
+    return local.voices?.[projectId] || [];
+  }
+
+  try {
+    const rows = (await client.sql`
+      SELECT * FROM lachvid_voice_items
+      WHERE project_id = ${projectId}
+      ORDER BY created_at ASC;
+    `) as Array<{
+      id: string;
+      project_id: string;
+      name: string;
+      file_name: string;
+      local_url: string;
+      local_path?: string;
+      duration: number;
+      source_type: "drive" | "local";
+      drive_file_id?: string;
+      drive_raw_url?: string;
+    }>;
+
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      fileName: r.file_name,
+      localUrl: r.local_url,
+      localPath: r.local_path || undefined,
+      duration: Number(r.duration || 20.0),
+      sourceType: r.source_type,
+      driveFileId: r.drive_file_id || undefined,
+      driveRawUrl: r.drive_raw_url || undefined,
+    }));
+  } catch (err) {
+    console.error("Lỗi getProjectVoiceTracks:", err);
+    return [];
+  }
+}
+
+export async function saveProjectVoiceTracks(projectId: string, voices: MultiVoiceItem[]) {
+  await initDatabase();
+  const now = new Date().toISOString();
+  const client = getClient();
+  if (!client) {
+    const local = readLocalStorage();
+    if (!local.voices) local.voices = {};
+    local.voices[projectId] = voices;
+    if (local.projects[projectId]) {
+      local.projects[projectId].updatedAt = now;
+    }
+    writeLocalStorage(local);
+    return;
+  }
+
+  try {
+    await client.sql`DELETE FROM lachvid_voice_items WHERE project_id = ${projectId};`;
+
+    for (const v of voices) {
+      await client.sql`
+        INSERT INTO lachvid_voice_items (
+          id, project_id, name, file_name, local_url, local_path,
+          duration, source_type, drive_file_id, drive_raw_url, created_at
+        ) VALUES (
+          ${v.id}, ${projectId}, ${v.name}, ${v.fileName}, ${v.localUrl},
+          ${v.localPath || null}, ${v.duration}, ${v.sourceType || "drive"},
+          ${v.driveFileId || null}, ${v.driveRawUrl || null}, ${now}
+        );
+      `;
+    }
+
+    await client.sql`
+      UPDATE lachvid_projects SET updated_at = ${now} WHERE id = ${projectId};
+    `;
+  } catch (err) {
+    console.error("Lỗi saveProjectVoiceTracks:", err);
+  }
+}
+
 export async function getRenderedHistory(projectId: string): Promise<RenderedVideoRecord[]> {
   await initDatabase();
   const client = getClient();
   if (!client) {
     const local = readLocalStorage();
-    return local.rendered[projectId] || [];
+    return (local.rendered[projectId] || []).map((r) => ({
+      ...r,
+      status: (r.status === "used" ? "used" : "unused") as "unused" | "used",
+    }));
   }
 
   try {
@@ -441,16 +615,30 @@ export async function getRenderedHistory(projectId: string): Promise<RenderedVid
       project_id: string;
       tuple_key: string;
       video_name?: string;
+      payload?: string;
+      status?: string;
       rendered_at: string;
     }>;
 
-    return rows.map((r) => ({
-      id: r.id,
-      projectId: r.project_id,
-      tupleKey: r.tuple_key,
-      name: r.video_name || undefined,
-      renderedAt: r.rendered_at,
-    }));
+    return rows.map((r) => {
+      let parsedPayload: Record<string, unknown> | undefined;
+      if (r.payload) {
+        try {
+          parsedPayload = JSON.parse(r.payload);
+        } catch {
+          // ignore
+        }
+      }
+      return {
+        id: r.id,
+        projectId: r.project_id,
+        tupleKey: r.tuple_key,
+        name: r.video_name || undefined,
+        payload: parsedPayload,
+        status: (r.status === "used" ? "used" : "unused") as "unused" | "used",
+        renderedAt: r.rendered_at,
+      };
+    });
   } catch (err) {
     console.error("Lỗi getRenderedHistory:", err);
     return [];
@@ -459,7 +647,7 @@ export async function getRenderedHistory(projectId: string): Promise<RenderedVid
 
 export async function recordRenderedVideos(
   projectId: string,
-  records: Array<{ tupleKey: string; name?: string }>
+  records: Array<{ tupleKey: string; name?: string; payload?: unknown; status?: "unused" | "used" }>
 ) {
   if (!records || records.length === 0) return;
   await initDatabase();
@@ -475,6 +663,8 @@ export async function recordRenderedVideos(
         projectId,
         tupleKey: rec.tupleKey,
         name: rec.name,
+        payload: rec.payload as Record<string, unknown> | undefined,
+        status: rec.status || "unused",
         renderedAt: now,
       });
     }
@@ -488,9 +678,11 @@ export async function recordRenderedVideos(
   try {
     for (const rec of records) {
       const id = `rend_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+      const payloadStr = rec.payload ? JSON.stringify(rec.payload) : null;
+      const statusVal = rec.status === "used" ? "used" : "unused";
       await client.sql`
-        INSERT INTO lachvid_rendered_history (id, project_id, tuple_key, video_name, rendered_at)
-        VALUES (${id}, ${projectId}, ${rec.tupleKey}, ${rec.name || null}, ${now});
+        INSERT INTO lachvid_rendered_history (id, project_id, tuple_key, video_name, payload, status, rendered_at)
+        VALUES (${id}, ${projectId}, ${rec.tupleKey}, ${rec.name || null}, ${payloadStr}, ${statusVal}, ${now});
       `;
     }
 
@@ -520,3 +712,50 @@ export async function clearProjectRenderedHistory(projectId: string) {
     console.error("Lỗi clearProjectRenderedHistory:", err);
   }
 }
+
+export async function deleteRenderedHistoryItem(id: string) {
+  await initDatabase();
+  const client = getClient();
+  if (!client) {
+    const local = readLocalStorage();
+    for (const pId of Object.keys(local.rendered)) {
+      local.rendered[pId] = local.rendered[pId].filter((r) => r.id !== id);
+    }
+    writeLocalStorage(local);
+    return;
+  }
+
+  try {
+    await client.sql`
+      DELETE FROM lachvid_rendered_history WHERE id = ${id};
+    `;
+  } catch (err) {
+    console.error("Lỗi deleteRenderedHistoryItem:", err);
+  }
+}
+
+export async function updateRenderedHistoryStatus(id: string, status: "unused" | "used") {
+  await initDatabase();
+  const client = getClient();
+  if (!client) {
+    const local = readLocalStorage();
+    for (const pId of Object.keys(local.rendered)) {
+      const found = local.rendered[pId]?.find((r) => r.id === id);
+      if (found) {
+        found.status = status;
+      }
+    }
+    writeLocalStorage(local);
+    return;
+  }
+
+  try {
+    await client.sql`
+      UPDATE lachvid_rendered_history SET status = ${status} WHERE id = ${id};
+    `;
+  } catch (err) {
+    console.error("Lỗi updateRenderedHistoryStatus:", err);
+  }
+}
+
+

@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { ShotCategory } from "@/types/lachvid";
 
 /**
@@ -229,6 +230,7 @@ export interface DriveClipProbeResult {
   duration: number;
   sizeBytes: number;
   lockFlipH: boolean;
+  contentHash?: string;
   error?: string;
 }
 
@@ -344,6 +346,13 @@ export async function probeGoogleDriveClipMetadata(
     const lowerName = fileName.toLowerCase();
     const lockFlipH = lowerName.includes("_lock");
 
+    const contentHash = crypto
+      .createHash("md5")
+      .update(headBuffer)
+      .update(String(totalSizeBytes))
+      .digest("hex")
+      .slice(0, 16);
+
     const result: DriveClipProbeResult = {
       success: true,
       fileId,
@@ -351,6 +360,7 @@ export async function probeGoogleDriveClipMetadata(
       duration,
       sizeBytes: totalSizeBytes,
       lockFlipH,
+      contentHash,
     };
     clipProbeCache.set(fileId, result);
     return result;

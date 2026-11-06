@@ -421,7 +421,11 @@ export default function PreviewPlayer916({
             Math.max(0.25, isoSlot.speed || 1)
           );
           setBufferingSync(true);
-          if (audioRef.current) audioRef.current.pause();
+          if (audioRef.current && enableVoice && rawVoiceUrl) {
+            audioRef.current.currentTime = isoSlot.enterBegin;
+          } else if (audioRef.current) {
+            audioRef.current.pause();
+          }
         } else {
           // Start from 0s or resume current position if mid-timeline
           const startPos =
@@ -474,12 +478,25 @@ export default function PreviewPlayer916({
         videoRefA.current.pause();
         videoRefA.current.currentTime = scrubSourceSec;
       }
+      if (audioRef.current && enableVoice && rawVoiceUrl && isoSlot) {
+        audioRef.current.pause();
+        const progress = Math.max(
+          0,
+          Math.min(
+            1,
+            (scrubSourceSec - isoSlot.videoBegin) /
+              Math.max(0.001, isoSlot.videoEnd - isoSlot.videoBegin)
+          )
+        );
+        audioRef.current.currentTime =
+          isoSlot.enterBegin + progress * (isoSlot.exitEnd - isoSlot.enterBegin);
+      }
       const timer = setTimeout(() => {
         setSlotCurrentSec(scrubSourceSec);
       }, 0);
       return () => clearTimeout(timer);
     }
-  }, [isSlotMode, isScrubbing, scrubSourceSec]);
+  }, [isSlotMode, isScrubbing, scrubSourceSec, enableVoice, rawVoiceUrl, isoSlot]);
 
   // External seekTimelineSec for full mode
   useEffect(() => {
@@ -506,7 +523,7 @@ export default function PreviewPlayer916({
       return;
     }
 
-    // SLOT MODE: Loop isolated slot
+    // SLOT MODE: Loop isolated slot with voice track sync
     if (isSlotMode && isoSlot) {
       const vidA = videoRefA.current;
       const mediaUrl = getSlotMediaUrl(isoSlot);
@@ -526,7 +543,28 @@ export default function PreviewPlayer916({
         }
       }
       videoRefB.current?.pause();
-      audioRef.current?.pause();
+
+      const audioEl = audioRef.current;
+      if (audioEl && enableVoice && rawVoiceUrl) {
+        const currentAttr = audioEl.getAttribute("data-voice-url") || "";
+        if (currentAttr !== rawVoiceUrl) {
+          audioEl.setAttribute("data-voice-url", rawVoiceUrl);
+          audioEl.src = rawVoiceUrl;
+        }
+        const curTime = vidA ? vidA.currentTime : isoSlot.videoBegin;
+        const progress = Math.max(
+          0,
+          Math.min(
+            1,
+            (curTime - isoSlot.videoBegin) /
+              Math.max(0.001, isoSlot.videoEnd - isoSlot.videoBegin)
+          )
+        );
+        audioEl.currentTime =
+          isoSlot.enterBegin + progress * (isoSlot.exitEnd - isoSlot.enterBegin);
+      } else if (audioEl) {
+        audioEl.pause();
+      }
 
       const tickSlot = () => {
         if (!isPlayingRef.current) return;
@@ -534,6 +572,7 @@ export default function PreviewPlayer916({
           if (vidA.seeking || vidA.readyState < 2) {
             setBufferingSync(true);
             if (!vidA.paused) vidA.pause();
+            if (audioEl && !audioEl.paused) audioEl.pause();
             rafRef.current = requestAnimationFrame(tickSlot);
             return;
           }
@@ -545,11 +584,36 @@ export default function PreviewPlayer916({
 
           const curTime = vidA.currentTime;
           setSlotCurrentSec(curTime);
+
+          // Synchronize voice audio to current slot playback progress
+          if (audioEl && enableVoice && rawVoiceUrl) {
+            const progress = Math.max(
+              0,
+              Math.min(
+                1,
+                (curTime - isoSlot.videoBegin) /
+                  Math.max(0.001, isoSlot.videoEnd - isoSlot.videoBegin)
+              )
+            );
+            const targetAudio =
+              isoSlot.enterBegin +
+              progress * (isoSlot.exitEnd - isoSlot.enterBegin);
+            if (audioEl.paused) {
+              audioEl.play().catch(() => {});
+            }
+            if (Math.abs(audioEl.currentTime - targetAudio) > 0.25) {
+              audioEl.currentTime = targetAudio;
+            }
+          }
+
           if (
             curTime >= isoSlot.videoEnd - 0.05 ||
             curTime < isoSlot.videoBegin - 0.05
           ) {
             vidA.currentTime = isoSlot.videoBegin;
+            if (audioEl && enableVoice && rawVoiceUrl) {
+              audioEl.currentTime = isoSlot.enterBegin;
+            }
           }
         }
         rafRef.current = requestAnimationFrame(tickSlot);
@@ -807,11 +871,23 @@ export default function PreviewPlayer916({
         if (videoRefA.current) {
           videoRefA.current.currentTime = sec;
         }
+        if (audioRef.current && enableVoice && rawVoiceUrl) {
+          const progress = Math.max(
+            0,
+            Math.min(
+              1,
+              (sec - isoSlot.videoBegin) /
+                Math.max(0.001, isoSlot.videoEnd - isoSlot.videoBegin)
+            )
+          );
+          audioRef.current.currentTime =
+            isoSlot.enterBegin + progress * (isoSlot.exitEnd - isoSlot.enterBegin);
+        }
       } else {
         handleSeekTimeline(sec);
       }
     },
-    [computeSecFromPointer, handleSeekTimeline, isSlotMode, isoSlot]
+    [computeSecFromPointer, enableVoice, handleSeekTimeline, isSlotMode, isoSlot, rawVoiceUrl]
   );
 
   // Compute live CSS transform & filter for the active or isolated slot
@@ -1056,7 +1132,7 @@ export default function PreviewPlayer916({
         <audio
           ref={audioRef}
           preload="auto"
-          muted={mutedVoice || isSlotMode || !enableVoice}
+          muted={mutedVoice || !enableVoice}
         />
 
         {/* Bottom Overlay with YouTube-style Scrubber Bar */}

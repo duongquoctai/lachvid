@@ -17,7 +17,12 @@ import {
   probeGoogleDriveClipMetadata,
   probeGoogleDriveVoiceMetadata,
 } from "@/lib/drive";
-import { getProjectCategoryPools, saveProjectCategoryPools } from "@/lib/db";
+import {
+  getProjectCategoryPools,
+  getProjectVoiceTracks,
+  saveProjectCategoryPools,
+  saveProjectVoiceTracks,
+} from "@/lib/db";
 
 const VALID_CATS: ShotCategory[] = ["open", "product", "texture", "apply", "end"];
 
@@ -39,11 +44,19 @@ export async function GET(req: NextRequest) {
   };
 
   if (qProjectId) {
-    const cloudPools = await getProjectCategoryPools(qProjectId);
-    const hasItems = Object.values(cloudPools).some((arr) => arr.length > 0);
-    if (hasItems) {
+    const [cloudPools, cloudVoices] = await Promise.all([
+      getProjectCategoryPools(qProjectId),
+      getProjectVoiceTracks(qProjectId),
+    ]);
+    const hasPoolItems = Object.values(cloudPools).some((arr) => arr.length > 0);
+    if (hasPoolItems) {
       pools = cloudPools;
       state.categoryPools = pools;
+    }
+    if (cloudVoices.length > 0) {
+      state.multiVoiceTracks = cloudVoices;
+    }
+    if (hasPoolItems || cloudVoices.length > 0) {
       writeProjectState(state, sessionId);
     }
   }
@@ -247,6 +260,7 @@ export async function POST(req: NextRequest) {
         lockFlipH: probe.lockFlipH,
         driveFileId: probe.fileId,
         sourceType: "drive",
+        contentHash: probe.contentHash,
       };
 
       pools[category].push(item);
@@ -285,7 +299,10 @@ export async function POST(req: NextRequest) {
     writeProjectState(state, sessionId);
 
     if (projectId) {
-      await saveProjectCategoryPools(projectId, pools);
+      await Promise.all([
+        saveProjectCategoryPools(projectId, pools),
+        saveProjectVoiceTracks(projectId, currentVoices),
+      ]);
     }
 
     return NextResponse.json({
@@ -313,6 +330,9 @@ export async function POST(req: NextRequest) {
     }
     state.multiVoiceTracks = currentVoices.filter((v) => v.id !== voiceId);
     writeProjectState(state, sessionId);
+    if (projectId) {
+      await saveProjectVoiceTracks(projectId, state.multiVoiceTracks);
+    }
     return NextResponse.json({ success: true, sessionId, multiVoiceTracks: state.multiVoiceTracks });
   }
 
@@ -330,6 +350,9 @@ export async function POST(req: NextRequest) {
     }
     state.multiVoiceTracks = [];
     writeProjectState(state, sessionId);
+    if (projectId) {
+      await saveProjectVoiceTracks(projectId, []);
+    }
     return NextResponse.json({ success: true, sessionId, multiVoiceTracks: [] });
   }
 
@@ -368,7 +391,10 @@ export async function POST(req: NextRequest) {
     writeProjectState(state, sessionId);
 
     if (projectId) {
-      await saveProjectCategoryPools(projectId, pools);
+      await Promise.all([
+        saveProjectCategoryPools(projectId, pools),
+        saveProjectVoiceTracks(projectId, []),
+      ]);
     }
 
     return NextResponse.json({
@@ -433,6 +459,9 @@ export async function POST(req: NextRequest) {
 
     state.multiVoiceTracks = newVoices;
     writeProjectState(state, sessionId);
+    if (projectId) {
+      await saveProjectVoiceTracks(projectId, newVoices);
+    }
     return NextResponse.json({ success: true, sessionId, multiVoiceTracks: newVoices });
   }
 
@@ -517,6 +546,7 @@ export async function POST(req: NextRequest) {
         sizeBytes: bytes.byteLength,
         lockFlipH: isLocked,
         sourceType: "local",
+        contentHash: fileHash,
       };
 
       pools[detectedCat].push(item);
@@ -527,7 +557,10 @@ export async function POST(req: NextRequest) {
     writeProjectState(state, sessionId);
 
     if (projectId) {
-      await saveProjectCategoryPools(projectId, pools);
+      await Promise.all([
+        saveProjectCategoryPools(projectId, pools),
+        saveProjectVoiceTracks(projectId, state.multiVoiceTracks || []),
+      ]);
     }
 
     return NextResponse.json({

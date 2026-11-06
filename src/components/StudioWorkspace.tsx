@@ -18,6 +18,7 @@ import {
   DEFAULT_CATEGORY_MIN_DURATIONS,
   MultiVoiceItem,
   ProjectState,
+  RenderedVideoRecord,
   ResolvedShotSlot,
   Shot,
   ShotEdits,
@@ -40,6 +41,7 @@ import {
   ChevronUp,
   Clock,
   Code2,
+  Copy,
   Download,
   Edit3,
   Cloud,
@@ -49,6 +51,7 @@ import {
   FolderDown,
   FolderOpen,
   FolderSync,
+  History,
   Info,
   KeyRound,
   Layers,
@@ -74,15 +77,25 @@ import {
   Upload,
   Wand2,
   X,
+  ArrowUpDown,
+  Check,
+  Eye,
+  Search,
+  ExternalLink,
 } from "lucide-react";
+import * as XLSX from "xlsx";
 import {
   parseExcelFiveColumnClipboard,
   extractGoogleDriveFileId,
 } from "@/lib/drive";
 
+const VALID_TABS = ["split", "mix", "history"] as const;
+type WorkspaceTab = (typeof VALID_TABS)[number];
+
 interface StudioWorkspaceProps {
   projectId: string;
   projectName?: string;
+  initialTab?: string;
 }
 
 const createDefaultState = (): ProjectState => ({
@@ -116,12 +129,57 @@ const createDefaultState = (): ProjectState => ({
 export default function StudioWorkspace({
   projectId,
   projectName,
+  initialTab,
 }: StudioWorkspaceProps) {
   const [currentProjectName, setCurrentProjectName] = useState<string>(
     projectName || "",
   );
   const [projectRenderedCount, setProjectRenderedCount] = useState<number>(0);
-  const [mainTab, setMainTab] = useState<"split" | "mix">("split");
+  const [renderedHistoryList, setRenderedHistoryList] = useState<RenderedVideoRecord[]>([]);
+  const [isLoadingHistory, setIsLoadingHistory] = useState<boolean>(false);
+  const [mainTab, setMainTabState] = useState<WorkspaceTab>(() => {
+    if (initialTab && (VALID_TABS as readonly string[]).includes(initialTab)) {
+      return initialTab as WorkspaceTab;
+    }
+    if (typeof window !== "undefined") {
+      const paramTab = new URLSearchParams(window.location.search).get("tab");
+      if (paramTab && (VALID_TABS as readonly string[]).includes(paramTab)) {
+        return paramTab as WorkspaceTab;
+      }
+    }
+    return "split";
+  });
+
+  const setMainTab = useCallback((newTab: WorkspaceTab) => {
+    setMainTabState(newTab);
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      if (url.searchParams.get("tab") !== newTab) {
+        url.searchParams.set("tab", newTab);
+        window.history.replaceState(null, "", url.toString());
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const paramTab = new URLSearchParams(window.location.search).get("tab");
+      if (paramTab && (VALID_TABS as readonly string[]).includes(paramTab)) {
+        setMainTabState(paramTab as WorkspaceTab);
+      } else {
+        setMainTabState("split");
+      }
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+  const [historyFilterStatus, setHistoryFilterStatus] = useState<"all" | "unused" | "used">("all");
+  const [historySearchText, setHistorySearchText] = useState<string>("");
+  const [historySortOrder, setHistorySortOrder] = useState<"desc" | "asc">("desc");
+  const [historyPage, setHistoryPage] = useState<number>(1);
+  const [historyPageSize, setHistoryPageSize] = useState<number>(10);
+  const [selectedHistoryDetail, setSelectedHistoryDetail] = useState<RenderedVideoRecord | null>(null);
+  const [showExportMenu, setShowExportMenu] = useState<boolean>(false);
   const [state, setState] = useState<ProjectState>(() => createDefaultState());
 
   // Tab 1 (Split) states
@@ -201,6 +259,16 @@ export default function StudioWorkspace({
   const [showClearConfirmModal, setShowClearConfirmModal] =
     useState<boolean>(false);
   const [isClearingAll, setIsClearingAll] = useState<boolean>(false);
+  const [showClearHistoryConfirmModal, setShowClearHistoryConfirmModal] =
+    useState<boolean>(false);
+  const [isClearingHistory, setIsClearingHistory] = useState<boolean>(false);
+
+  // Google Drive History & Search states
+  const [showDriveHistoryDrawer, setShowDriveHistoryDrawer] = useState<boolean>(false);
+  const [driveHistorySearchText, setDriveHistorySearchText] = useState<string>("");
+  const [driveHistoryCategoryFilter, setDriveHistoryCategoryFilter] =
+    useState<"all" | ShotCategory | "voice">("all");
+  const [quickCheckInput, setQuickCheckInput] = useState<string>("");
 
   // Audition voice state
   const [auditionVoiceId, setAuditionVoiceId] = useState<string | null>(null);
@@ -209,6 +277,109 @@ export default function StudioWorkspace({
   const parsedExcel = useMemo(() => {
     return parseExcelFiveColumnClipboard(excelPasteText);
   }, [excelPasteText]);
+
+  const allDriveLinks = useMemo(() => {
+    const list: Array<{
+      id: string;
+      category: ShotCategory | "voice";
+      name: string;
+      fileName: string;
+      fileId: string;
+      driveUrl: string;
+      duration: number;
+      sizeBytes?: number;
+    }> = [];
+
+    CATEGORY_ORDER.forEach((cat) => {
+      (categoryPools[cat] || []).forEach((it) => {
+        if (it.driveFileId || it.sourceType === "drive") {
+          const fileId =
+            it.driveFileId || extractGoogleDriveFileId(it.localUrl) || "";
+          list.push({
+            id: it.id,
+            category: cat,
+            name: it.name,
+            fileName: it.fileName,
+            fileId,
+            driveUrl: fileId
+              ? `https://drive.google.com/file/d/${fileId}/view`
+              : it.localUrl,
+            duration: it.duration,
+            sizeBytes: it.sizeBytes,
+          });
+        }
+      });
+    });
+
+    (multiVoices || []).forEach((v) => {
+      if (v.driveFileId || v.sourceType === "drive") {
+        const fileId =
+          v.driveFileId || extractGoogleDriveFileId(v.driveRawUrl || "") || "";
+        list.push({
+          id: v.id,
+          category: "voice",
+          name: v.name,
+          fileName: v.fileName,
+          fileId,
+          driveUrl:
+            v.driveRawUrl ||
+            (fileId
+              ? `https://drive.google.com/file/d/${fileId}/view`
+              : v.localUrl),
+          duration: v.duration,
+        });
+      }
+    });
+
+    return list;
+  }, [categoryPools, multiVoices]);
+
+  const quickCheckResult = useMemo(() => {
+    const raw = quickCheckInput.trim();
+    if (!raw) return null;
+    const fileId = extractGoogleDriveFileId(raw);
+    const searchLower = raw.toLowerCase();
+
+    const matches = allDriveLinks.filter((item) => {
+      if (fileId && item.fileId === fileId) return true;
+      if (item.name.toLowerCase().includes(searchLower)) return true;
+      if (item.fileName.toLowerCase().includes(searchLower)) return true;
+      if (item.driveUrl.toLowerCase().includes(searchLower)) return true;
+      return false;
+    });
+
+    return {
+      query: raw,
+      fileId,
+      found: matches.length > 0,
+      matches,
+    };
+  }, [quickCheckInput, allDriveLinks]);
+
+  const filteredDriveLinks = useMemo(() => {
+    let result = allDriveLinks;
+
+    if (driveHistoryCategoryFilter !== "all") {
+      result = result.filter(
+        (it) => it.category === driveHistoryCategoryFilter,
+      );
+    }
+
+    const q = driveHistorySearchText.trim().toLowerCase();
+    if (q) {
+      const qFileId = extractGoogleDriveFileId(q);
+      result = result.filter((it) => {
+        if (qFileId && it.fileId === qFileId) return true;
+        if (it.name.toLowerCase().includes(q)) return true;
+        if (it.fileName.toLowerCase().includes(q)) return true;
+        if (it.driveUrl.toLowerCase().includes(q)) return true;
+        if (it.fileId.toLowerCase().includes(q)) return true;
+        return false;
+      });
+    }
+
+    return result;
+  }, [allDriveLinks, driveHistoryCategoryFilter, driveHistorySearchText]);
 
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [toasts, setToasts] = useState<
@@ -293,6 +464,12 @@ export default function StudioWorkspace({
         if (data.project?.name) {
           setCurrentProjectName(data.project.name);
         }
+        if (data.categoryPools) {
+          setCategoryPools(data.categoryPools);
+        }
+        if (data.voiceTracks) {
+          setMultiVoices(data.voiceTracks);
+        }
         if (data.project?.settings) {
           const s = data.project.settings;
           if (typeof s.targetMixDuration === "number") {
@@ -351,7 +528,7 @@ export default function StudioWorkspace({
         if (data.multiVoiceTracks) setMultiVoices(data.multiVoiceTracks);
       })
       .catch(() => {});
-  }, [sessionId]);
+  }, [sessionId, projectId]);
 
   const persistState = useCallback(
     async (nextState: ProjectState) => {
@@ -1627,6 +1804,396 @@ export default function StudioWorkspace({
     }
   };
 
+  const fetchRenderedHistory = useCallback(async () => {
+    if (!projectId) return;
+    setIsLoadingHistory(true);
+    try {
+      const res = await fetch(`/api/project?id=${encodeURIComponent(projectId)}&history=1`);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.history)) {
+          setRenderedHistoryList(data.history);
+          setProjectRenderedCount(data.history.length);
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    let ignore = false;
+    if (mainTab === "history" && projectId) {
+      fetch(`/api/project?id=${encodeURIComponent(projectId)}&history=1`)
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (!ignore && data?.history && Array.isArray(data.history)) {
+            setRenderedHistoryList(data.history);
+            setProjectRenderedCount(data.history.length);
+          }
+        })
+        .catch(() => {});
+    }
+    return () => {
+      ignore = true;
+    };
+  }, [mainTab, projectId]);
+
+  const handleConfirmClearHistory = async () => {
+    if (!projectId) return;
+    setIsClearingHistory(true);
+    try {
+      const res = await fetch("/api/project", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "clear_history", projectId }),
+      });
+      if (res.ok) {
+        setRenderedHistoryList([]);
+        setProjectRenderedCount(0);
+        setShowClearHistoryConfirmModal(false);
+        addToast({
+          type: "success",
+          text: "Đã xóa toàn bộ lịch sử render của dự án.",
+        });
+      } else {
+        const data = await res.json().catch(() => ({}));
+        addToast({
+          type: "error",
+          text: data?.error || "Không thể xóa lịch sử render.",
+        });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast({ type: "error", text: msg });
+    } finally {
+      setIsClearingHistory(false);
+    }
+  };
+
+  const handleDeleteHistoryItem = async (id?: string) => {
+    if (!id) return;
+    try {
+      const res = await fetch("/api/project", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "delete_history_item", id }),
+      });
+      if (res.ok) {
+        setRenderedHistoryList((prev) => prev.filter((r) => r.id !== id));
+        if (selectedHistoryDetail?.id === id) {
+          setSelectedHistoryDetail(null);
+        }
+        setProjectRenderedCount((prev) => Math.max(0, prev - 1));
+        setStatusBanner({
+          type: "success",
+          text: "Đã xóa bản ghi video khỏi lịch sử render.",
+        });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setStatusBanner({ type: "error", text: msg });
+    }
+  };
+
+  const handleToggleHistoryStatus = async (
+    record: RenderedVideoRecord,
+    e?: React.MouseEvent,
+  ) => {
+    if (e) e.stopPropagation();
+    const newStatus: "unused" | "used" =
+      record.status === "used" ? "unused" : "used";
+
+    // Optimistic UI update
+    setRenderedHistoryList((prev) =>
+      prev.map((r) => (r.id === record.id ? { ...r, status: newStatus } : r)),
+    );
+    if (selectedHistoryDetail?.id === record.id) {
+      setSelectedHistoryDetail((prev) =>
+        prev ? { ...prev, status: newStatus } : null,
+      );
+    }
+
+    try {
+      const res = await fetch("/api/project", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "update_render_status",
+          id: record.id,
+          status: newStatus,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error("Không thể cập nhật trạng thái");
+      }
+      setStatusBanner({
+        type: "success",
+        text: `Đã đánh dấu "${record.name || "Video"}" là ${
+          newStatus === "used" ? "đã sử dụng" : "chưa sử dụng"
+        }.`,
+      });
+    } catch (err: unknown) {
+      setRenderedHistoryList((prev) =>
+        prev.map((r) =>
+          r.id === record.id ? { ...r, status: record.status } : r,
+        ),
+      );
+      if (selectedHistoryDetail?.id === record.id) {
+        setSelectedHistoryDetail((prev) =>
+          prev ? { ...prev, status: record.status } : null,
+        );
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      setStatusBanner({ type: "error", text: msg });
+    }
+  };
+
+  const historyCounts = useMemo(() => {
+    let unused = 0;
+    let used = 0;
+    for (const r of renderedHistoryList) {
+      if (r.status === "used") used++;
+      else unused++;
+    }
+    return { all: renderedHistoryList.length, unused, used };
+  }, [renderedHistoryList]);
+
+  const filteredHistoryList = useMemo(() => {
+    let list = [...renderedHistoryList];
+
+    if (historyFilterStatus === "unused") {
+      list = list.filter((r) => r.status !== "used");
+    } else if (historyFilterStatus === "used") {
+      list = list.filter((r) => r.status === "used");
+    }
+
+    if (historySearchText.trim()) {
+      const q = historySearchText.trim().toLowerCase();
+      list = list.filter((r) => {
+        const nameMatch = (r.name || "").toLowerCase().includes(q);
+        const tupleMatch = (r.tupleKey || "").toLowerCase().includes(q);
+        const comp = r.payload as ComposedVideo | undefined;
+        const slotMatch = comp?.slots?.some((s) =>
+          (s.shotLabel || s.shotId || "").toLowerCase().includes(q),
+        );
+        return nameMatch || tupleMatch || slotMatch;
+      });
+    }
+
+    list.sort((a, b) => {
+      const timeA = new Date(a.renderedAt).getTime() || 0;
+      const timeB = new Date(b.renderedAt).getTime() || 0;
+      return historySortOrder === "asc" ? timeA - timeB : timeB - timeA;
+    });
+
+    return list;
+  }, [
+    renderedHistoryList,
+    historyFilterStatus,
+    historySearchText,
+    historySortOrder,
+  ]);
+
+  const totalHistoryPages = Math.max(
+    1,
+    Math.ceil(filteredHistoryList.length / historyPageSize),
+  );
+
+  const paginatedHistoryList = useMemo(() => {
+    const start = (historyPage - 1) * historyPageSize;
+    return filteredHistoryList.slice(start, start + historyPageSize);
+  }, [filteredHistoryList, historyPage, historyPageSize]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setHistoryPage(1);
+  }, [
+    historyFilterStatus,
+    historySearchText,
+    historySortOrder,
+    historyPageSize,
+  ]);
+
+  const getGoogleDriveLinkFromSlot = (
+    slot?: ResolvedShotSlot | null,
+  ): string => {
+    if (!slot) return "";
+    if (slot.localUrl?.startsWith("/api/drive-stream/")) {
+      const fileId = slot.localUrl
+        .replace("/api/drive-stream/", "")
+        .split("?")[0];
+      if (fileId) return `https://drive.google.com/file/d/${fileId}/view`;
+    }
+    if (slot.shotId?.startsWith("drive_")) {
+      const parts = slot.shotId.split("_");
+      if (parts.length >= 3 && parts[2]) {
+        return `https://drive.google.com/file/d/${parts[2]}/view`;
+      }
+    }
+    if (
+      slot.src &&
+      (slot.src.includes("drive.google.com") ||
+        slot.src.includes("googleusercontent.com"))
+    ) {
+      return slot.src;
+    }
+    return "";
+  };
+
+  const getGoogleDriveLinkFromVoice = (
+    voice?: MultiVoiceItem | null,
+  ): string => {
+    if (!voice) return "";
+    if (voice.driveRawUrl) return voice.driveRawUrl;
+    if (voice.driveFileId) {
+      return `https://drive.google.com/file/d/${voice.driveFileId}/view`;
+    }
+    if (voice.localUrl?.startsWith("/api/drive-stream/")) {
+      const fileId = voice.localUrl
+        .replace("/api/drive-stream/", "")
+        .split("?")[0];
+      if (fileId) return `https://drive.google.com/file/d/${fileId}/view`;
+    }
+    return "";
+  };
+
+  const handleExportHistory = (format: "xlsx" | "csv") => {
+    setShowExportMenu(false);
+    if (renderedHistoryList.length === 0) {
+      setStatusBanner({
+        type: "error",
+        text: "Không có video nào trong lịch sử để xuất.",
+      });
+      return;
+    }
+
+    const rows = renderedHistoryList.map((rec, idx) => {
+      const comp = rec.payload as ComposedVideo | undefined;
+      const dateStr = rec.renderedAt
+        ? new Date(rec.renderedAt).toLocaleString("vi-VN", {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+            day: "2-digit",
+            month: "2-digit",
+            year: "numeric",
+          })
+        : "";
+
+      const slotMap: Record<string, string> = {
+        open: "",
+        product: "",
+        texture: "",
+        apply: "",
+        end: "",
+      };
+
+      if (comp?.slots) {
+        for (const slot of comp.slots) {
+          const driveLink = getGoogleDriveLinkFromSlot(slot);
+          slotMap[slot.category] =
+            driveLink || slot.shotLabel || slot.shotId || "";
+        }
+      }
+
+      let voiceValue = "";
+      if (comp?.voiceTrackId) {
+        const v = multiVoices.find((m) => m.id === comp.voiceTrackId);
+        voiceValue = getGoogleDriveLinkFromVoice(v) || v?.name || "Voice";
+      }
+
+      return {
+        STT: idx + 1,
+        Name: rec.name || `Video #${idx + 1}`,
+        Duration: comp?.finalDuration
+          ? `${comp.finalDuration.toFixed(1)}s`
+          : "",
+        Date: dateStr,
+        Open: slotMap.open,
+        Product: slotMap.product,
+        Texture: slotMap.texture,
+        Apply: slotMap.apply,
+        End: slotMap.end,
+        Voice: voiceValue,
+        Status: rec.status === "used" ? "Đã sử dụng" : "Chưa sử dụng",
+      };
+    });
+
+    const projectNameSafe = (currentProjectName || "Lachvid").replace(
+      /\s+/g,
+      "_",
+    );
+    const fileName = `Lich_su_render_${projectNameSafe}_${new Date()
+      .toISOString()
+      .slice(0, 10)}`;
+
+    if (format === "xlsx") {
+      const worksheet = XLSX.utils.json_to_sheet(rows);
+      worksheet["!cols"] = [
+        { wch: 6 }, // STT
+        { wch: 25 }, // Name
+        { wch: 12 }, // Duration
+        { wch: 22 }, // Date
+        { wch: 55 }, // Open
+        { wch: 55 }, // Product
+        { wch: 55 }, // Texture
+        { wch: 55 }, // Apply
+        { wch: 55 }, // End
+        { wch: 55 }, // Voice
+        { wch: 16 }, // Status
+      ];
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, "Lịch sử render");
+      XLSX.writeFile(workbook, `${fileName}.xlsx`);
+    } else {
+      const worksheet = XLSX.utils.json_to_sheet(rows);
+      const csvContent = XLSX.utils.sheet_to_csv(worksheet);
+      const blob = new Blob(["\uFEFF" + csvContent], {
+        type: "text/csv;charset=utf-8;",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${fileName}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+
+    setStatusBanner({
+      type: "success",
+      text: `Đã xuất toàn bộ ${renderedHistoryList.length} video ra file ${format.toUpperCase()} thành công!`,
+    });
+  };
+
+  const handlePreviewHistoryComposed = (rec: RenderedVideoRecord) => {
+    if (!rec.payload) {
+      setStatusBanner({
+        type: "info",
+        text: "Video này được render ở phiên bản cũ nên không có bản ghi chi tiết cảnh.",
+      });
+      return;
+    }
+    const comp = rec.payload as unknown as ComposedVideo;
+    const exists = state.composedVideos.some((c) => c.id === comp.id);
+    if (!exists) {
+      setState((prev) => ({
+        ...prev,
+        composedVideos: [comp, ...prev.composedVideos],
+      }));
+    }
+    setSelectedComposedId(comp.id);
+    setMainTab("mix");
+    setStatusBanner({
+      type: "success",
+      text: `Đang xem lại "${comp.name || rec.name || "Video đã render"}" trên màn hình preview 9:16.`,
+    });
+  };
+
   // Plan Combinatorial Mix
   const handlePlanDiverseMix = async () => {
     const missingCats = CATEGORY_ORDER.filter(
@@ -1827,12 +2394,18 @@ export default function StudioWorkspace({
           body: JSON.stringify({
             action: "record_render",
             projectId,
-            records: [{ tupleKey: composed.tupleKey, name: composed.name }],
+            records: [
+              {
+                tupleKey: composed.tupleKey,
+                name: composed.name,
+                payload: composed,
+              },
+            ],
           }),
         })
           .then((r) => r.json())
           .then((res) => {
-            if (res.addedCount) {
+            if (res.addedCount || res.count) {
               setProjectRenderedCount((prev) => prev + 1);
             }
           })
@@ -1925,6 +2498,7 @@ export default function StudioWorkspace({
         const records = state.composedVideos.map((comp) => ({
           tupleKey: comp.tupleKey,
           name: comp.name,
+          payload: comp,
         }));
         fetch("/api/project", {
           method: "POST",
@@ -1937,7 +2511,7 @@ export default function StudioWorkspace({
         })
           .then((r) => r.json())
           .then((res) => {
-            if (res.addedCount) {
+            if (res.addedCount || res.count) {
               setProjectRenderedCount((prev) => prev + records.length);
             }
           })
@@ -1968,63 +2542,106 @@ export default function StudioWorkspace({
       {/* Top Header & Two-Tab Navigation */}
       <header className="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800 px-6 py-3 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3">
-          <Link
-            href="/"
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs font-medium text-slate-300 hover:text-white transition"
-            title="Quay lại danh sách dự án"
-          >
-            <ArrowLeft className="w-3.5 h-3.5" />
-            <span>Dự án</span>
+          {/* Logo & Brand title */}
+          <Link href="/" className="flex items-center gap-3 hover:opacity-90 transition">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-rose-500 to-indigo-500 flex items-center justify-center shadow-lg shadow-rose-500/20 shrink-0">
+              <Film className="w-5 h-5 text-white" />
+            </div>
+            <div>
+              <h1 className="text-base font-extrabold tracking-tight">
+                <span>Lachvid Studio</span>
+              </h1>
+              <p className="text-xs text-slate-400">
+                Hệ thống tách video slicer & trộn lách content mỹ phẩm
+              </p>
+            </div>
           </Link>
-          {/* Current Project Pill */}
-          <div className="hidden sm:flex items-center gap-2 px-3 py-1 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-xs">
-            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
-            <span className="font-bold text-white">{currentProjectName || "Dự án"}</span>
-            {projectRenderedCount > 0 && (
-              <span className="text-[11px] font-mono text-indigo-300 bg-indigo-950/60 px-1.5 py-0.5 rounded border border-indigo-800/60">
-                Đã render {projectRenderedCount} video
-              </span>
-            )}
-          </div>
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-rose-500 to-indigo-500 flex items-center justify-center shadow-lg shadow-rose-500/20">
-            <Film className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <h1 className="text-base font-extrabold tracking-tight flex items-center gap-2">
-              <span>LachVid Studio</span>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40">
-                PRO 2.0
-              </span>
-            </h1>
-            <p className="text-xs text-slate-400">
-              Hệ thống tách video slicer & trộn lách content mỹ phẩm
-            </p>
+
+          <div className="h-6 w-px bg-slate-800 mx-1 hidden sm:block" />
+
+          {/* Button trở về Dự án & Tên Project */}
+          <div className="flex items-center gap-2">
+            <Link
+              href="/"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs font-medium text-slate-300 hover:text-white transition"
+              title="Quay lại danh sách dự án"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>Dự án</span>
+            </Link>
+            {/* Current Project Pill */}
+            <div className="hidden sm:flex items-center gap-2 px-3 py-1 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-xs">
+              <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
+              <span className="font-bold text-white">{currentProjectName || "Dự án"}</span>
+              {projectRenderedCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMainTab("history");
+                    fetchRenderedHistory();
+                  }}
+                  className="text-[11px] font-mono text-indigo-300 hover:text-white bg-indigo-950/60 hover:bg-indigo-900/80 px-2 py-0.5 rounded border border-indigo-800/60 transition flex items-center gap-1 cursor-pointer"
+                  title="Bấm để xem lịch sử video đã render"
+                >
+                  <History className="w-3 h-3 text-indigo-400" />
+                  <span>Đã render {projectRenderedCount} video</span>
+                </button>
+              )}
+            </div>
           </div>
         </div>
 
-        {/* The Two Dedicated Workspaces / Tabs */}
-        <div className="flex items-center bg-slate-950 p-1.5 rounded-2xl border border-slate-800 shadow-inner">
+        {/* 3 Dedicated Workspaces / Tabs */}
+        <div className="flex items-center bg-slate-950 p-1.5 rounded-2xl border border-slate-800 shadow-inner gap-1">
           <button
+            type="button"
             onClick={() => setMainTab("split")}
-            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-all ${
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all ${
               mainTab === "split"
                 ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/30 scale-100"
-                : "text-slate-400 hover:text-slate-200"
+                : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
             }`}
           >
             <Scissors className="w-4 h-4" />
-            <span>Khâu 1: Tách 1 video & slicer studio</span>
+            <span>Tách video</span>
           </button>
           <button
+            type="button"
             onClick={() => setMainTab("mix")}
-            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-all ${
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all ${
               mainTab === "mix"
                 ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/30 scale-100"
-                : "text-slate-400 hover:text-slate-200"
+                : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
             }`}
           >
             <Shuffle className="w-4 h-4" />
-            <span>Khâu 2: Trộn & ghép video theo folder</span>
+            <span>Trộn ghép</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setMainTab("history");
+              fetchRenderedHistory();
+            }}
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all ${
+              mainTab === "history"
+                ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/30 scale-100"
+                : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+            }`}
+          >
+            <History className="w-4 h-4" />
+            <span>Lịch sử render</span>
+            {projectRenderedCount > 0 && (
+              <span
+                className={`text-[10px] font-mono px-1.5 py-0.5 rounded-full font-bold transition-colors ${
+                  mainTab === "history"
+                    ? "bg-white/25 text-white"
+                    : "bg-indigo-500/20 text-indigo-300 border border-indigo-500/30"
+                }`}
+              >
+                {projectRenderedCount}
+              </span>
+            )}
           </button>
         </div>
       </header>
@@ -3396,10 +4013,10 @@ export default function StudioWorkspace({
           <div className="space-y-6">
             {/* Top Action Bar: Mode chính (Excel Google Drive) & Mode phụ (Upload máy) */}
             <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 space-y-5">
-              <div className="flex flex-wrap items-center justify-between gap-4">
-                <div>
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                <div className="min-w-0">
                   <h2 className="text-sm font-bold flex items-center gap-2 text-white">
-                    <Cloud className="w-5 h-5 text-sky-400" />
+                    <Cloud className="w-5 h-5 text-sky-400 shrink-0" />
                     <span>
                       Kho video theo 5 category (Google Drive & máy tính)
                     </span>
@@ -3411,7 +4028,16 @@ export default function StudioWorkspace({
                   </p>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-center justify-end gap-2 shrink-0 sm:ml-auto">
+                  <button
+                    type="button"
+                    onClick={() => setShowDriveHistoryDrawer(true)}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-sky-950/80 hover:bg-sky-900 border border-sky-700/60 text-sky-200 text-xs font-semibold transition shadow-sm"
+                    title="Xem toàn bộ lịch sử link Google Drive đã nạp vào kho"
+                  >
+                    <Cloud className="w-4 h-4 text-sky-400" />
+                    <span>Lịch sử link Drive ({allDriveLinks.length})</span>
+                  </button>
                   <button
                     onClick={() => masterFolderInputRef.current?.click()}
                     className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition"
@@ -3423,13 +4049,69 @@ export default function StudioWorkspace({
                   <button
                     type="button"
                     onClick={() => setShowClearConfirmModal(true)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-slate-100 transition shadow-md shadow-rose-600/20"
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-slate-100 transition shadow-md shadow-rose-600/20"
                     title="Xóa toàn bộ clip trong kho, voice và danh sách tổ hợp"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
-                    <span>Xoá trắng kho</span>
+                    <span>Xóa</span>
                   </button>
                 </div>
+              </div>
+
+              {/* Thanh tra cứu nhanh link Drive */}
+              <div className="bg-slate-950/90 border border-slate-800 rounded-xl p-3 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
+                <div className="flex items-center gap-2 flex-1 min-w-0">
+                  <Search className="w-4 h-4 text-slate-400 shrink-0" />
+                  <input
+                    type="text"
+                    value={quickCheckInput}
+                    onChange={(e) => setQuickCheckInput(e.target.value)}
+                    placeholder="Kiểm tra nhanh: Dán link Google Drive hoặc File ID vào đây để kiểm tra đã nạp chưa..."
+                    className="bg-transparent border-none text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none w-full font-mono"
+                  />
+                  {quickCheckInput && (
+                    <button
+                      type="button"
+                      onClick={() => setQuickCheckInput("")}
+                      className="p-1 rounded text-slate-500 hover:text-slate-300 transition"
+                      title="Xóa tìm kiếm"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {quickCheckResult && (
+                  <div className="flex items-center gap-2 shrink-0 text-xs font-medium">
+                    {quickCheckResult.found ? (
+                      <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-300">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        <span>
+                          Đã có {quickCheckResult.matches.length} file (
+                          {quickCheckResult.matches
+                            .map((m) => m.category.toUpperCase())
+                            .join(", ")}
+                          )
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDriveHistorySearchText(quickCheckInput);
+                            setShowDriveHistoryDrawer(true);
+                          }}
+                          className="text-[11px] underline ml-1 text-emerald-200 hover:text-white cursor-pointer"
+                        >
+                          Xem chi tiết
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800/80 border border-slate-700 text-slate-300">
+                        <Info className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                        <span>Chưa có trong kho (hợp lệ để dán nạp)</span>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Mode chính: Dán nhanh bảng 5 cột từ Excel */}
@@ -3495,44 +4177,6 @@ export default function StudioWorkspace({
                     className="w-full px-3.5 py-2.5 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition resize-y"
                   />
                 </div>
-
-                {/* Live Pill Breakdown of Parsed Links */}
-                <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-800/80 text-[11px]">
-                  <div className="flex flex-wrap items-center gap-1.5 font-mono">
-                    <span className="text-slate-400 font-sans">
-                      Đã nhận diện:
-                    </span>
-                    <span className="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/40">
-                      1. Open: {parsedExcel.open.length}
-                    </span>
-                    <span className="px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 border border-blue-500/40">
-                      2. Product: {parsedExcel.product.length}
-                    </span>
-                    <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40">
-                      3. Texture: {parsedExcel.texture.length}
-                    </span>
-                    <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                      4. Apply: {parsedExcel.apply.length}
-                    </span>
-                    <span className="px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/40">
-                      5. End: {parsedExcel.end.length}
-                    </span>
-                    <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
-                      6. Voice: {parsedExcel.voice?.length || 0}
-                    </span>
-                    {parsedExcel.skippedRows > 0 && (
-                      <span className="text-slate-500 text-[10px]">
-                        (Đã bỏ qua dòng tiêu đề)
-                      </span>
-                    )}
-                  </div>
-
-                  {parsedExcel.totalExtracted === 0 && (
-                    <span className="text-[10px] text-slate-500">
-                      Chưa có link nào được nhận diện
-                    </span>
-                  )}
-                </div>
               </div>
 
               {/* 6 Category & Voice Columns in 3x2 Grid */}
@@ -3590,49 +4234,101 @@ export default function StudioWorkspace({
                       </div>
 
                       {/* Items List */}
-                      <div className="flex-1 space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                      <div className="flex-1 space-y-1.5 max-h-64 overflow-y-auto pr-1">
                         {items.length === 0 ? (
                           <div className="h-full flex flex-col items-center justify-center text-center p-3 text-[11px] text-slate-500">
                             Chưa có clip nào
                           </div>
                         ) : (
-                          items.map((it) => (
-                            <div
-                              key={it.id}
-                              className="p-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-[10px] flex items-center justify-between group hover:border-slate-700 transition"
-                            >
-                              <span
-                                className="truncate max-w-[210px] text-slate-300 flex items-center gap-1"
-                                title={it.name}
+                          items.map((it) => {
+                            const isDrive =
+                              it.sourceType === "drive" || !!it.driveFileId;
+                            const driveFileId =
+                              it.driveFileId ||
+                              extractGoogleDriveFileId(it.localUrl);
+                            const driveUrl = driveFileId
+                              ? `https://drive.google.com/file/d/${driveFileId}/view`
+                              : isDrive
+                                ? it.localUrl
+                                : null;
+
+                            return (
+                              <div
+                                key={it.id}
+                                className="p-2 rounded-lg bg-slate-900/90 border border-slate-800 text-[10px] space-y-1 group hover:border-slate-700 transition"
                               >
-                                {it.sourceType === "drive" && (
-                                  <span title="Link Google Drive (Zero-disk stream)">
-                                    <Cloud className="w-2.5 h-2.5 text-sky-400 shrink-0" />
-                                  </span>
+                                <div className="flex items-center justify-between gap-1.5">
+                                  <div className="min-w-0 flex items-center gap-1.5 truncate">
+                                    {isDrive ? (
+                                      <span title="Link Google Drive (Zero-disk stream)">
+                                        <Cloud className="w-3 h-3 text-sky-400 shrink-0" />
+                                      </span>
+                                    ) : (
+                                      <span title="File video từ máy tính">
+                                        <Film className="w-3 h-3 text-slate-400 shrink-0" />
+                                      </span>
+                                    )}
+                                    {it.lockFlipH && (
+                                      <span title="Khóa lật gương">
+                                        <Lock className="w-2.5 h-2.5 text-amber-400 shrink-0" />
+                                      </span>
+                                    )}
+                                    <span
+                                      className="truncate text-slate-200 font-medium"
+                                      title={it.name}
+                                    >
+                                      {it.name}
+                                    </span>
+                                  </div>
+
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    <span className="font-mono text-slate-400 font-semibold">
+                                      {it.duration.toFixed(1)}s
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        handleRemoveCategoryItem(catKey, it.id)
+                                      }
+                                      className="text-slate-500 hover:text-rose-400 opacity-60 group-hover:opacity-100 transition p-0.5 rounded hover:bg-slate-800"
+                                      title="Xóa clip này khỏi kho"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {driveUrl && (
+                                  <div className="flex items-center justify-between gap-1.5 pl-4 text-[9px] font-mono text-slate-400 bg-slate-950/60 rounded px-1.5 py-0.5 border border-slate-800/60">
+                                    <a
+                                      href={driveUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-sky-400 hover:text-sky-300 hover:underline truncate max-w-[170px] inline-flex items-center gap-1"
+                                      title={`Mở link Drive: ${driveUrl}`}
+                                    >
+                                      <span className="truncate">{driveUrl}</span>
+                                      <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-70" />
+                                    </a>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        navigator.clipboard.writeText(driveUrl);
+                                        addToast({
+                                          type: "info",
+                                          text: "Đã sao chép link Google Drive.",
+                                        });
+                                      }}
+                                      className="text-slate-500 hover:text-slate-200 p-0.5 rounded transition shrink-0"
+                                      title="Sao chép link Drive"
+                                    >
+                                      <Copy className="w-2.5 h-2.5" />
+                                    </button>
+                                  </div>
                                 )}
-                                {it.lockFlipH && (
-                                  <span title="Khoá lật gương">
-                                    <Lock className="w-2.5 h-2.5 text-amber-400 shrink-0" />
-                                  </span>
-                                )}
-                                <span>{it.name}</span>
-                              </span>
-                              <div className="flex items-center gap-1.5">
-                                <span className="font-mono text-slate-500">
-                                  {it.duration.toFixed(1)}s
-                                </span>
-                                <button
-                                  onClick={() =>
-                                    handleRemoveCategoryItem(catKey, it.id)
-                                  }
-                                  className="text-slate-500 hover:text-rose-400 ml-1 opacity-0 group-hover:opacity-100 transition"
-                                  title="Xoá clip này khỏi kho"
-                                >
-                                  <Trash2 className="w-3 h-3" />
-                                </button>
                               </div>
-                            </div>
-                          ))
+                            );
+                          })
                         )}
                       </div>
                     </div>
@@ -3724,64 +4420,115 @@ export default function StudioWorkspace({
                   </div>
 
                   {/* Voice Items List */}
-                  <div className="flex-1 space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                  <div className="flex-1 space-y-1.5 max-h-64 overflow-y-auto pr-1">
                     {multiVoices.length === 0 ? (
                       <div className="h-full flex flex-col items-center justify-center text-center p-3 text-[11px] text-slate-500">
                         Chưa có voice nào
                       </div>
                     ) : (
-                      multiVoices.map((v) => (
-                        <div
-                          key={v.id}
-                          className="p-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-[10px] flex items-center justify-between group hover:border-slate-700 transition"
-                        >
-                          <div className="flex items-center gap-1.5 truncate max-w-[210px]">
-                            <button
-                              type="button"
-                              onClick={() => handleToggleAuditionVoice(v)}
-                              className={`p-1 rounded transition shrink-0 ${
-                                auditionVoiceId === v.id
-                                  ? "bg-indigo-600 text-white"
-                                  : "text-slate-400 hover:text-indigo-300 hover:bg-slate-800"
-                              }`}
-                              title={
-                                auditionVoiceId === v.id
-                                  ? "Dừng nghe thử"
-                                  : "Nghe thử file này"
-                              }
-                            >
-                              {auditionVoiceId === v.id ? (
-                                <Square className="w-2.5 h-2.5 fill-current" />
-                              ) : (
-                                <Play className="w-2.5 h-2.5 fill-current" />
-                              )}
-                            </button>
-                            <span
-                              className="truncate text-slate-300 flex items-center gap-1"
-                              title={v.name}
-                            >
-                              {v.sourceType === "drive" && (
-                                <span title="Link Google Drive (Zero-disk stream)">
-                                  <Cloud className="w-2.5 h-2.5 text-sky-400 shrink-0" />
+                      multiVoices.map((v) => {
+                        const isDrive =
+                          v.sourceType === "drive" || !!v.driveFileId;
+                        const driveFileId =
+                          v.driveFileId ||
+                          extractGoogleDriveFileId(v.driveRawUrl || "");
+                        const driveUrl =
+                          v.driveRawUrl ||
+                          (driveFileId
+                            ? `https://drive.google.com/file/d/${driveFileId}/view`
+                            : isDrive
+                              ? v.localUrl
+                              : null);
+
+                        return (
+                          <div
+                            key={v.id}
+                            className="p-2 rounded-lg bg-slate-900/90 border border-slate-800 text-[10px] space-y-1 group hover:border-slate-700 transition"
+                          >
+                            <div className="flex items-center justify-between gap-1.5">
+                              <div className="flex items-center gap-1.5 truncate min-w-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleAuditionVoice(v)}
+                                  className={`p-1 rounded transition shrink-0 ${
+                                    auditionVoiceId === v.id
+                                      ? "bg-indigo-600 text-white"
+                                      : "text-slate-400 hover:text-indigo-300 hover:bg-slate-800"
+                                  }`}
+                                  title={
+                                    auditionVoiceId === v.id
+                                      ? "Dừng nghe thử"
+                                      : "Nghe thử file này"
+                                  }
+                                >
+                                  {auditionVoiceId === v.id ? (
+                                    <Square className="w-2.5 h-2.5 fill-current" />
+                                  ) : (
+                                    <Play className="w-2.5 h-2.5 fill-current" />
+                                  )}
+                                </button>
+                                {isDrive ? (
+                                  <span title="Link Google Drive (Zero-disk stream)">
+                                    <Cloud className="w-3 h-3 text-sky-400 shrink-0" />
+                                  </span>
+                                ) : (
+                                  <span title="File âm thanh từ máy tính">
+                                    <Music className="w-3 h-3 text-slate-400 shrink-0" />
+                                  </span>
+                                )}
+                                <span
+                                  className="truncate text-slate-200 font-medium"
+                                  title={v.name}
+                                >
+                                  {v.name}
                                 </span>
-                              )}
-                              <span>{v.name}</span>
-                            </span>
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <span className="font-mono text-slate-400 font-semibold">
+                                  {v.duration.toFixed(1)}s
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveVoiceItem(v.id)}
+                                  className="text-slate-500 hover:text-rose-400 opacity-60 group-hover:opacity-100 transition p-0.5 rounded hover:bg-slate-800"
+                                  title="Xóa voice này khỏi kho"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              </div>
+                            </div>
+
+                            {driveUrl && (
+                              <div className="flex items-center justify-between gap-1.5 pl-5 text-[9px] font-mono text-slate-400 bg-slate-950/60 rounded px-1.5 py-0.5 border border-slate-800/60">
+                                <a
+                                  href={driveUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-sky-400 hover:text-sky-300 hover:underline truncate max-w-[170px] inline-flex items-center gap-1"
+                                  title={`Mở link Drive: ${driveUrl}`}
+                                >
+                                  <span className="truncate">{driveUrl}</span>
+                                  <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-70" />
+                                </a>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    navigator.clipboard.writeText(driveUrl);
+                                    addToast({
+                                      type: "info",
+                                      text: "Đã sao chép link Google Drive.",
+                                    });
+                                  }}
+                                  className="text-slate-500 hover:text-slate-200 p-0.5 rounded transition shrink-0"
+                                  title="Sao chép link Drive"
+                                >
+                                  <Copy className="w-2.5 h-2.5" />
+                                </button>
+                              </div>
+                            )}
                           </div>
-                          <div className="flex items-center gap-1.5">
-                            <span className="font-mono text-slate-500">
-                              {v.duration.toFixed(1)}s
-                            </span>
-                            <button
-                              onClick={() => handleRemoveVoiceItem(v.id)}
-                              className="text-slate-500 hover:text-rose-400 ml-1 opacity-0 group-hover:opacity-100 transition"
-                              title="Xoá voice này khỏi kho"
-                            >
-                              <Trash2 className="w-3 h-3" />
-                            </button>
-                          </div>
-                        </div>
-                      ))
+                        );
+                      })
                     )}
                   </div>
                 </div>
@@ -3817,7 +4564,7 @@ export default function StudioWorkspace({
                 </div>
               </div>
 
-              <div className="w-full sm:w-auto shrink-0">
+              <div className="w-full sm:w-auto shrink-0 flex items-center gap-2">
                 <button
                   onClick={handlePlanDiverseMix}
                   className="w-full sm:w-auto px-6 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-xs sm:text-sm shadow-xl shadow-indigo-600/20 flex items-center justify-center gap-2 transition"
@@ -4328,7 +5075,1132 @@ export default function StudioWorkspace({
             )}
           </div>
         )}
+
+        {/* TAB 3: LỊCH SỬ RENDER */}
+        {mainTab === "history" && (
+          <div className="space-y-5 animate-in fade-in duration-150">
+            {/* Header Toolbar */}
+            <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-indigo-500/15 flex items-center justify-center border border-indigo-500/30 text-indigo-400 shrink-0">
+                    <History className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h2 className="text-base font-extrabold text-white flex items-center gap-2.5">
+                      <span>Lịch sử video đã render</span>
+                      <span className="text-xs font-mono font-bold px-2.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
+                        {renderedHistoryList.length} video
+                      </span>
+                    </h2>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Quản lý trạng thái sử dụng của từng video đã xuất file. Thuật toán tự động ghi nhận và loại trừ các cảnh này khi tạo mẻ video mới.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {/* Export Dropdown */}
+                  <div className="relative">
+                    <button
+                      type="button"
+                      disabled={renderedHistoryList.length === 0}
+                      onClick={() => setShowExportMenu((prev) => !prev)}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold transition disabled:opacity-50"
+                      title="Xuất toàn bộ lịch sử video ra file bảng tính"
+                    >
+                      <Download className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Xuất file</span>
+                      <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                    </button>
+
+                    {showExportMenu && (
+                      <>
+                        <div
+                          className="fixed inset-0 z-40"
+                          onClick={() => setShowExportMenu(false)}
+                        />
+                        <div className="absolute right-0 mt-1.5 w-48 rounded-xl bg-slate-900 border border-slate-700/80 shadow-2xl py-1.5 z-50 animate-in fade-in zoom-in-95 duration-150">
+                          <button
+                            type="button"
+                            onClick={() => handleExportHistory("xlsx")}
+                            className="w-full px-3.5 py-2 text-left text-xs font-medium text-slate-200 hover:bg-slate-800 hover:text-white flex items-center gap-2 transition"
+                          >
+                            <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+                            <span>Xuất Excel (.xlsx)</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleExportHistory("csv")}
+                            className="w-full px-3.5 py-2 text-left text-xs font-medium text-slate-200 hover:bg-slate-800 hover:text-white flex items-center gap-2 transition"
+                          >
+                            <Code2 className="w-4 h-4 text-sky-400" />
+                            <span>Xuất CSV (.csv)</span>
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={fetchRenderedHistory}
+                    disabled={isLoadingHistory}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold transition disabled:opacity-50"
+                    title="Tải lại danh sách lịch sử"
+                  >
+                    <RefreshCw
+                      className={`w-3.5 h-3.5 ${
+                        isLoadingHistory ? "animate-spin text-indigo-400" : ""
+                      }`}
+                    />
+                    <span>Làm mới</span>
+                  </button>
+                  {renderedHistoryList.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowClearHistoryConfirmModal(true)}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-semibold transition"
+                      title="Xóa toàn bộ lịch sử video đã render của dự án này"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Xóa toàn bộ lịch sử</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Filters, Search & Sort Bar */}
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-800/80">
+                {/* Status Filter Tabs */}
+                <div className="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setHistoryFilterStatus("all")}
+                    className={`px-3 py-1.5 rounded-lg font-semibold transition ${
+                      historyFilterStatus === "all"
+                        ? "bg-indigo-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    Tất cả ({historyCounts.all})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setHistoryFilterStatus("unused")}
+                    className={`px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5 ${
+                      historyFilterStatus === "unused"
+                        ? "bg-indigo-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <span className="w-2 h-2 rounded-full bg-slate-400" />
+                    <span>Chưa sử dụng ({historyCounts.unused})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setHistoryFilterStatus("used")}
+                    className={`px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5 ${
+                      historyFilterStatus === "used"
+                        ? "bg-emerald-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                    <span>Đã sử dụng ({historyCounts.used})</span>
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-2 flex-1 sm:flex-initial justify-end">
+                  {/* Search Input */}
+                  <div className="relative flex-1 sm:w-64">
+                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={historySearchText}
+                      onChange={(e) => setHistorySearchText(e.target.value)}
+                      placeholder="Tìm theo tên video, cảnh..."
+                      className="w-full pl-8 pr-7 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 transition"
+                    />
+                    {historySearchText && (
+                      <button
+                        type="button"
+                        onClick={() => setHistorySearchText("")}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-xs"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Sort Order Toggle */}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setHistorySortOrder((prev) =>
+                        prev === "desc" ? "asc" : "desc",
+                      )
+                    }
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-xs font-semibold text-slate-300 transition"
+                    title={`Đang sắp xếp: ${
+                      historySortOrder === "desc"
+                        ? "Mới nhất trước"
+                        : "Cũ nhất trước"
+                    }`}
+                  >
+                    <ArrowUpDown className="w-3.5 h-3.5 text-indigo-400" />
+                    <span className="hidden sm:inline">
+                      {historySortOrder === "desc"
+                        ? "Mới nhất trước"
+                        : "Cũ nhất trước"}
+                    </span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Table or Empty/Loading State */}
+            {isLoadingHistory ? (
+              <div className="py-24 flex flex-col items-center justify-center gap-3 text-slate-400">
+                <Loader2 className="w-8 h-8 animate-spin text-indigo-400" />
+                <span className="text-xs font-medium">
+                  Đang tải danh sách lịch sử render...
+                </span>
+              </div>
+            ) : renderedHistoryList.length === 0 ? (
+              <div className="py-20 px-6 rounded-2xl bg-slate-900/50 border border-slate-800/80 flex flex-col items-center justify-center text-center space-y-4">
+                <div className="w-16 h-16 rounded-2xl bg-slate-800/60 border border-slate-700/60 flex items-center justify-center text-slate-500 shadow-inner">
+                  <Film className="w-8 h-8" />
+                </div>
+                <div className="max-w-md space-y-1">
+                  <h3 className="text-sm font-bold text-white">
+                    Chưa có video nào trong lịch sử render
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Khi bạn xuất file MP4 đơn lẻ hoặc tải ZIP toàn bộ ở tab
+                    &quot;Trộn ghép&quot;, các video sẽ tự động được lưu vào đây và không
+                    bị trùng cảnh ở các lần tạo tiếp theo.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setMainTab("mix")}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow-lg shadow-indigo-600/25"
+                >
+                  <Shuffle className="w-4 h-4" />
+                  <span>Sang tab trộn ghép ngay</span>
+                </button>
+              </div>
+            ) : filteredHistoryList.length === 0 ? (
+              <div className="py-16 px-6 rounded-2xl bg-slate-900/40 border border-slate-800/80 flex flex-col items-center justify-center text-center space-y-2">
+                <Search className="w-7 h-7 text-slate-500 mb-1" />
+                <h3 className="text-sm font-bold text-white">
+                  Không tìm thấy video phù hợp
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Thử đổi bộ lọc trạng thái hoặc từ khóa tìm kiếm khác.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setHistoryFilterStatus("all");
+                    setHistorySearchText("");
+                  }}
+                  className="mt-2 text-xs font-semibold text-indigo-400 hover:text-indigo-300 underline"
+                >
+                  Đặt lại bộ lọc
+                </button>
+              </div>
+            ) : (
+              <div className="bg-slate-900/80 border border-slate-800 rounded-2xl overflow-hidden shadow-sm flex flex-col">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400 font-semibold uppercase tracking-wider text-[11px]">
+                        <th className="py-3.5 px-4 w-12 text-center">STT</th>
+                        <th className="py-3.5 px-4 min-w-[220px]">Tên video</th>
+                        <th className="py-3.5 px-3 w-28 text-center">Thời lượng</th>
+                        <th className="py-3.5 px-4 min-w-[240px]">5 Cảnh tổ hợp</th>
+                        <th className="py-3.5 px-3 min-w-[120px]">Voice</th>
+                        <th className="py-3.5 px-4 w-44 text-center">Trạng thái</th>
+                        <th className="py-3.5 px-4 w-24 text-right">Thao tác</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60">
+                      {paginatedHistoryList.map((rec, rIdx) => {
+                        const comp = rec.payload as ComposedVideo | undefined;
+                        const isUsed = rec.status === "used";
+                        const globalIdx =
+                          (historyPage - 1) * historyPageSize + rIdx + 1;
+                        const dateStr = rec.renderedAt
+                          ? new Date(rec.renderedAt).toLocaleString("vi-VN", {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              day: "2-digit",
+                              month: "2-digit",
+                              year: "numeric",
+                            })
+                          : "";
+                        const voiceItem = comp?.voiceTrackId
+                          ? multiVoices.find((v) => v.id === comp.voiceTrackId)
+                          : null;
+
+                        return (
+                          <tr
+                            key={rec.id || rIdx}
+                            onClick={() => setSelectedHistoryDetail(rec)}
+                            className="hover:bg-slate-800/40 transition cursor-pointer group"
+                          >
+                            {/* STT */}
+                            <td className="py-3 px-4 text-center text-slate-400 font-mono">
+                              #{globalIdx}
+                            </td>
+
+                            {/* Tên video & ngày render */}
+                            <td className="py-3 px-4">
+                              <div className="font-bold text-white group-hover:text-indigo-300 transition line-clamp-1">
+                                {rec.name || `Video #${globalIdx}`}
+                              </div>
+                              {dateStr && (
+                                <div className="text-[11px] text-slate-400 font-mono mt-0.5">
+                                  ⏱️ {dateStr}
+                                </div>
+                              )}
+                            </td>
+
+                            {/* Thời lượng */}
+                            <td className="py-3 px-3 text-center">
+                              {comp?.finalDuration ? (
+                                <span className="inline-block px-2 py-0.5 rounded-full font-mono font-bold text-[11px] bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
+                                  {comp.finalDuration.toFixed(1)}s
+                                </span>
+                              ) : (
+                                <span className="text-slate-500">-</span>
+                              )}
+                            </td>
+
+                            {/* 5 Cảnh tổ hợp */}
+                            <td className="py-3 px-4">
+                              {comp?.slots && comp.slots.length > 0 ? (
+                                <div className="flex items-center gap-1">
+                                  {comp.slots.map((s, sIdx) => {
+                                    const catMeta = SHOT_CATEGORIES.find(
+                                      (c) => c.id === s.category,
+                                    );
+                                    return (
+                                      <div
+                                        key={sIdx}
+                                        className={`px-1.5 py-0.5 rounded font-mono text-[10px] font-bold border truncate max-w-[80px] ${
+                                          catMeta?.badgeClass ||
+                                          "bg-slate-800 text-slate-300 border-slate-700"
+                                        }`}
+                                        title={`${s.category.toUpperCase()}: ${
+                                          s.shotLabel || s.shotId
+                                        } (${s.videoBegin.toFixed(1)}s - ${s.videoEnd.toFixed(1)}s)`}
+                                      >
+                                        {s.category.slice(0, 1).toUpperCase()}:{" "}
+                                        {s.shotLabel || s.shotId}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : (
+                                <span
+                                  className="text-slate-500 font-mono text-[11px] truncate max-w-[180px] block"
+                                  title={rec.tupleKey}
+                                >
+                                  {rec.tupleKey}
+                                </span>
+                              )}
+                            </td>
+
+                            {/* Voice */}
+                            <td className="py-3 px-3">
+                              {comp?.voiceTrackId ? (
+                                <span
+                                  className="inline-flex items-center gap-1 text-[11px] font-mono text-indigo-300 bg-indigo-500/10 border border-indigo-500/30 px-2 py-0.5 rounded-full truncate max-w-[120px]"
+                                  title={voiceItem?.name || "Có lồng voice"}
+                                >
+                                  🎙️ {voiceItem?.name || "Voice"}
+                                </span>
+                              ) : (
+                                <span className="text-slate-500 font-mono">
+                                  -
+                                </span>
+                              )}
+                            </td>
+
+                            {/* Trạng thái (Switch toggle) */}
+                            <td
+                              className="py-3 px-4 text-center"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <div className="flex items-center justify-center gap-2">
+                                <button
+                                  type="button"
+                                  role="switch"
+                                  aria-checked={isUsed}
+                                  onClick={(e) =>
+                                    handleToggleHistoryStatus(rec, e)
+                                  }
+                                  className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                                    isUsed ? "bg-emerald-500" : "bg-slate-700"
+                                  }`}
+                                  title={
+                                    isUsed
+                                      ? "Bấm để đánh dấu là chưa sử dụng"
+                                      : "Bấm để đánh dấu là đã sử dụng"
+                                  }
+                                >
+                                  <span
+                                    aria-hidden="true"
+                                    className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                                      isUsed
+                                        ? "translate-x-4"
+                                        : "translate-x-0"
+                                    }`}
+                                  />
+                                </button>
+                                <span
+                                  className={`text-[11px] font-medium select-none min-w-[75px] text-left ${
+                                    isUsed
+                                      ? "text-emerald-400 font-bold"
+                                      : "text-slate-400"
+                                  }`}
+                                >
+                                  {isUsed ? "Đã dùng" : "Chưa dùng"}
+                                </span>
+                              </div>
+                            </td>
+
+                            {/* Thao tác */}
+                            <td
+                              className="py-3 px-4 text-right"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <div className="flex items-center justify-end gap-1.5">
+                                {comp && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleRenderSingleComposed(comp)
+                                    }
+                                    className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
+                                    title="Tải lại file MP4 này về máy"
+                                  >
+                                    <Download className="w-3.5 h-3.5 text-emerald-400" />
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleDeleteHistoryItem(rec.id)
+                                  }
+                                  className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 border border-transparent hover:border-rose-500/20 transition"
+                                  title="Xóa bản ghi này khỏi lịch sử"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Pagination Footer */}
+                <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-t border-slate-800/80 bg-slate-950/40 text-xs text-slate-400">
+                  <div className="flex items-center gap-2">
+                    <span>
+                      Hiển thị{" "}
+                      <strong className="text-white">
+                        {(historyPage - 1) * historyPageSize + 1}
+                      </strong>
+                      –
+                      <strong className="text-white">
+                        {Math.min(
+                          filteredHistoryList.length,
+                          historyPage * historyPageSize,
+                        )}
+                      </strong>{" "}
+                      trên tổng số{" "}
+                      <strong className="text-white">
+                        {filteredHistoryList.length}
+                      </strong>{" "}
+                      video
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    {/* Page Size Selector */}
+                    <div className="flex items-center gap-1.5">
+                      <span>Dòng mỗi trang:</span>
+                      <select
+                        value={historyPageSize}
+                        onChange={(e) =>
+                          setHistoryPageSize(Number(e.target.value))
+                        }
+                        className="bg-slate-900 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-xs focus:outline-none focus:border-indigo-500"
+                      >
+                        <option value={10}>10</option>
+                        <option value={20}>20</option>
+                        <option value={50}>50</option>
+                      </select>
+                    </div>
+
+                    {/* Pagination Page Controls */}
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        disabled={historyPage <= 1}
+                        onClick={() =>
+                          setHistoryPage((prev) => Math.max(1, prev - 1))
+                        }
+                        className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 disabled:hover:bg-slate-800 transition"
+                        title="Trang trước"
+                      >
+                        <ChevronLeft className="w-3.5 h-3.5" />
+                      </button>
+                      <span className="px-2 font-mono text-slate-300">
+                        {historyPage} / {totalHistoryPages}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={historyPage >= totalHistoryPages}
+                        onClick={() =>
+                          setHistoryPage((prev) =>
+                            Math.min(totalHistoryPages, prev + 1),
+                          )
+                        }
+                        className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 disabled:hover:bg-slate-800 transition"
+                        title="Trang tiếp theo"
+                      >
+                        <ChevronRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* SLIDE-OVER DRAWER CHI TIẾT VIDEO (TRƯỢT TỪ BÊN PHẢI) */}
+            {selectedHistoryDetail && (
+              <div className="fixed inset-0 z-50 overflow-hidden animate-in fade-in duration-200">
+                {/* Backdrop */}
+                <div
+                  onClick={() => setSelectedHistoryDetail(null)}
+                  className="absolute inset-0 bg-black/60 backdrop-blur-sm transition-opacity"
+                />
+
+                <div className="fixed inset-y-0 right-0 max-w-full flex pl-10">
+                  <div className="w-screen max-w-xl sm:max-w-2xl bg-slate-900 border-l border-slate-800 shadow-2xl flex flex-col justify-between animate-in slide-in-from-right duration-300 overflow-hidden">
+                    {/* Drawer Header */}
+                    <div className="p-5 border-b border-slate-800 flex items-center justify-between gap-4 bg-slate-950/60">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <h3 className="text-base font-extrabold text-white truncate">
+                            {selectedHistoryDetail.name || "Chi tiết video"}
+                          </h3>
+                        </div>
+                        {selectedHistoryDetail.renderedAt && (
+                          <p className="text-xs text-slate-400 font-mono mt-0.5">
+                            ⏱️ Đã render lúc:{" "}
+                            {new Date(
+                              selectedHistoryDetail.renderedAt,
+                            ).toLocaleString("vi-VN", {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              day: "2-digit",
+                              month: "2-digit",
+                              year: "numeric",
+                            })}
+                          </p>
+                        )}
+                      </div>
+
+                      {/* Status Toggle on Drawer Header */}
+                      <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-800">
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-checked={
+                              selectedHistoryDetail.status === "used"
+                            }
+                            onClick={() =>
+                              handleToggleHistoryStatus(selectedHistoryDetail)
+                            }
+                            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                              selectedHistoryDetail.status === "used"
+                                ? "bg-emerald-500"
+                                : "bg-slate-700"
+                            }`}
+                            title="Bấm để đổi trạng thái sử dụng"
+                          >
+                            <span
+                              aria-hidden="true"
+                              className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                                selectedHistoryDetail.status === "used"
+                                  ? "translate-x-4"
+                                  : "translate-x-0"
+                              }`}
+                            />
+                          </button>
+                          <span
+                            className={`text-xs font-semibold select-none ${
+                              selectedHistoryDetail.status === "used"
+                                ? "text-emerald-400 font-bold"
+                                : "text-slate-400"
+                            }`}
+                          >
+                            {selectedHistoryDetail.status === "used"
+                              ? "Đã sử dụng"
+                              : "Chưa sử dụng"}
+                          </span>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => setSelectedHistoryDetail(null)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                          title="Đóng chi tiết"
+                        >
+                          <X className="w-5 h-5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Drawer Body */}
+                    <div className="flex-1 overflow-y-auto overflow-x-hidden p-5 sm:p-6 space-y-6 min-w-0">
+                      {/* Video Preview Player */}
+                      {selectedHistoryDetail.payload ? (
+                        <div className="space-y-3">
+                          <div className="flex items-center justify-between">
+                            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                              <Play className="w-3.5 h-3.5 text-indigo-400 fill-current" />
+                              <span>Màn hình xem lại video 9:16</span>
+                            </h4>
+                            {(selectedHistoryDetail.payload as ComposedVideo)
+                              ?.finalDuration && (
+                              <span className="text-xs font-mono font-bold text-emerald-400 px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30">
+                                Thời lượng:{" "}
+                                {(
+                                  selectedHistoryDetail.payload as ComposedVideo
+                                ).finalDuration.toFixed(1)}
+                                s
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 flex justify-center">
+                            {(() => {
+                              const comp = selectedHistoryDetail.payload as ComposedVideo;
+                              const vItem = comp?.voiceTrackId
+                                ? multiVoices.find((v) => v.id === comp.voiceTrackId)
+                                : null;
+                              const vTrack: VoiceTrack | null = vItem
+                                ? {
+                                    id: vItem.id,
+                                    name: vItem.name,
+                                    fileName: vItem.fileName,
+                                    localUrl: vItem.localUrl,
+                                    localPath: vItem.localPath || "",
+                                    sizeBytes: 0,
+                                    duration: vItem.duration || 20,
+                                    createdAt: "",
+                                  }
+                                : null;
+                              return (
+                                <PreviewPlayer916
+                                  composed={comp}
+                                  sourceVideo={state.sourceVideo}
+                                  voiceTrack={vTrack}
+                                  enableVoice={Boolean(vTrack)}
+                                />
+                              );
+                            })()}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="p-8 rounded-2xl bg-slate-950 border border-slate-800 text-center text-xs text-slate-500">
+                          Bản ghi này thuộc phiên bản trước, không có snapshot
+                          cảnh để preview trực tiếp.
+                        </div>
+                      )}
+
+                      {/* 5 Cảnh Category Details */}
+                      {(selectedHistoryDetail.payload as ComposedVideo)
+                        ?.slots && (
+                        <div className="space-y-3">
+                          <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                            <Layers className="w-3.5 h-3.5 text-indigo-400" />
+                            <span>Chi tiết 5 cảnh trong tổ hợp</span>
+                          </h4>
+
+                          <div className="space-y-2.5">
+                            {(
+                              selectedHistoryDetail.payload as ComposedVideo
+                            ).slots.map((s, idx) => {
+                              const catMeta = SHOT_CATEGORIES.find(
+                                (c) => c.id === s.category,
+                              );
+                              const driveLink = getGoogleDriveLinkFromSlot(s);
+
+                              return (
+                                <div
+                                  key={idx}
+                                  className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 text-xs"
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                                      <span
+                                        className={`w-[72px] shrink-0 text-center px-1.5 py-1 rounded text-[10px] font-extrabold uppercase border tracking-wider ${
+                                          catMeta?.badgeClass || "text-slate-300"
+                                        }`}
+                                      >
+                                        {s.category}
+                                      </span>
+                                      <div className="min-w-0 flex-1 space-y-0.5">
+                                        <div className="font-semibold text-slate-200 truncate">
+                                          {s.shotLabel || s.shotId}
+                                        </div>
+                                        <div className="flex items-center gap-2 text-[10px] text-slate-400 font-mono">
+                                          <span className="shrink-0">
+                                            Cắt gốc: {s.videoBegin.toFixed(1)}s →{" "}
+                                            {s.videoEnd.toFixed(1)}s
+                                          </span>
+                                          {driveLink ? (
+                                            <>
+                                              <span className="text-slate-600 shrink-0">•</span>
+                                              <a
+                                                href={driveLink}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="text-sky-400 hover:text-sky-300 hover:underline inline-flex items-center gap-1 truncate max-w-[150px] sm:max-w-[220px]"
+                                                title={`Mở video gốc trên Google Drive: ${driveLink}`}
+                                              >
+                                                <Cloud className="w-3 h-3 text-sky-400 shrink-0" />
+                                                <span className="truncate">{driveLink}</span>
+                                                <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-70" />
+                                              </a>
+                                            </>
+                                          ) : (
+                                            <>
+                                              <span className="text-slate-600 shrink-0">•</span>
+                                              <span className="text-slate-500 italic shrink-0">File máy tính</span>
+                                            </>
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    <div className="flex items-center gap-2 font-mono text-[11px] shrink-0">
+                                      {s.speed && s.speed !== 1 && (
+                                        <span className="px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/30">
+                                          {s.speed}x
+                                        </span>
+                                      )}
+                                      {s.flipH && (
+                                        <span className="px-1.5 py-0.5 rounded bg-fuchsia-500/10 text-fuchsia-300 border border-fuchsia-500/30">
+                                          Mirror
+                                        </span>
+                                      )}
+                                      <span className="px-2 py-0.5 rounded bg-slate-900 text-slate-300 border border-slate-800">
+                                        {(s.exitEnd - s.enterBegin).toFixed(1)}s
+                                      </span>
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Voice Track Details */}
+                      {(selectedHistoryDetail.payload as ComposedVideo)
+                        ?.voiceTrackId && (
+                        <div className="space-y-2">
+                          <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                            <Mic className="w-3.5 h-3.5 text-indigo-400" />
+                            <span>Giọng lồng tiếng (Voiceover)</span>
+                          </h4>
+                          {(() => {
+                            const vItem = multiVoices.find(
+                              (v) =>
+                                v.id ===
+                                (
+                                  selectedHistoryDetail.payload as ComposedVideo
+                                ).voiceTrackId,
+                            );
+                            const voiceDriveLink =
+                              getGoogleDriveLinkFromVoice(vItem);
+
+                            return (
+                              <div className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 text-xs">
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="min-w-0 flex-1 space-y-0.5">
+                                    <div className="font-medium text-slate-200 font-mono truncate">
+                                      🎙️ {vItem?.name || "Track lồng voice"}
+                                    </div>
+                                    <div className="flex items-center gap-2 text-[10px] text-slate-400 font-mono">
+                                      <span className="text-emerald-400 shrink-0">
+                                        Đã hòa âm
+                                      </span>
+                                      {voiceDriveLink ? (
+                                        <>
+                                          <span className="text-slate-600 shrink-0">•</span>
+                                          <a
+                                            href={voiceDriveLink}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="text-sky-400 hover:text-sky-300 hover:underline inline-flex items-center gap-1 truncate max-w-[180px] sm:max-w-[260px]"
+                                            title={`Mở file voice trên Google Drive: ${voiceDriveLink}`}
+                                          >
+                                            <Cloud className="w-3 h-3 text-sky-400 shrink-0" />
+                                            <span className="truncate">{voiceDriveLink}</span>
+                                            <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-70" />
+                                          </a>
+                                        </>
+                                      ) : (
+                                        <>
+                                          <span className="text-slate-600 shrink-0">•</span>
+                                          <span className="text-slate-500 italic shrink-0">File máy tính</span>
+                                        </>
+                                      )}
+                                    </div>
+                                  </div>
+                                  <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 shrink-0">
+                                    Voiceover
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      )}
+
+                      {/* Tuple Key */}
+                      <div className="flex items-center gap-2 text-[11px] font-mono text-slate-500 min-w-0 max-w-full">
+                        <p
+                          className="truncate min-w-0 flex-1 select-all cursor-text"
+                          title={`Mã tổ hợp: ${selectedHistoryDetail.tupleKey}`}
+                        >
+                          <span className="shrink-0">Mã tổ hợp: </span>
+                          <span className="text-slate-400">
+                            {selectedHistoryDetail.tupleKey}
+                          </span>
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigator.clipboard.writeText(
+                              selectedHistoryDetail.tupleKey,
+                            );
+                            addToast({
+                              type: "info",
+                              text: "Đã sao chép mã tổ hợp vào clipboard.",
+                            });
+                          }}
+                          className="shrink-0 p-1 rounded hover:bg-slate-800 text-slate-500 hover:text-slate-300 transition"
+                          title="Sao chép mã tổ hợp"
+                        >
+                          <Copy className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Drawer Footer Actions */}
+                    <div className="p-5 border-t border-slate-800 bg-slate-950/80 flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex items-center gap-2">
+                        {selectedHistoryDetail.payload && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              handlePreviewHistoryComposed(
+                                selectedHistoryDetail,
+                              );
+                              setSelectedHistoryDetail(null);
+                            }}
+                            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow-sm"
+                          >
+                            <Shuffle className="w-3.5 h-3.5" />
+                            <span>Mở trên tab trộn ghép</span>
+                          </button>
+                        )}
+                        {selectedHistoryDetail.payload && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleRenderSingleComposed(
+                                selectedHistoryDetail.payload as ComposedVideo,
+                              )
+                            }
+                            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-bold transition"
+                          >
+                            <Download className="w-3.5 h-3.5 text-emerald-400" />
+                            <span>Tải lại MP4</span>
+                          </button>
+                        )}
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setSelectedHistoryDetail(null)}
+                        className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition"
+                      >
+                        Đóng
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </main>
+
+      {/* Slide-over Drawer: Lịch sử & tra cứu link Google Drive */}
+      {showDriveHistoryDrawer && (
+        <div className="fixed inset-0 z-50 overflow-hidden bg-slate-950/70 backdrop-blur-sm animate-in fade-in duration-200">
+          <div
+            className="absolute inset-0"
+            onClick={() => setShowDriveHistoryDrawer(false)}
+          />
+          <div className="fixed inset-y-0 right-0 max-w-full flex pl-10 pointer-events-none">
+            <div className="w-screen max-w-2xl bg-slate-900 border-l border-slate-800 shadow-2xl flex flex-col pointer-events-auto animate-in slide-in-from-right duration-300">
+              {/* Header */}
+              <div className="p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/80">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400">
+                    <Cloud className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-sm font-bold text-white">
+                        Lịch sử link Google Drive
+                      </h3>
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-sky-500/20 text-sky-300 border border-sky-500/40">
+                        {allDriveLinks.length} link
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400">
+                      Toàn bộ link Google Drive đã nạp trong kho của dự án
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowDriveHistoryDrawer(false)}
+                  className="p-1.5 rounded-xl hover:bg-slate-800 text-slate-400 hover:text-white transition"
+                  title="Đóng drawer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Search & Filter Toolbar */}
+              <div className="p-4 border-b border-slate-800 bg-slate-900/60 space-y-3">
+                <div className="relative">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={driveHistorySearchText}
+                    onChange={(e) => setDriveHistorySearchText(e.target.value)}
+                    placeholder="Tìm theo link Drive, File ID hoặc tên file..."
+                    className="w-full pl-9 pr-9 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-sky-500 transition"
+                  />
+                  {driveHistorySearchText && (
+                    <button
+                      type="button"
+                      onClick={() => setDriveHistorySearchText("")}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-white"
+                      title="Xóa tìm kiếm"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Category Filter Pills */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => setDriveHistoryCategoryFilter("all")}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
+                      driveHistoryCategoryFilter === "all"
+                        ? "bg-sky-600 text-white"
+                        : "bg-slate-800/80 text-slate-400 hover:text-slate-200 hover:bg-slate-800"
+                    }`}
+                  >
+                    Tất cả ({allDriveLinks.length})
+                  </button>
+                  {CATEGORY_ORDER.map((cat) => {
+                    const count = allDriveLinks.filter(
+                      (l) => l.category === cat,
+                    ).length;
+                    const meta = SHOT_CATEGORIES.find((c) => c.id === cat);
+                    return (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => setDriveHistoryCategoryFilter(cat)}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
+                          driveHistoryCategoryFilter === cat
+                            ? "bg-sky-600 text-white"
+                            : "bg-slate-800/80 text-slate-400 hover:text-slate-200 hover:bg-slate-800"
+                        }`}
+                      >
+                        {meta?.label || cat} ({count})
+                      </button>
+                    );
+                  })}
+                  {(() => {
+                    const voiceCount = allDriveLinks.filter(
+                      (l) => l.category === "voice",
+                    ).length;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => setDriveHistoryCategoryFilter("voice")}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
+                          driveHistoryCategoryFilter === "voice"
+                            ? "bg-sky-600 text-white"
+                            : "bg-slate-800/80 text-slate-400 hover:text-slate-200 hover:bg-slate-800"
+                        }`}
+                      >
+                        Voice ({voiceCount})
+                      </button>
+                    );
+                  })()}
+                </div>
+              </div>
+
+              {/* Items List */}
+              <div className="flex-1 overflow-y-auto p-4 space-y-2.5">
+                {filteredDriveLinks.length === 0 ? (
+                  <div className="h-48 flex flex-col items-center justify-center text-center p-4 text-xs text-slate-400 space-y-2">
+                    <Cloud className="w-8 h-8 text-slate-600" />
+                    <div>Không tìm thấy link Google Drive nào phù hợp.</div>
+                  </div>
+                ) : (
+                  filteredDriveLinks.map((item) => {
+                    const catMeta = SHOT_CATEGORIES.find(
+                      (c) => c.id === item.category,
+                    );
+                    return (
+                      <div
+                        key={`${item.category}-${item.id}`}
+                        className="p-3 rounded-xl bg-slate-950/80 border border-slate-800/90 hover:border-slate-700 transition space-y-2"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span
+                              className={`text-[10px] font-bold px-2 py-0.5 rounded-full border shrink-0 ${
+                                item.category === "voice"
+                                  ? "border-indigo-500/40 text-indigo-300 bg-indigo-500/10"
+                                  : catMeta?.badgeClass ||
+                                    "border-slate-700 text-slate-200"
+                              }`}
+                            >
+                              {item.category === "voice"
+                                ? "Voice"
+                                : catMeta?.label || item.category}
+                            </span>
+                            <span
+                              className="text-xs font-medium text-slate-200 truncate"
+                              title={item.name}
+                            >
+                              {item.name}
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {item.duration > 0 && (
+                              <span className="text-xs font-mono text-slate-400 bg-slate-900 px-2 py-0.5 rounded border border-slate-800">
+                                {item.duration.toFixed(1)}s
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (item.category === "voice") {
+                                  handleRemoveVoiceItem(item.id);
+                                } else {
+                                  handleRemoveCategoryItem(
+                                    item.category as ShotCategory,
+                                    item.id,
+                                  );
+                                }
+                                addToast({
+                                  type: "info",
+                                  text: "Đã xóa clip khỏi kho.",
+                                });
+                              }}
+                              className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition"
+                              title="Xóa khỏi kho"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Link detail row */}
+                        <div className="flex items-center justify-between gap-2 bg-slate-900/80 px-2.5 py-1.5 rounded-lg border border-slate-800/80 text-[11px] font-mono">
+                          <a
+                            href={item.driveUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-sky-400 hover:text-sky-300 hover:underline truncate inline-flex items-center gap-1.5"
+                            title={`Mở link trên Google Drive: ${item.driveUrl}`}
+                          >
+                            <Cloud className="w-3 h-3 text-sky-400 shrink-0" />
+                            <span className="truncate">{item.driveUrl}</span>
+                            <ExternalLink className="w-3 h-3 opacity-70 shrink-0" />
+                          </a>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard.writeText(item.driveUrl);
+                              addToast({
+                                type: "info",
+                                text: "Đã sao chép link Google Drive vào clipboard.",
+                              });
+                            }}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition shrink-0 text-[10px]"
+                            title="Sao chép link"
+                          >
+                            <Copy className="w-3 h-3" />
+                            <span>Sao chép</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Footer */}
+              <div className="p-4 border-t border-slate-800 bg-slate-950/90 flex items-center justify-between">
+                <span className="text-xs text-slate-400 font-mono">
+                  Hiển thị {filteredDriveLinks.length} / {allDriveLinks.length}{" "}
+                  link Drive
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowDriveHistoryDrawer(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition"
+                >
+                  Đóng
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Single Category Google Drive Paste Modal */}
       {singleCategoryDriveModal && (
@@ -4463,6 +6335,66 @@ export default function StudioWorkspace({
                   <Trash2 className="w-3.5 h-3.5" />
                 )}
                 <span>{isClearingAll ? "Đang xóa..." : "Xác nhận xóa sạch"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear Render History Confirmation Modal */}
+      {showClearHistoryConfirmModal && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-slate-700/80 rounded-2xl max-w-md w-full p-6 space-y-5 shadow-2xl relative overflow-hidden animate-in zoom-in-95 duration-200">
+            {/* Ambient subtle glow */}
+            <div className="absolute -top-10 -right-10 w-32 h-32 bg-rose-500/15 rounded-full blur-3xl pointer-events-none" />
+
+            <div className="flex items-start gap-3.5">
+              <div className="w-10 h-10 rounded-xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center shrink-0 text-rose-400">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-sm font-bold text-white">
+                  Xác nhận xóa toàn bộ lịch sử
+                </h3>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Bạn có chắc chắn muốn xóa toàn bộ lịch sử các video đã render của dự án này?
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-slate-950/70 border border-slate-800 p-3 space-y-1.5 text-[11px] text-slate-400">
+              <div className="flex items-center gap-2 text-amber-300 font-medium">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>Lưu ý quan trọng:</span>
+              </div>
+              <ul className="list-disc list-inside space-y-1 pl-1 text-slate-300">
+                <li>Toàn bộ {renderedHistoryList.length} bản ghi video đã render sẽ bị xóa khỏi lịch sử.</li>
+                <li>Sau khi xóa, các mẻ trộn tiếp theo có thể trùng với các clip/tổ hợp đã từng render trước đây.</li>
+                <li>Hành động này không thể hoàn tác.</li>
+              </ul>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                disabled={isClearingHistory}
+                onClick={() => setShowClearHistoryConfirmModal(false)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition disabled:opacity-50"
+              >
+                Hủy bỏ
+              </button>
+              <button
+                type="button"
+                disabled={isClearingHistory}
+                onClick={handleConfirmClearHistory}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold transition shadow-lg shadow-rose-600/25 disabled:opacity-50"
+              >
+                {isClearingHistory ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+                <span>{isClearingHistory ? "Đang xóa..." : "Xác nhận xóa"}</span>
               </button>
             </div>
           </div>

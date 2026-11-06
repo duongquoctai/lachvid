@@ -12,6 +12,8 @@ import {
   Info,
   Layers,
   Loader2,
+  MoreVertical,
+  Pencil,
   Plus,
   Trash2,
   X,
@@ -34,6 +36,11 @@ export default function HomePage() {
   const [showCreateModal, setShowCreateModal] = useState<boolean>(false);
   const [newProjectName, setNewProjectName] = useState<string>("");
   const [newProjectDesc, setNewProjectDesc] = useState<string>("");
+  const [editingProject, setEditingProject] = useState<ProjectItem | null>(null);
+  const [editProjectName, setEditProjectName] = useState<string>("");
+  const [editProjectDesc, setEditProjectDesc] = useState<string>("");
+  const [isUpdating, setIsUpdating] = useState<boolean>(false);
+  const [openMenuProjectId, setOpenMenuProjectId] = useState<string | null>(null);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
 
   const [toasts, setToasts] = useState<
@@ -92,6 +99,13 @@ export default function HomePage() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!openMenuProjectId) return;
+    const handleClickOutside = () => setOpenMenuProjectId(null);
+    window.addEventListener("click", handleClickOutside);
+    return () => window.removeEventListener("click", handleClickOutside);
+  }, [openMenuProjectId]);
+
   const handleCreateProject = async () => {
     if (!newProjectName.trim()) {
       addToast({ type: "error", text: "Vui lòng nhập tên dự án." });
@@ -126,6 +140,59 @@ export default function HomePage() {
       addToast({ type: "error", text: msg });
     } finally {
       setBusyMessage(null);
+    }
+  };
+
+  const handleOpenEditModal = (p: ProjectItem, e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setEditingProject(p);
+    setEditProjectName(p.name);
+    setEditProjectDesc(p.description || "");
+  };
+
+  const handleUpdateProject = async () => {
+    if (!editingProject) return;
+    const trimmed = editProjectName.trim();
+    if (!trimmed) {
+      addToast({ type: "error", text: "Vui lòng nhập tên dự án." });
+      return;
+    }
+    setIsUpdating(true);
+    try {
+      const res = await fetch(`/api/project/${editingProject.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: trimmed,
+          description: editProjectDesc.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Không thể cập nhật dự án");
+
+      setProjectList((prev) =>
+        prev.map((item) =>
+          item.id === editingProject.id
+            ? {
+                ...item,
+                name: trimmed,
+                description: editProjectDesc.trim(),
+                updatedAt: new Date().toISOString(),
+              }
+            : item
+        )
+      );
+      setEditingProject(null);
+      addToast({
+        type: "success",
+        text: `Đã cập nhật tên dự án thành "${trimmed}".`,
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast({ type: "error", text: msg });
+    } finally {
+      setIsUpdating(false);
     }
   };
 
@@ -166,11 +233,8 @@ export default function HomePage() {
             <Film className="w-5 h-5 text-white" />
           </div>
           <div>
-            <h1 className="text-base font-extrabold tracking-tight flex items-center gap-2">
-              <span>LachVid Studio</span>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40">
-                PRO 2.0
-              </span>
+            <h1 className="text-base font-extrabold tracking-tight">
+              <span>Lachvid Studio</span>
             </h1>
             <p className="text-xs text-slate-400">
               Hệ thống tách video slicer & trộn lách content mỹ phẩm
@@ -243,7 +307,9 @@ export default function HomePage() {
                 <Link
                   key={p.id}
                   href={`/projects/${p.id}`}
-                  className="group bg-slate-900/80 hover:bg-slate-900 border border-slate-800 hover:border-indigo-500/50 rounded-2xl p-5 space-y-4 cursor-pointer transition-all hover:shadow-xl hover:shadow-indigo-950/40 relative flex flex-col justify-between"
+                  className={`group bg-slate-900/80 hover:bg-slate-900 border border-slate-800 hover:border-indigo-500/50 rounded-2xl p-5 space-y-4 cursor-pointer transition-all hover:shadow-xl hover:shadow-indigo-950/40 relative flex flex-col justify-between ${
+                    openMenuProjectId === p.id ? "z-20 border-slate-700" : "z-0"
+                  }`}
                 >
                   <div className="space-y-2.5">
                     <div className="flex items-start justify-between gap-3">
@@ -261,14 +327,60 @@ export default function HomePage() {
                         </div>
                       </div>
 
-                      <button
-                        type="button"
-                        onClick={(e) => handleDeleteProject(p.id, p.name, e)}
-                        className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition"
-                        title="Xóa dự án"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                      <div className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            setOpenMenuProjectId((prev) => (prev === p.id ? null : p.id));
+                          }}
+                          className={`p-1.5 rounded-lg transition ${
+                            openMenuProjectId === p.id
+                              ? "text-white bg-slate-800"
+                              : "text-slate-500 hover:text-slate-300 hover:bg-slate-800"
+                          }`}
+                          title="Tùy chọn"
+                        >
+                          <MoreVertical className="w-4 h-4" />
+                        </button>
+
+                        {openMenuProjectId === p.id && (
+                          <div
+                            className="absolute right-0 top-full mt-1.5 w-36 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl py-1 z-30 animate-in fade-in zoom-in-95 duration-150 backdrop-blur-md"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              e.preventDefault();
+                            }}
+                          >
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                setOpenMenuProjectId(null);
+                                handleOpenEditModal(p, e);
+                              }}
+                              className="w-full px-3 py-2 text-left text-xs font-medium text-slate-300 hover:text-white hover:bg-indigo-600/20 flex items-center gap-2 transition"
+                            >
+                              <Pencil className="w-3.5 h-3.5 text-indigo-400" />
+                              <span>Sửa tên</span>
+                            </button>
+
+                            <div className="h-px bg-slate-800 my-1" />
+
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                setOpenMenuProjectId(null);
+                                handleDeleteProject(p.id, p.name, e);
+                              }}
+                              className="w-full px-3 py-2 text-left text-xs font-medium text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 flex items-center gap-2 transition"
+                            >
+                              <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                              <span>Xóa</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     </div>
 
                     {p.description && (
@@ -369,6 +481,81 @@ export default function HomePage() {
                 className="inline-flex items-center gap-1.5 px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow-lg shadow-indigo-600/30 disabled:opacity-50"
               >
                 <span>Tạo dự án</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal chỉnh sửa dự án */}
+      {editingProject && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
+                  <Pencil className="w-4 h-4" />
+                </div>
+                <h3 className="text-sm font-bold text-white">Chỉnh sửa tên dự án</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingProject(null)}
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3.5">
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-300">
+                  Tên dự án / Thương hiệu <span className="text-rose-400">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={editProjectName}
+                  onChange={(e) => setEditProjectName(e.target.value)}
+                  placeholder="Nhập tên mới cho dự án..."
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 transition"
+                  autoFocus
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleUpdateProject();
+                  }}
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-300">
+                  Mô tả dự án (Tùy chọn)
+                </label>
+                <textarea
+                  rows={2}
+                  value={editProjectDesc}
+                  onChange={(e) => setEditProjectDesc(e.target.value)}
+                  placeholder="Ghi chú về chiến dịch, sản phẩm, hướng dẫn..."
+                  className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 transition resize-none"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setEditingProject(null)}
+                disabled={isUpdating}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition disabled:opacity-50"
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                disabled={!editProjectName.trim() || isUpdating}
+                onClick={handleUpdateProject}
+                className="inline-flex items-center gap-1.5 px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow-lg shadow-indigo-600/30 disabled:opacity-50"
+              >
+                {isUpdating && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>Lưu thay đổi</span>
               </button>
             </div>
           </div>

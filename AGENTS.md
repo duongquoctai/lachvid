@@ -1,6 +1,6 @@
 # Quy định & Hướng dẫn dành cho AI Agents (AGENTS.md)
 
-Tài liệu này ghi chú các quy chuẩn bắt buộc mà toàn bộ AI Agents / Developers phải tuân thủ nghiêm ngặt khi phát triển, chỉnh sửa và tạo mới code trong dự án **LachVid Studio**.
+Tài liệu này ghi chú các quy chuẩn bắt buộc mà toàn bộ AI Agents / Developers phải tuân thủ nghiêm ngặt khi phát triển, chỉnh sửa và tạo mới code trong dự án **Lachvid Studio**.
 
 ---
 
@@ -16,7 +16,7 @@ Tài liệu này ghi chú các quy chuẩn bắt buộc mà toàn bộ AI Agents
    - Nếu có mở ngoặc giải thích ở cuối tiêu đề, chỉ viết hoa chữ cái đầu trong ngoặc nếu cần (hoặc viết thường theo ngữ cảnh), không viết hoa toàn bộ từng chữ trong ngoặc.
    - Các từ tiếng Việt thông thường ở giữa câu/tiêu đề **bắt buộc viết thường**.
 2. **Ngoại lệ được phép giữ nguyên**:
-   - Tên thương hiệu riêng: `Zvid`, `TikTok`, `LachVid`, `Google`, v.v.
+   - Tên thương hiệu riêng: `Zvid`, `TikTok`, `Lachvid`, `Google`, v.v.
    - Thuật ngữ / định dạng / từ viết tắt kỹ thuật: `API`, `MP4`, `MP3`, `ZIP`, `JSON`, `FFmpeg`, `CDN`, `URL`, `ID`, v.v.
    - Tên người / hiệu ứng mang tên riêng: `Ken Burns`.
 
@@ -65,7 +65,7 @@ Quy tắc trên áp dụng cho:
 
 ---
 
-## 3. Tech Stack & Cấu hình dự án LachVid Studio
+## 3. Tech Stack & Cấu hình dự án Lachvid Studio
 - **Next.js**: 16.4.3 (Turbopack)
 - **React**: 19.3.1 (Hỗ trợ React automatic runtime & React Hooks rule)
 - **Font**: GeistSans (`geist/font/sans`) được cấu hình global toàn app

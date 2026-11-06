@@ -4,10 +4,13 @@ import {
   deleteProject,
   getProjectById,
   getProjectCategoryPools,
+  getProjectVoiceTracks,
   getProjects,
   getRenderedHistory,
   recordRenderedVideos,
   clearProjectRenderedHistory,
+  deleteRenderedHistoryItem,
+  updateRenderedHistoryStatus,
 } from "@/lib/db";
 import {
   clearSessionCategories,
@@ -36,12 +39,16 @@ export async function GET(req: NextRequest) {
       if (!project) {
         return NextResponse.json({ error: "Không tìm thấy dự án" }, { status: 404 });
       }
-      const pools = await getProjectCategoryPools(id);
-      const historyRecords = await getRenderedHistory(id);
+      const [pools, voices, historyRecords] = await Promise.all([
+        getProjectCategoryPools(id),
+        getProjectVoiceTracks(id),
+        getRenderedHistory(id),
+      ]);
       return NextResponse.json({
         success: true,
         project,
         categoryPools: pools,
+        voiceTracks: voices,
         renderedCount: historyRecords.length,
       });
     }
@@ -81,12 +88,12 @@ export async function POST(req: NextRequest) {
 
     if (action === "record_render") {
       const projectId = body.projectId as string;
-      const records = body.records as Array<{ tupleKey: string; name?: string }>;
+      const records = body.records as Array<{ tupleKey: string; name?: string; payload?: unknown }>;
       if (!projectId || !records || records.length === 0) {
         return NextResponse.json({ error: "Thiếu dữ liệu ghi nhận render" }, { status: 400 });
       }
       await recordRenderedVideos(projectId, records);
-      return NextResponse.json({ success: true, count: records.length });
+      return NextResponse.json({ success: true, count: records.length, addedCount: records.length });
     }
 
     if (action === "clear_history") {
@@ -96,6 +103,25 @@ export async function POST(req: NextRequest) {
       }
       await clearProjectRenderedHistory(projectId);
       return NextResponse.json({ success: true });
+    }
+
+    if (action === "delete_history_item") {
+      const id = body.id as string;
+      if (!id) {
+        return NextResponse.json({ error: "Thiếu id bản ghi" }, { status: 400 });
+      }
+      await deleteRenderedHistoryItem(id);
+      return NextResponse.json({ success: true });
+    }
+
+    if (action === "update_render_status") {
+      const id = body.id as string;
+      const status = body.status === "used" ? "used" : "unused";
+      if (!id) {
+        return NextResponse.json({ error: "Thiếu id bản ghi" }, { status: 400 });
+      }
+      await updateRenderedHistoryStatus(id, status);
+      return NextResponse.json({ success: true, status });
     }
 
     if (action === "reset_source") {

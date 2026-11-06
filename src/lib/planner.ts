@@ -63,6 +63,36 @@ export function computeHammingDistance(
   return diff;
 }
 
+/**
+ * Compares two shot identifiers or fingerprints for identity equivalence.
+ * Matches:
+ * - Direct equality (e.g. hash:abc === hash:abc, or id1 === id1)
+ * - Drive file ID equivalence (e.g. drive_open_XXX vs gdrive:XXX)
+ */
+export function isSameShotFingerprint(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const cleanA = a.replace(/^drive_[^_]+_/, "").replace(/^gdrive:/, "");
+  const cleanB = b.replace(/^drive_[^_]+_/, "").replace(/^gdrive:/, "");
+  return cleanA === cleanB;
+}
+
+/**
+ * Computes the semantic Hamming distance between two tuples, accounting for content hashes and drive IDs.
+ */
+export function computeFingerprintHammingDistance(
+  tupleA: [string, string, string, string, string],
+  tupleB: [string, string, string, string, string]
+): number {
+  let diff = 0;
+  for (let i = 0; i < 5; i++) {
+    if (!isSameShotFingerprint(tupleA[i], tupleB[i])) {
+      diff++;
+    }
+  }
+  return diff;
+}
+
 export interface PlannerResult {
   tuples: [Shot, Shot, Shot, Shot, Shot][];
   maxPossibleCombinations: number;
@@ -74,12 +104,15 @@ export interface PlannerResult {
 
 /**
  * Extracts a stable fingerprint for a shot:
- * - If driveFileId exists: gdrive:<driveFileId>
- * - Otherwise cleans dynamic suffix like _<timestamp>
+ * - Priority 1: contentHash (head 64KB + totalSizeBytes md5 hash) -> recognizes identical videos across different Drive links
+ * - Priority 2: driveFileId -> gdrive:<driveFileId>
+ * - Priority 3: shot.id
  */
 export function getShotFingerprint(shot: Shot): string {
+  if (shot.contentHash) {
+    return `hash:${shot.contentHash}`;
+  }
   if (shot.id.startsWith("drive_")) {
-    // If it's a drive file, parse parts: drive_category_fileId
     const parts = shot.id.split("_");
     if (parts.length >= 3) {
       return `gdrive:${parts[2]}`;
@@ -171,6 +204,7 @@ export function planDiverseCombinations(
 
   const selected: [Shot, Shot, Shot, Shot, Shot][] = [];
   const selectedIds: [string, string, string, string, string][] = [];
+  const selectedFingerprints: [string, string, string, string, string][] = [];
   const shotUsageCounts: Record<string, number> = {};
   for (const s of shots) {
     shotUsageCounts[s.id] = 0;
@@ -207,6 +241,14 @@ export function planDiverseCombinations(
       candidateTuple[4].id,
     ];
 
+    const candFingerprints: [string, string, string, string, string] = [
+      getShotFingerprint(candidateTuple[0]),
+      getShotFingerprint(candidateTuple[1]),
+      getShotFingerprint(candidateTuple[2]),
+      getShotFingerprint(candidateTuple[3]),
+      getShotFingerprint(candidateTuple[4]),
+    ];
+
     // Check frequency cap
     let exceedsFreq = false;
     for (let k = 0; k < 5; k++) {
@@ -218,9 +260,10 @@ export function planDiverseCombinations(
     if (exceedsFreq) continue;
 
     // Check anti-collision with previously rendered history (Hamming >= 2)
+    // Matches by contentHash or drive ID so different links of same clip are recognized
     let violatesHistory = false;
     for (const histIds of parsedHistory) {
-      if (computeHammingDistance(candIds, histIds) < 2) {
+      if (computeFingerprintHammingDistance(candFingerprints, histIds) < 2) {
         violatesHistory = true;
         break;
       }
@@ -229,8 +272,8 @@ export function planDiverseCombinations(
 
     // Check pairwise Hamming distance against all already selected tuples in this batch
     let violatesHamming = false;
-    for (const prevIds of selectedIds) {
-      if (computeHammingDistance(candIds, prevIds) < minHamming) {
+    for (const prevFps of selectedFingerprints) {
+      if (computeFingerprintHammingDistance(candFingerprints, prevFps) < minHamming) {
         violatesHamming = true;
         break;
       }
@@ -240,6 +283,7 @@ export function planDiverseCombinations(
     // Candidate is valid! Add to selected
     selected.push(candidateTuple as [Shot, Shot, Shot, Shot, Shot]);
     selectedIds.push(candIds);
+    selectedFingerprints.push(candFingerprints);
     for (const id of candIds) {
       shotUsageCounts[id] = (shotUsageCounts[id] || 0) + 1;
     }
@@ -252,12 +296,12 @@ export function planDiverseCombinations(
   }
 
   let minPairwiseHamming = 5;
-  if (selectedIds.length <= 1) {
+  if (selectedFingerprints.length <= 1) {
     minPairwiseHamming = 5;
   } else {
-    for (let i = 0; i < selectedIds.length; i++) {
-      for (let j = i + 1; j < selectedIds.length; j++) {
-        const d = computeHammingDistance(selectedIds[i], selectedIds[j]);
+    for (let i = 0; i < selectedFingerprints.length; i++) {
+      for (let j = i + 1; j < selectedFingerprints.length; j++) {
+        const d = computeFingerprintHammingDistance(selectedFingerprints[i], selectedFingerprints[j]);
         if (d < minPairwiseHamming) minPairwiseHamming = d;
       }
     }
@@ -596,12 +640,13 @@ export function buildComposedVideo(params: {
   ];
 
   const now = new Date().toISOString();
+  const tupleKey = tuple.map((s) => getShotFingerprint(s)).join("|");
 
   return {
     id: existingId || `comp_${index + 1}_${Date.now()}`,
     jobId: existingJobId || crypto.randomUUID(),
     name: `Video Remix #${index + 1}`,
-    tupleKey: shotIds.join("|"),
+    tupleKey,
     shotIds,
     slots: resolvedSlots,
     totalVisualDuration,
