@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   deleteProject,
+  getFoldersByParentId,
   getProjectById,
   getProjectCategoryPools,
   getProjectVoiceTracks,
@@ -19,10 +20,11 @@ export async function GET(
     if (!project) {
       return NextResponse.json({ error: "Không tìm thấy dự án" }, { status: 404 });
     }
-    const [pools, voices, historyRecords] = await Promise.all([
+    const [pools, voices, historyRecords, siblingFolders] = await Promise.all([
       getProjectCategoryPools(id),
       getProjectVoiceTracks(id),
       getRenderedHistory(id),
+      project.parentProjectId ? getFoldersByParentId(project.parentProjectId) : Promise.resolve([]),
     ]);
 
     return NextResponse.json({
@@ -31,6 +33,10 @@ export async function GET(
       categoryPools: pools,
       voiceTracks: voices,
       renderedCount: historyRecords.length,
+      siblingFolders: siblingFolders.map((f) => ({
+        id: f.id,
+        name: f.name,
+      })),
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

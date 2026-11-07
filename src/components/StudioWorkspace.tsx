@@ -1,18 +1,15 @@
 "use client";
 
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-import JSZip from "jszip";
+import IPhoneVideoTrimmer from "@/components/IPhoneVideoTrimmer";
+import PreviewPlayer916 from "@/components/PreviewPlayer916";
 import {
-  AudioVideoSyncMode,
+  extractGoogleDriveFileId,
+  parseExcelFiveColumnClipboard,
+} from "@/lib/drive";
+import { CATEGORY_ORDER, recalculateComposedVideo } from "@/lib/planner";
+import {
   CategoryMinDurations,
   CategoryPools,
-  CategoryVideoItem,
   ComposedVideo,
   computeShotSpeedForMinDuration,
   DEFAULT_CATEGORY_MIN_DURATIONS,
@@ -21,30 +18,29 @@ import {
   RenderedVideoRecord,
   ResolvedShotSlot,
   Shot,
-  ShotEdits,
   SHOT_CATEGORIES,
   ShotCategory,
+  ShotEdits,
   VoiceTrack,
 } from "@/types/lachvid";
-import { CATEGORY_ORDER, recalculateComposedVideo } from "@/lib/planner";
-import PreviewPlayer916 from "@/components/PreviewPlayer916";
-import IPhoneVideoTrimmer from "@/components/IPhoneVideoTrimmer";
-import Link from "next/link";
+import JSZip from "jszip";
 import {
   AlertTriangle,
   ArrowLeft,
-  ArrowRight,
+  ArrowUpDown,
+  Check,
+  CheckCheck,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  ChevronUp,
   Clock,
+  Cloud,
   Code2,
   Copy,
   Download,
   Edit3,
-  Cloud,
+  ExternalLink,
   FileSpreadsheet,
   Film,
   FlipHorizontal,
@@ -53,7 +49,6 @@ import {
   FolderSync,
   History,
   Info,
-  KeyRound,
   Layers,
   Link2,
   Loader2,
@@ -66,8 +61,7 @@ import {
   RefreshCw,
   RotateCcw,
   Scissors,
-  Send,
-  ShieldCheck,
+  Search,
   Shuffle,
   Sliders,
   Sparkles,
@@ -77,17 +71,16 @@ import {
   Upload,
   Wand2,
   X,
-  ArrowUpDown,
-  Check,
-  Eye,
-  Search,
-  ExternalLink,
 } from "lucide-react";
+import Link from "next/link";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import * as XLSX from "xlsx";
-import {
-  parseExcelFiveColumnClipboard,
-  extractGoogleDriveFileId,
-} from "@/lib/drive";
 
 const VALID_TABS = ["split", "mix", "history"] as const;
 type WorkspaceTab = (typeof VALID_TABS)[number];
@@ -95,6 +88,7 @@ type WorkspaceTab = (typeof VALID_TABS)[number];
 interface StudioWorkspaceProps {
   projectId: string;
   projectName?: string;
+  parentProjectId?: string;
   initialTab?: string;
 }
 
@@ -129,13 +123,40 @@ const createDefaultState = (): ProjectState => ({
 export default function StudioWorkspace({
   projectId,
   projectName,
+  parentProjectId,
   initialTab,
 }: StudioWorkspaceProps) {
   const [currentProjectName, setCurrentProjectName] = useState<string>(
-    projectName || "",
+    projectName || ""
   );
+  const [parentProjectIdState, setParentProjectIdState] = useState<string>(
+    parentProjectId || ""
+  );
+  const [parentProjectNameState, setParentProjectNameState] = useState<string>("");
+  const [siblingFolders, setSiblingFolders] = useState<
+    Array<{ id: string; name: string }>
+  >([]);
+  const [showFolderSwitcher, setShowFolderSwitcher] = useState<boolean>(false);
+  const folderSwitcherRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!showFolderSwitcher) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (
+        folderSwitcherRef.current &&
+        !folderSwitcherRef.current.contains(e.target as Node)
+      ) {
+        setShowFolderSwitcher(false);
+      }
+    };
+    window.addEventListener("mousedown", handleClickOutside);
+    return () => window.removeEventListener("mousedown", handleClickOutside);
+  }, [showFolderSwitcher]);
+
   const [projectRenderedCount, setProjectRenderedCount] = useState<number>(0);
-  const [renderedHistoryList, setRenderedHistoryList] = useState<RenderedVideoRecord[]>([]);
+  const [renderedHistoryList, setRenderedHistoryList] = useState<
+    RenderedVideoRecord[]
+  >([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState<boolean>(false);
   const [mainTab, setMainTabState] = useState<WorkspaceTab>(() => {
     if (initialTab && (VALID_TABS as readonly string[]).includes(initialTab)) {
@@ -173,12 +194,17 @@ export default function StudioWorkspace({
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
-  const [historyFilterStatus, setHistoryFilterStatus] = useState<"all" | "unused" | "used">("all");
+  const [historyFilterStatus, setHistoryFilterStatus] = useState<
+    "all" | "unused" | "used"
+  >("all");
   const [historySearchText, setHistorySearchText] = useState<string>("");
-  const [historySortOrder, setHistorySortOrder] = useState<"desc" | "asc">("desc");
+  const [historySortOrder, setHistorySortOrder] = useState<"desc" | "asc">(
+    "desc"
+  );
   const [historyPage, setHistoryPage] = useState<number>(1);
   const [historyPageSize, setHistoryPageSize] = useState<number>(10);
-  const [selectedHistoryDetail, setSelectedHistoryDetail] = useState<RenderedVideoRecord | null>(null);
+  const [selectedHistoryDetail, setSelectedHistoryDetail] =
+    useState<RenderedVideoRecord | null>(null);
   const [showExportMenu, setShowExportMenu] = useState<boolean>(false);
   const [state, setState] = useState<ProjectState>(() => createDefaultState());
 
@@ -191,7 +217,7 @@ export default function StudioWorkspace({
   const [pyThreshold, setPyThreshold] = useState<number>(27.0);
   const [pyMinSceneLen, setPyMinSceneLen] = useState<number>(0.8);
   const [pyDetector, setPyDetector] = useState<"content" | "adaptive">(
-    "content",
+    "content"
   );
   const [isSlicing, setIsSlicing] = useState<boolean>(false);
   const [sourceBlobUrl, setSourceBlobUrl] = useState<string | null>(null);
@@ -201,7 +227,9 @@ export default function StudioWorkspace({
     if (typeof window !== "undefined") {
       let sid = localStorage.getItem("lachvid_session_id");
       if (!sid) {
-        sid = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+        sid = `sess_${Date.now().toString(36)}_${Math.random()
+          .toString(36)
+          .slice(2, 8)}`;
         localStorage.setItem("lachvid_session_id", sid);
       }
       return sid;
@@ -222,11 +250,12 @@ export default function StudioWorkspace({
   });
   const [multiVoices, setMultiVoices] = useState<MultiVoiceItem[]>([]);
   const [selectedComposedId, setSelectedComposedId] = useState<string | null>(
-    null,
+    null
   );
   const [targetMixDuration, setTargetMixDuration] = useState<number>(20);
   const [targetMixCount, setTargetMixCount] = useState<number>(10);
   const [mixVoiceMode, setMixVoiceMode] = useState<"none" | "rotate">("rotate");
+  const [clipNamePrefix, setClipNamePrefix] = useState<string>(projectName || "");
   const [editingSlotCategory, setEditingSlotCategory] =
     useState<ShotCategory | null>(null);
   const [activeSlotFocusIndex, setActiveSlotFocusIndex] = useState<
@@ -262,12 +291,23 @@ export default function StudioWorkspace({
   const [showClearHistoryConfirmModal, setShowClearHistoryConfirmModal] =
     useState<boolean>(false);
   const [isClearingHistory, setIsClearingHistory] = useState<boolean>(false);
+  const [showMarkAllRenderedModal, setShowMarkAllRenderedModal] =
+    useState<boolean>(false);
+  const [isMarkingAllRendered, setIsMarkingAllRendered] =
+    useState<boolean>(false);
+  const [historyItemPendingDelete, setHistoryItemPendingDelete] =
+    useState<RenderedVideoRecord | null>(null);
+  const [isDeletingHistoryItem, setIsDeletingHistoryItem] =
+    useState<boolean>(false);
 
   // Google Drive History & Search states
-  const [showDriveHistoryDrawer, setShowDriveHistoryDrawer] = useState<boolean>(false);
-  const [driveHistorySearchText, setDriveHistorySearchText] = useState<string>("");
-  const [driveHistoryCategoryFilter, setDriveHistoryCategoryFilter] =
-    useState<"all" | ShotCategory | "voice">("all");
+  const [showDriveHistoryDrawer, setShowDriveHistoryDrawer] =
+    useState<boolean>(false);
+  const [driveHistorySearchText, setDriveHistorySearchText] =
+    useState<string>("");
+  const [driveHistoryCategoryFilter, setDriveHistoryCategoryFilter] = useState<
+    "all" | ShotCategory | "voice"
+  >("all");
   const [quickCheckInput, setQuickCheckInput] = useState<string>("");
 
   // Audition voice state
@@ -361,7 +401,7 @@ export default function StudioWorkspace({
 
     if (driveHistoryCategoryFilter !== "all") {
       result = result.filter(
-        (it) => it.category === driveHistoryCategoryFilter,
+        (it) => it.category === driveHistoryCategoryFilter
       );
     }
 
@@ -393,13 +433,15 @@ export default function StudioWorkspace({
   const addToast = useCallback(
     (toast: { type: "info" | "success" | "error"; text: string } | null) => {
       if (!toast) return;
-      const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const id = `toast_${Date.now()}_${Math.random()
+        .toString(36)
+        .slice(2, 7)}`;
       setToasts((prev) => [...prev, { id, ...toast }]);
       setTimeout(() => {
         setToasts((prev) => prev.filter((t) => t.id !== id));
       }, 5000);
     },
-    [],
+    []
   );
 
   const removeToast = useCallback((id: string) => {
@@ -455,7 +497,7 @@ export default function StudioWorkspace({
   });
   const voiceInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Load project details (name, categoryPools, renderedCount, settings) for this projectId
+  // Load project details (name, categoryPools, renderedCount, settings, siblingFolders) for this projectId
   useEffect(() => {
     if (!projectId) return;
     fetch(`/api/project/${projectId}`)
@@ -464,12 +506,26 @@ export default function StudioWorkspace({
         if (data.project?.name) {
           setCurrentProjectName(data.project.name);
         }
+        if (data.project?.parentProjectId) {
+          setParentProjectIdState(data.project.parentProjectId);
+        }
+        if (data.project?.parentProjectName) {
+          setParentProjectNameState(data.project.parentProjectName);
+        }
+        if (Array.isArray(data.siblingFolders)) {
+          setSiblingFolders(data.siblingFolders);
+        }
         if (data.categoryPools) {
           setCategoryPools(data.categoryPools);
         }
         if (data.voiceTracks) {
           setMultiVoices(data.voiceTracks);
         }
+
+        const fullDefaultPrefix = data.project?.parentProjectName
+          ? `${data.project.parentProjectName} - ${data.project.name || ""}`
+          : (data.project?.name || "");
+
         if (data.project?.settings) {
           const s = data.project.settings;
           if (typeof s.targetMixDuration === "number") {
@@ -481,6 +537,13 @@ export default function StudioWorkspace({
           if (s.mixVoiceMode === "none" || s.mixVoiceMode === "rotate") {
             setMixVoiceMode(s.mixVoiceMode);
           }
+          if (typeof s.clipNamePrefix === "string" && s.clipNamePrefix.trim()) {
+            setClipNamePrefix(s.clipNamePrefix.trim());
+          } else if (fullDefaultPrefix) {
+            setClipNamePrefix(fullDefaultPrefix);
+          }
+        } else if (fullDefaultPrefix) {
+          setClipNamePrefix(fullDefaultPrefix);
         }
         if (typeof data.renderedCount === "number") {
           setProjectRenderedCount(data.renderedCount);
@@ -509,7 +572,7 @@ export default function StudioWorkspace({
           }
           if (data.state.diversityConfig?.targetOutputDuration) {
             setTargetMixDuration(
-              data.state.diversityConfig.targetOutputDuration,
+              data.state.diversityConfig.targetOutputDuration
             );
           }
         }
@@ -517,10 +580,12 @@ export default function StudioWorkspace({
       .catch(() => {});
 
     fetch(
-      `/api/category-library?sessionId=${encodeURIComponent(sid)}&projectId=${encodeURIComponent(projectId)}`,
+      `/api/category-library?sessionId=${encodeURIComponent(
+        sid
+      )}&projectId=${encodeURIComponent(projectId)}`,
       {
         headers: { "x-session-id": sid },
-      },
+      }
     )
       .then((r) => r.json())
       .then((data) => {
@@ -553,6 +618,7 @@ export default function StudioWorkspace({
                 targetMixDuration,
                 targetMixCount,
                 mixVoiceMode,
+                clipNamePrefix,
                 categoryMinDurations: nextState.categoryMinDurations,
               },
             }),
@@ -562,7 +628,34 @@ export default function StudioWorkspace({
         // ignore transient save error
       }
     },
-    [sessionId],
+    [sessionId, projectId, targetMixDuration, targetMixCount, mixVoiceMode, clipNamePrefix]
+  );
+
+  const persistProjectSettings = useCallback(
+    (
+      overrides?: Partial<{
+        targetMixDuration: number;
+        targetMixCount: number;
+        mixVoiceMode: "none" | "rotate";
+        clipNamePrefix: string;
+      }>
+    ) => {
+      if (!projectId) return;
+      fetch(`/api/project/${projectId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          settings: {
+            targetMixDuration,
+            targetMixCount,
+            mixVoiceMode,
+            clipNamePrefix,
+            ...overrides,
+          },
+        }),
+      }).catch(() => {});
+    },
+    [projectId, targetMixDuration, targetMixCount, mixVoiceMode, clipNamePrefix]
   );
 
   // Auto-detect and sync exact video duration from browser decoder for all category pool items
@@ -586,7 +679,7 @@ export default function StudioWorkspace({
             setCategoryPools((prev) => {
               const currentList = prev[cat] || [];
               const updated = currentList.map((it) =>
-                it.id === item.id ? { ...it, duration: exactDur } : it,
+                it.id === item.id ? { ...it, duration: exactDur } : it
               );
               return { ...prev, [cat]: updated };
             });
@@ -619,8 +712,8 @@ export default function StudioWorkspace({
         if (Math.abs(exactDur - voice.duration) > 0.05) {
           setMultiVoices((prev) =>
             prev.map((v) =>
-              v.id === voice.id ? { ...v, duration: exactDur } : v,
-            ),
+              v.id === voice.id ? { ...v, duration: exactDur } : v
+            )
           );
         }
       };
@@ -669,7 +762,7 @@ export default function StudioWorkspace({
         },
       };
     },
-    [],
+    []
   );
 
   const selectedShot = useMemo(() => {
@@ -727,7 +820,7 @@ export default function StudioWorkspace({
   const selectedVoiceTrack: VoiceTrack | null = useMemo(() => {
     if (!selectedComposed?.voiceTrackId) return null;
     const found = multiVoices.find(
-      (v) => v.id === selectedComposed.voiceTrackId,
+      (v) => v.id === selectedComposed.voiceTrackId
     );
     if (found) {
       return {
@@ -780,7 +873,9 @@ export default function StudioWorkspace({
     ) {
       setStatusBanner({
         type: "error",
-        text: `File "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB) vượt quá giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy chọn video dưới 95 MB hoặc nén trước khi tải lên.`,
+        text: `File "${file.name}" (${(file.size / 1024 / 1024).toFixed(
+          1
+        )} MB) vượt quá giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy chọn video dưới 95 MB hoặc nén trước khi tải lên.`,
       });
       return;
     }
@@ -837,7 +932,9 @@ export default function StudioWorkspace({
       }
       setStatusBanner({
         type: "success",
-        text: `Đã nạp video "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB). Hãy bấm Auto detect hoặc tách cảnh thủ công!`,
+        text: `Đã nạp video "${file.name}" (${(file.size / 1024 / 1024).toFixed(
+          1
+        )} MB). Hãy bấm Auto detect hoặc tách cảnh thủ công!`,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -856,7 +953,7 @@ export default function StudioWorkspace({
       return;
     }
     setBusyMessage(
-      "Đang quét phân tích frame (PySceneDetect ContentDetector)...",
+      "Đang quét phân tích frame (PySceneDetect ContentDetector)..."
     );
     setStatusBanner(null);
     try {
@@ -904,7 +1001,7 @@ export default function StudioWorkspace({
       if (s.id !== shotId) return s;
       return applyMinDurationToShot(
         { ...s, category: newCat },
-        categoryMinDurations,
+        categoryMinDurations
       );
     });
     persistState({ ...state, shots: nextShots });
@@ -927,7 +1024,7 @@ export default function StudioWorkspace({
     slicerVideoRef.current.currentTime = targetShot.begin;
     slicerVideoRef.current.playbackRate = Math.min(
       4,
-      Math.max(0.25, targetShot.edits.speed || 1),
+      Math.max(0.25, targetShot.edits.speed || 1)
     );
     slicerVideoRef.current.play().catch(() => {});
     setIsPlayingSlicer(true);
@@ -947,7 +1044,7 @@ export default function StudioWorkspace({
       if (!state) return;
       const shotToSplit =
         state.shots.find(
-          (s) => targetSec > s.begin + 0.3 && targetSec < s.end - 0.3,
+          (s) => targetSec > s.begin + 0.3 && targetSec < s.end - 0.3
         ) || selectedShot;
 
       if (!shotToSplit) {
@@ -978,7 +1075,7 @@ export default function StudioWorkspace({
           rawEnd: cutPoint,
           label: `${shotToSplit.label} (P1)`,
         },
-        categoryMinDurations,
+        categoryMinDurations
       );
       const secondHalf = applyMinDurationToShot(
         {
@@ -991,7 +1088,7 @@ export default function StudioWorkspace({
           label: `${shotToSplit.label} (P2)`,
           edits: { ...shotToSplit.edits },
         },
-        categoryMinDurations,
+        categoryMinDurations
       );
 
       const nextShots: Shot[] = [];
@@ -1017,7 +1114,7 @@ export default function StudioWorkspace({
       applyMinDurationToShot,
       persistState,
       setStatusBanner,
-    ],
+    ]
   );
 
   // Merge shot with next shot
@@ -1043,7 +1140,7 @@ export default function StudioWorkspace({
         rawEnd: nextShot.rawEnd ?? nextShot.end,
         label: `${currentShot.label} + ${nextShot.label}`,
       },
-      categoryMinDurations,
+      categoryMinDurations
     );
 
     const nextShots = state.shots.filter((_, i) => i !== idx && i !== idx + 1);
@@ -1063,17 +1160,17 @@ export default function StudioWorkspace({
   const handleUpdateShotTrim = (
     shotId: string,
     newBegin: number,
-    newEnd: number,
+    newEnd: number
   ) => {
     if (!state) return;
     const maxDur = state.sourceVideo?.duration || 99999;
     const roundedBegin = Math.max(
       0,
-      Math.min(maxDur - 0.2, Math.round(newBegin * 10) / 10),
+      Math.min(maxDur - 0.2, Math.round(newBegin * 10) / 10)
     );
     const roundedEnd = Math.max(
       roundedBegin + 0.2,
-      Math.min(maxDur, Math.round(newEnd * 10) / 10),
+      Math.min(maxDur, Math.round(newEnd * 10) / 10)
     );
 
     const nextShots = state.shots.map((s) => {
@@ -1108,7 +1205,7 @@ export default function StudioWorkspace({
   const handleUpdateShotTime = (
     shotId: string,
     field: "begin" | "end",
-    val: number,
+    val: number
   ) => {
     if (!state) return;
     const rounded = Math.round(val * 10) / 10;
@@ -1132,7 +1229,7 @@ export default function StudioWorkspace({
     const nextShots = state.shots.map((s) =>
       s.id === shotId
         ? { ...s, edits: { ...s.edits, flipH: !s.edits.flipH } }
-        : s,
+        : s
     );
     persistState({ ...state, shots: nextShots });
   };
@@ -1142,7 +1239,7 @@ export default function StudioWorkspace({
     const nextShots = state.shots.map((s) =>
       s.id === shotId
         ? { ...s, edits: { ...s.edits, lockFlipH: !s.edits.lockFlipH } }
-        : s,
+        : s
     );
     persistState({ ...state, shots: nextShots });
   };
@@ -1150,7 +1247,7 @@ export default function StudioWorkspace({
   const handleSetSpeed = (shotId: string, speed: number) => {
     if (!state) return;
     const nextShots = state.shots.map((s) =>
-      s.id === shotId ? { ...s, edits: { ...s.edits, speed } } : s,
+      s.id === shotId ? { ...s, edits: { ...s.edits, speed } } : s
     );
     persistState({ ...state, shots: nextShots });
   };
@@ -1166,7 +1263,7 @@ export default function StudioWorkspace({
               zoom: depth ? { depth } : false,
             },
           }
-        : s,
+        : s
     );
     persistState({ ...state, shots: nextShots });
   };
@@ -1261,7 +1358,7 @@ export default function StudioWorkspace({
     }
     setIsSlicing(true);
     setBusyMessage(
-      "Đang cắt video thành các file .mp4 riêng biệt và nén ZIP...",
+      "Đang cắt video thành các file .mp4 riêng biệt và nén ZIP..."
     );
     try {
       const res = await fetch("/api/slice-scenes", {
@@ -1354,7 +1451,7 @@ export default function StudioWorkspace({
       }
 
       setBusyMessage(
-        "Đang ghi thẳng các file .mp4 vào đúng các thư mục trên máy tính...",
+        "Đang ghi thẳng các file .mp4 vào đúng các thư mục trên máy tính..."
       );
       const zipBlob = await res.blob();
       const zip = await JSZip.loadAsync(zipBlob);
@@ -1443,7 +1540,7 @@ export default function StudioWorkspace({
 
     setIsIngestingDrive(true);
     setBusyMessage(
-      `Đang nạp và kiểm tra ${parsedExcel.totalExtracted} link Google Drive từ các cột...`,
+      `Đang nạp và kiểm tra ${parsedExcel.totalExtracted} link Google Drive từ các cột...`
     );
     setStatusBanner(null);
 
@@ -1506,7 +1603,7 @@ export default function StudioWorkspace({
   // Nạp link Google Drive vào 1 cột category hoặc voice cụ thể
   const handleIngestSingleCategoryDrive = async (
     category: ShotCategory | "voice",
-    text: string,
+    text: string
   ) => {
     const rawLinks = text
       .split(/[\r\n,]+/)
@@ -1528,7 +1625,7 @@ export default function StudioWorkspace({
       category === "voice" ? "Voice (lồng tiếng)" : category.toUpperCase();
     setIsIngestingDrive(true);
     setBusyMessage(
-      `Đang nạp ${validFileIds.length} link vào mục ${catLabel}...`,
+      `Đang nạp ${validFileIds.length} link vào mục ${catLabel}...`
     );
     setStatusBanner(null);
 
@@ -1579,7 +1676,7 @@ export default function StudioWorkspace({
 
   // Master folder upload (reads all subfolders OPEN, PRODUCT, TEXTURE, APPLY, END)
   const handleMasterFolderUpload = async (
-    e: React.ChangeEvent<HTMLInputElement>,
+    e: React.ChangeEvent<HTMLInputElement>
   ) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
@@ -1593,7 +1690,9 @@ export default function StudioWorkspace({
     ) {
       setStatusBanner({
         type: "error",
-        text: `Tổng dung lượng thư mục (${(totalBytes / 1024 / 1024).toFixed(1)} MB) vượt giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy chia nhỏ hoặc nạp từng cột.`,
+        text: `Tổng dung lượng thư mục (${(totalBytes / 1024 / 1024).toFixed(
+          1
+        )} MB) vượt giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy chia nhỏ hoặc nạp từng cột.`,
       });
       if (masterFolderInputRef.current) masterFolderInputRef.current.value = "";
       return;
@@ -1633,7 +1732,7 @@ export default function StudioWorkspace({
   // Upload into a single specific category column
   const handleCategoryColumnUpload = async (
     category: ShotCategory,
-    files: FileList | null,
+    files: FileList | null
   ) => {
     if (!files || files.length === 0) return;
 
@@ -1646,7 +1745,9 @@ export default function StudioWorkspace({
     ) {
       setStatusBanner({
         type: "error",
-        text: `Tổng dung lượng file (${(totalBytes / 1024 / 1024).toFixed(1)} MB) vượt giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy tải từng file nhỏ hơn.`,
+        text: `Tổng dung lượng file (${(totalBytes / 1024 / 1024).toFixed(
+          1
+        )} MB) vượt giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy tải từng file nhỏ hơn.`,
       });
       if (categoryInputRefs.current[category]) {
         categoryInputRefs.current[category]!.value = "";
@@ -1655,7 +1756,7 @@ export default function StudioWorkspace({
     }
 
     setBusyMessage(
-      `Đang nạp ${files.length} video vào ${category.toUpperCase()}...`,
+      `Đang nạp ${files.length} video vào ${category.toUpperCase()}...`
     );
     try {
       const fd = new FormData();
@@ -1676,7 +1777,9 @@ export default function StudioWorkspace({
       setCategoryPools(data.categoryPools);
       setStatusBanner({
         type: "success",
-        text: `Đã thêm ${data.addedCount} video vào mục ${category.toUpperCase()}`,
+        text: `Đã thêm ${
+          data.addedCount
+        } video vào mục ${category.toUpperCase()}`,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1725,7 +1828,7 @@ export default function StudioWorkspace({
 
   const handleRemoveCategoryItem = async (
     cat: ShotCategory,
-    itemId: string,
+    itemId: string
   ) => {
     const fd = new FormData();
     fd.append("sessionId", sessionId);
@@ -1808,7 +1911,9 @@ export default function StudioWorkspace({
     if (!projectId) return;
     setIsLoadingHistory(true);
     try {
-      const res = await fetch(`/api/project?id=${encodeURIComponent(projectId)}&history=1`);
+      const res = await fetch(
+        `/api/project?id=${encodeURIComponent(projectId)}&history=1`
+      );
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data.history)) {
@@ -1824,22 +1929,10 @@ export default function StudioWorkspace({
   }, [projectId]);
 
   useEffect(() => {
-    let ignore = false;
-    if (mainTab === "history" && projectId) {
-      fetch(`/api/project?id=${encodeURIComponent(projectId)}&history=1`)
-        .then((res) => (res.ok ? res.json() : null))
-        .then((data) => {
-          if (!ignore && data?.history && Array.isArray(data.history)) {
-            setRenderedHistoryList(data.history);
-            setProjectRenderedCount(data.history.length);
-          }
-        })
-        .catch(() => {});
+    if (projectId) {
+      fetchRenderedHistory();
     }
-    return () => {
-      ignore = true;
-    };
-  }, [mainTab, projectId]);
+  }, [projectId, fetchRenderedHistory]);
 
   const handleConfirmClearHistory = async () => {
     if (!projectId) return;
@@ -1873,8 +1966,127 @@ export default function StudioWorkspace({
     }
   };
 
+  const unrecordedComposedCount = useMemo(() => {
+    if (!state?.composedVideos) return 0;
+    return state.composedVideos.filter(
+      (comp) => !renderedHistoryList.some((r) => r.tupleKey === comp.tupleKey)
+    ).length;
+  }, [state?.composedVideos, renderedHistoryList]);
+
+  const handleConfirmMarkAllRendered = async () => {
+    if (
+      !projectId ||
+      !state?.composedVideos ||
+      state.composedVideos.length === 0
+    ) {
+      setShowMarkAllRenderedModal(false);
+      return;
+    }
+
+    setIsMarkingAllRendered(true);
+    try {
+      const unrecordedVideos = state.composedVideos.filter(
+        (comp) => !renderedHistoryList.some((r) => r.tupleKey === comp.tupleKey)
+      );
+
+      if (unrecordedVideos.length === 0) {
+        addToast({
+          type: "info",
+          text: "Tất cả video trong danh sách tổ hợp đều đã có trong lịch sử render.",
+        });
+        setShowMarkAllRenderedModal(false);
+        return;
+      }
+
+      const records = unrecordedVideos.map((comp) => ({
+        tupleKey: comp.tupleKey,
+        name: comp.name,
+        payload: comp,
+      }));
+
+      const res = await fetch("/api/project", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "record_render",
+          projectId,
+          records,
+        }),
+      });
+
+      if (res.ok) {
+        await fetchRenderedHistory();
+        addToast({
+          type: "success",
+          text: `Đã đánh dấu thành công ${unrecordedVideos.length} video vào lịch sử render!`,
+        });
+        setStatusBanner({
+          type: "success",
+          text: `Đã ghi nhận ${unrecordedVideos.length} video tổ hợp vào lịch sử render mà không cần tải về máy.`,
+        });
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        addToast({
+          type: "error",
+          text:
+            errData.error || "Không thể lưu lịch sử render. Vui lòng thử lại.",
+        });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast({
+        type: "error",
+        text: `Lỗi: ${msg}`,
+      });
+    } finally {
+      setIsMarkingAllRendered(false);
+      setShowMarkAllRenderedModal(false);
+    }
+  };
+
+  const handleConfirmDeleteHistoryItem = async () => {
+    if (!historyItemPendingDelete?.id) return;
+    const item = historyItemPendingDelete;
+    setIsDeletingHistoryItem(true);
+    try {
+      const res = await fetch("/api/project", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "delete_history_item", id: item.id }),
+      });
+      if (res.ok) {
+        setRenderedHistoryList((prev) => prev.filter((r) => r.id !== item.id));
+        if (selectedHistoryDetail?.id === item.id) {
+          setSelectedHistoryDetail(null);
+        }
+        setProjectRenderedCount((prev) => Math.max(0, prev - 1));
+        addToast({
+          type: "success",
+          text: `Đã xóa video "${item.name || item.id}" khỏi lịch sử render.`,
+        });
+        setHistoryItemPendingDelete(null);
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        addToast({
+          type: "error",
+          text: errData.error || "Không thể xóa bản ghi video.",
+        });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast({ type: "error", text: msg });
+    } finally {
+      setIsDeletingHistoryItem(false);
+    }
+  };
+
   const handleDeleteHistoryItem = async (id?: string) => {
     if (!id) return;
+    const target = renderedHistoryList.find((r) => r.id === id);
+    if (target) {
+      setHistoryItemPendingDelete(target);
+      return;
+    }
     try {
       const res = await fetch("/api/project", {
         method: "POST",
@@ -1900,7 +2112,7 @@ export default function StudioWorkspace({
 
   const handleToggleHistoryStatus = async (
     record: RenderedVideoRecord,
-    e?: React.MouseEvent,
+    e?: React.MouseEvent
   ) => {
     if (e) e.stopPropagation();
     const newStatus: "unused" | "used" =
@@ -1908,11 +2120,11 @@ export default function StudioWorkspace({
 
     // Optimistic UI update
     setRenderedHistoryList((prev) =>
-      prev.map((r) => (r.id === record.id ? { ...r, status: newStatus } : r)),
+      prev.map((r) => (r.id === record.id ? { ...r, status: newStatus } : r))
     );
     if (selectedHistoryDetail?.id === record.id) {
       setSelectedHistoryDetail((prev) =>
-        prev ? { ...prev, status: newStatus } : null,
+        prev ? { ...prev, status: newStatus } : null
       );
     }
 
@@ -1938,12 +2150,12 @@ export default function StudioWorkspace({
     } catch (err: unknown) {
       setRenderedHistoryList((prev) =>
         prev.map((r) =>
-          r.id === record.id ? { ...r, status: record.status } : r,
-        ),
+          r.id === record.id ? { ...r, status: record.status } : r
+        )
       );
       if (selectedHistoryDetail?.id === record.id) {
         setSelectedHistoryDetail((prev) =>
-          prev ? { ...prev, status: record.status } : null,
+          prev ? { ...prev, status: record.status } : null
         );
       }
       const msg = err instanceof Error ? err.message : String(err);
@@ -1977,7 +2189,7 @@ export default function StudioWorkspace({
         const tupleMatch = (r.tupleKey || "").toLowerCase().includes(q);
         const comp = r.payload as ComposedVideo | undefined;
         const slotMatch = comp?.slots?.some((s) =>
-          (s.shotLabel || s.shotId || "").toLowerCase().includes(q),
+          (s.shotLabel || s.shotId || "").toLowerCase().includes(q)
         );
         return nameMatch || tupleMatch || slotMatch;
       });
@@ -1999,7 +2211,7 @@ export default function StudioWorkspace({
 
   const totalHistoryPages = Math.max(
     1,
-    Math.ceil(filteredHistoryList.length / historyPageSize),
+    Math.ceil(filteredHistoryList.length / historyPageSize)
   );
 
   const paginatedHistoryList = useMemo(() => {
@@ -2018,7 +2230,7 @@ export default function StudioWorkspace({
   ]);
 
   const getGoogleDriveLinkFromSlot = (
-    slot?: ResolvedShotSlot | null,
+    slot?: ResolvedShotSlot | null
   ): string => {
     if (!slot) return "";
     if (slot.localUrl?.startsWith("/api/drive-stream/")) {
@@ -2044,7 +2256,7 @@ export default function StudioWorkspace({
   };
 
   const getGoogleDriveLinkFromVoice = (
-    voice?: MultiVoiceItem | null,
+    voice?: MultiVoiceItem | null
   ): string => {
     if (!voice) return "";
     if (voice.driveRawUrl) return voice.driveRawUrl;
@@ -2124,7 +2336,7 @@ export default function StudioWorkspace({
 
     const projectNameSafe = (currentProjectName || "Lachvid").replace(
       /\s+/g,
-      "_",
+      "_"
     );
     const fileName = `Lich_su_render_${projectNameSafe}_${new Date()
       .toISOString()
@@ -2166,7 +2378,9 @@ export default function StudioWorkspace({
 
     setStatusBanner({
       type: "success",
-      text: `Đã xuất toàn bộ ${renderedHistoryList.length} video ra file ${format.toUpperCase()} thành công!`,
+      text: `Đã xuất toàn bộ ${
+        renderedHistoryList.length
+      } video ra file ${format.toUpperCase()} thành công!`,
     });
   };
 
@@ -2190,28 +2404,34 @@ export default function StudioWorkspace({
     setMainTab("mix");
     setStatusBanner({
       type: "success",
-      text: `Đang xem lại "${comp.name || rec.name || "Video đã render"}" trên màn hình preview 9:16.`,
+      text: `Đang xem lại "${
+        comp.name || rec.name || "Video đã render"
+      }" trên màn hình preview 9:16.`,
     });
   };
 
   // Plan Combinatorial Mix
   const handlePlanDiverseMix = async () => {
     const missingCats = CATEGORY_ORDER.filter(
-      (c) => (categoryPools[c]?.length || 0) === 0,
+      (c) => (categoryPools[c]?.length || 0) === 0
     );
     if (missingCats.length > 0) {
       setStatusBanner({
         type: "error",
-        text: `Còn thiếu video ở các Category: ${missingCats.map((c) => c.toUpperCase()).join(", ")}. Hãy upload đủ 5 Category để bắt đầu trộn!`,
+        text: `Còn thiếu video ở các Category: ${missingCats
+          .map((c) => c.toUpperCase())
+          .join(", ")}. Hãy upload đủ 5 Category để bắt đầu trộn!`,
       });
       return;
     }
 
     setBusyMessage(
-      "Đang tính toán các tổ hợp đa dạng tối ưu (Hamming distance, Speed Scale)...",
+      "Đang tính toán các tổ hợp đa dạng tối ưu (Hamming distance, Speed Scale)..."
     );
     setStatusBanner(null);
     const clampedMixCount = Math.max(1, Math.min(50, targetMixCount || 10));
+    const effectivePrefix = (clipNamePrefix || "").trim() || currentProjectName.trim() || "Video Remix";
+    persistProjectSettings({ clipNamePrefix: effectivePrefix });
 
     try {
       const res = await fetch("/api/plan-mix", {
@@ -2223,6 +2443,7 @@ export default function StudioWorkspace({
         body: JSON.stringify({
           sessionId,
           projectId: projectId || undefined,
+          clipNamePrefix: effectivePrefix,
           categoryPools,
           multiVoiceTracks: multiVoices,
           mixVoiceMode,
@@ -2265,7 +2486,7 @@ export default function StudioWorkspace({
   const handleUpdateComposedSlot = (
     composedId: string,
     slotIndex: number,
-    edits: Partial<ResolvedShotSlot>,
+    edits: Partial<ResolvedShotSlot>
   ) => {
     if (!state) return;
     const targetComp = state.composedVideos.find((c) => c.id === composedId);
@@ -2274,7 +2495,7 @@ export default function StudioWorkspace({
     let currentVoice: VoiceTrack | null = null;
     if (targetComp.voiceTrackId) {
       const foundMulti = state.multiVoiceTracks?.find(
-        (v) => v.id === targetComp.voiceTrackId,
+        (v) => v.id === targetComp.voiceTrackId
       );
       if (foundMulti) {
         currentVoice = {
@@ -2297,11 +2518,11 @@ export default function StudioWorkspace({
       slotIndex,
       edits,
       currentVoice,
-      state.syncMode,
+      state.syncMode
     );
 
     const updatedList = state.composedVideos.map((c) =>
-      c.id === composedId ? updatedComp : c,
+      c.id === composedId ? updatedComp : c
     );
 
     persistState({
@@ -2312,7 +2533,7 @@ export default function StudioWorkspace({
 
   const handleChangeComposedVoice = (
     composedId: string,
-    voiceId: string | null,
+    voiceId: string | null
   ) => {
     if (!state) return;
     const targetComp = state.composedVideos.find((c) => c.id === composedId);
@@ -2340,12 +2561,12 @@ export default function StudioWorkspace({
       -1,
       {},
       chosenVoice,
-      state.syncMode,
+      state.syncMode
     );
     updatedComp.voiceTrackId = voiceId;
 
     const updatedList = state.composedVideos.map((c) =>
-      c.id === composedId ? updatedComp : c,
+      c.id === composedId ? updatedComp : c
     );
 
     persistState({
@@ -2438,16 +2659,14 @@ export default function StudioWorkspace({
       name: "Đang khởi tạo FFmpeg...",
       percent: 0,
     });
-    setBusyMessage(
-      `Đang kết xuất ${totalCount} video MP4 và đóng gói ZIP...`,
-    );
+    setBusyMessage(`Đang kết xuất ${totalCount} video MP4 và đóng gói ZIP...`);
 
     let pollInterval: NodeJS.Timeout | null = null;
     try {
       pollInterval = setInterval(async () => {
         try {
           const pRes = await fetch(
-            `/api/render-progress?sessionId=${encodeURIComponent(sessionId)}`,
+            `/api/render-progress?sessionId=${encodeURIComponent(sessionId)}`
           );
           if (pRes.ok) {
             const pData = await pRes.json();
@@ -2533,17 +2752,16 @@ export default function StudioWorkspace({
     }
   };
 
-
-
-
-
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
       {/* Top Header & Two-Tab Navigation */}
       <header className="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800 px-6 py-3 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3">
           {/* Logo & Brand title */}
-          <Link href="/" className="flex items-center gap-3 hover:opacity-90 transition">
+          <Link
+            href="/"
+            className="flex items-center gap-3 hover:opacity-90 transition"
+          >
             <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-rose-500 to-indigo-500 flex items-center justify-center shadow-lg shadow-rose-500/20 shrink-0">
               <Film className="w-5 h-5 text-white" />
             </div>
@@ -2559,35 +2777,125 @@ export default function StudioWorkspace({
 
           <div className="h-6 w-px bg-slate-800 mx-1 hidden sm:block" />
 
-          {/* Button trở về Dự án & Tên Project */}
-          <div className="flex items-center gap-2">
+          {/* Breadcrumb Navigation: Dự án > Folder Switcher */}
+          <div className="flex items-center gap-1.5 sm:gap-2 text-xs">
             <Link
               href="/"
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs font-medium text-slate-300 hover:text-white transition"
-              title="Quay lại danh sách dự án"
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-900/80 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white transition"
+              title="Danh sách dự án"
             >
-              <ArrowLeft className="w-3.5 h-3.5" />
-              <span>Dự án</span>
+              <ArrowLeft className="w-3 h-3 sm:hidden" />
+              <span className="hidden sm:inline">Dự án</span>
             </Link>
-            {/* Current Project Pill */}
-            <div className="hidden sm:flex items-center gap-2 px-3 py-1 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-xs">
-              <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
-              <span className="font-bold text-white">{currentProjectName || "Dự án"}</span>
-              {projectRenderedCount > 0 && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMainTab("history");
-                    fetchRenderedHistory();
-                  }}
-                  className="text-[11px] font-mono text-indigo-300 hover:text-white bg-indigo-950/60 hover:bg-indigo-900/80 px-2 py-0.5 rounded border border-indigo-800/60 transition flex items-center gap-1 cursor-pointer"
-                  title="Bấm để xem lịch sử video đã render"
-                >
-                  <History className="w-3 h-3 text-indigo-400" />
-                  <span>Đã render {projectRenderedCount} video</span>
-                </button>
+
+            <ChevronRight className="w-3 h-3 text-slate-600 shrink-0" />
+
+            {parentProjectIdState ? (
+              <Link
+                href={`/projects/${parentProjectIdState}`}
+                className="max-w-[120px] sm:max-w-[180px] truncate px-2.5 py-1.5 rounded-xl bg-slate-900/80 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white transition font-medium"
+                title={`Về dự án: ${parentProjectNameState || "Dự án"}`}
+              >
+                {parentProjectNameState || "Dự án"}
+              </Link>
+            ) : (
+              <span className="max-w-[120px] sm:max-w-[180px] truncate px-2.5 py-1.5 rounded-xl bg-slate-900/40 text-slate-400 font-medium">
+                {parentProjectNameState || "Dự án"}
+              </span>
+            )}
+
+            <ChevronRight className="w-3 h-3 text-slate-600 shrink-0" />
+
+            {/* Folder Dropdown Quick Switcher */}
+            <div className="relative" ref={folderSwitcherRef}>
+              <button
+                type="button"
+                onClick={() => setShowFolderSwitcher((prev) => !prev)}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-500/10 border border-indigo-500/30 hover:border-indigo-500/60 text-white font-semibold transition cursor-pointer"
+                title="Bấm để chuyển nhanh giữa các folder"
+              >
+                <FolderOpen className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                <span className="max-w-[130px] sm:max-w-[200px] truncate">
+                  {currentProjectName || "Folder"}
+                </span>
+                <ChevronDown
+                  className={`w-3.5 h-3.5 text-indigo-400 transition-transform duration-200 ${
+                    showFolderSwitcher ? "rotate-180" : ""
+                  }`}
+                />
+              </button>
+
+              {/* Dropdown Menu */}
+              {showFolderSwitcher && (
+                <div className="absolute left-0 mt-1.5 w-64 rounded-xl bg-slate-900 border border-slate-800 shadow-2xl py-1 z-50 animate-in fade-in zoom-in-95 duration-150">
+                  <div className="px-3 py-1.5 text-[10px] font-semibold text-slate-400 uppercase tracking-wider border-b border-slate-800">
+                    Các folder trong dự án
+                  </div>
+                  <div className="max-h-56 overflow-y-auto divide-y divide-slate-800/40 py-1">
+                    {siblingFolders.length > 0 ? (
+                      siblingFolders.map((f) => {
+                        const isCurrent = f.id === projectId;
+                        return (
+                          <Link
+                            key={f.id}
+                            href={`/projects/${parentProjectIdState || "default"}/folders/${f.id}`}
+                            onClick={() => setShowFolderSwitcher(false)}
+                            className={`flex items-center justify-between px-3 py-2 text-xs transition ${
+                              isCurrent
+                                ? "bg-indigo-600/15 text-indigo-300 font-bold"
+                                : "text-slate-300 hover:bg-slate-800 hover:text-white"
+                            }`}
+                          >
+                            <div className="flex items-center gap-2 min-w-0">
+                              <FolderOpen
+                                className={`w-3.5 h-3.5 shrink-0 ${
+                                  isCurrent ? "text-indigo-400" : "text-slate-500"
+                                }`}
+                              />
+                              <span className="truncate">{f.name}</span>
+                            </div>
+                            {isCurrent && (
+                              <Check className="w-3.5 h-3.5 text-indigo-400 shrink-0 ml-2" />
+                            )}
+                          </Link>
+                        );
+                      })
+                    ) : (
+                      <div className="px-3 py-2 text-xs text-slate-500 italic">
+                        Chỉ có 1 folder hiện tại
+                      </div>
+                    )}
+                  </div>
+                  {parentProjectIdState && (
+                    <div className="p-1.5 border-t border-slate-800 bg-slate-950/40">
+                      <Link
+                        href={`/projects/${parentProjectIdState}`}
+                        onClick={() => setShowFolderSwitcher(false)}
+                        className="flex items-center justify-center gap-1.5 w-full px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:text-white bg-slate-800/70 hover:bg-slate-800 transition"
+                      >
+                        <Layers className="w-3 h-3 text-indigo-400" />
+                        <span>Quản lý tất cả folder</span>
+                      </Link>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
+
+            {projectRenderedCount > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMainTab("history");
+                  fetchRenderedHistory();
+                }}
+                className="hidden lg:flex items-center gap-1 text-[11px] font-mono text-indigo-300 hover:text-white bg-indigo-950/60 hover:bg-indigo-900/80 px-2.5 py-1 rounded-xl border border-indigo-800/60 transition cursor-pointer shrink-0"
+                title="Bấm để xem lịch sử video đã render"
+              >
+                <History className="w-3 h-3 text-indigo-400" />
+                <span>Đã render {projectRenderedCount} video</span>
+              </button>
+            )}
           </div>
         </div>
 
@@ -2755,7 +3063,7 @@ export default function StudioWorkspace({
                       <div className="flex items-center gap-2">
                         <span>
                           {(state.sourceVideo.sizeBytes / 1024 / 1024).toFixed(
-                            1,
+                            1
                           )}{" "}
                           MB
                         </span>
@@ -2815,7 +3123,7 @@ export default function StudioWorkspace({
                               };
                               if (state) {
                                 const updatedShots = state.shots.map((s) =>
-                                  applyMinDurationToShot(s, updatedMinDurs),
+                                  applyMinDurationToShot(s, updatedMinDurs)
                                 );
                                 persistState({
                                   ...state,
@@ -2841,7 +3149,7 @@ export default function StudioWorkspace({
                         value={pyDetector}
                         onChange={(e) =>
                           setPyDetector(
-                            e.target.value as "content" | "adaptive",
+                            e.target.value as "content" | "adaptive"
                           )
                         }
                         className="px-2 py-0.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-200"
@@ -2995,14 +3303,14 @@ export default function StudioWorkspace({
                       <div className="grid grid-cols-5 gap-1.5">
                         {SHOT_CATEGORIES.map((cat) => {
                           const catShots = state.shots.filter(
-                            (s) => s.category === cat.id,
+                            (s) => s.category === cat.id
                           );
                           const isCatActive = splitEditingCategory === cat.id;
                           const minDur = categoryMinDurations[cat.id] ?? 3.0;
                           const totalDur = catShots.reduce(
                             (acc, s) =>
                               acc + (s.end - s.begin) / (s.edits.speed || 1),
-                            0,
+                            0
                           );
 
                           return (
@@ -3017,7 +3325,7 @@ export default function StudioWorkspace({
                                   setSplitEditingCategory(cat.id);
                                   setAccordionShotId(null);
                                   const currentCatShots = state.shots.filter(
-                                    (s) => s.category === cat.id,
+                                    (s) => s.category === cat.id
                                   );
                                   if (currentCatShots.length > 0) {
                                     handleSelectSplitShot(currentCatShots[0]);
@@ -3042,7 +3350,11 @@ export default function StudioWorkspace({
                                     {cat.id}
                                   </span>
                                   <span
-                                    className={`font-mono font-bold ${isCatActive ? "text-indigo-300" : "text-slate-300"}`}
+                                    className={`font-mono font-bold ${
+                                      isCatActive
+                                        ? "text-indigo-300"
+                                        : "text-slate-300"
+                                    }`}
                                   >
                                     {catShots.length > 0
                                       ? `${totalDur.toFixed(1)}s`
@@ -3100,14 +3412,14 @@ export default function StudioWorkspace({
                                       maxDur,
                                       categoryMinDurations[
                                         splitEditingCategory
-                                      ] || 4,
+                                      ] || 4
                                     ),
                                     rawBegin: 0,
                                     rawEnd: Math.min(
                                       maxDur,
                                       categoryMinDurations[
                                         splitEditingCategory
-                                      ] || 4,
+                                      ] || 4
                                     ),
                                     category: splitEditingCategory,
                                     edits: {
@@ -3161,13 +3473,15 @@ export default function StudioWorkspace({
                                           : Math.max(0, maxDur - 4);
                                       const newEnd =
                                         Math.round(
-                                          Math.min(maxDur, newBegin + 4) * 10,
+                                          Math.min(maxDur, newBegin + 4) * 10
                                         ) / 10;
                                       const newShot: Shot = {
                                         id: `shot_${Date.now()}`,
                                         sourceVideoId:
                                           state.sourceVideo?.id || "src_vid",
-                                        label: `Cảnh ${splitEditingCategory.toUpperCase()} #${splitCatShots.length + 1}`,
+                                        label: `Cảnh ${splitEditingCategory.toUpperCase()} #${
+                                          splitCatShots.length + 1
+                                        }`,
                                         begin: Math.round(newBegin * 10) / 10,
                                         end: newEnd,
                                         rawBegin:
@@ -3217,7 +3531,7 @@ export default function StudioWorkspace({
                                   const rawDur = shot.end - shot.begin;
                                   const speed = shot.edits.speed || 1.0;
                                   const effectiveDur = (rawDur / speed).toFixed(
-                                    1,
+                                    1
                                   );
                                   const minDur =
                                     categoryMinDurations[
@@ -3297,7 +3611,7 @@ export default function StudioWorkspace({
                                               setAccordionShotId((prev) =>
                                                 prev === shot.id
                                                   ? null
-                                                  : shot.id,
+                                                  : shot.id
                                               );
                                             }}
                                             className={`p-1.5 rounded-lg transition ${
@@ -3355,7 +3669,7 @@ export default function StudioWorkspace({
                                                               label:
                                                                 e.target.value,
                                                             }
-                                                          : s,
+                                                          : s
                                                       );
                                                     persistState({
                                                       ...state,
@@ -3368,7 +3682,7 @@ export default function StudioWorkspace({
                                                 <span className="text-[10px] text-slate-400 font-mono hidden md:inline shrink-0">
                                                   (Gốc:{" "}
                                                   {splitShotTrimInfo.rawDuration.toFixed(
-                                                    1,
+                                                    1
                                                   )}
                                                   s)
                                                 </span>
@@ -3380,7 +3694,7 @@ export default function StudioWorkspace({
                                                   type="button"
                                                   onClick={() =>
                                                     handleToggleFlipH(
-                                                      accordionShot.id,
+                                                      accordionShot.id
                                                     )
                                                   }
                                                   className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] font-semibold border transition ${
@@ -3403,7 +3717,7 @@ export default function StudioWorkspace({
                                                   type="button"
                                                   onClick={() =>
                                                     handlePlayActiveShot(
-                                                      accordionShot,
+                                                      accordionShot
                                                     )
                                                   }
                                                   className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-200 transition"
@@ -3451,7 +3765,7 @@ export default function StudioWorkspace({
                                                             accordionShot.id,
                                                             {
                                                               speed: spd,
-                                                            },
+                                                            }
                                                           )
                                                         }
                                                         className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition ${
@@ -3479,9 +3793,9 @@ export default function StudioWorkspace({
                                                         {
                                                           speed:
                                                             parseFloat(
-                                                              e.target.value,
+                                                              e.target.value
                                                             ) || 1.0,
-                                                        },
+                                                        }
                                                       )
                                                     }
                                                     className="w-full accent-indigo-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
@@ -3490,7 +3804,7 @@ export default function StudioWorkspace({
                                                 <p className="text-[10px] text-slate-400 font-mono pt-1 border-t border-slate-800/80">
                                                   Cắt{" "}
                                                   {splitShotTrimInfo.cutDur.toFixed(
-                                                    1,
+                                                    1
                                                   )}
                                                   s ÷ {splitShotTrimInfo.speed}x
                                                   ={" "}
@@ -3503,7 +3817,7 @@ export default function StudioWorkspace({
                                                     }`}
                                                   >
                                                     {splitShotTrimInfo.effectiveDur.toFixed(
-                                                      1,
+                                                      1
                                                     )}
                                                     s
                                                   </span>
@@ -3541,12 +3855,12 @@ export default function StudioWorkspace({
                                                   }
                                                   onChange={(
                                                     newBegin,
-                                                    newEnd,
+                                                    newEnd
                                                   ) =>
                                                     handleUpdateShotTrim(
                                                       accordionShot.id,
                                                       newBegin,
-                                                      newEnd,
+                                                      newEnd
                                                     )
                                                   }
                                                   onScrubStart={() => {
@@ -3558,8 +3872,8 @@ export default function StudioWorkspace({
                                                       Math.min(
                                                         state.sourceVideo
                                                           ?.duration || 0,
-                                                        sourceSec,
-                                                      ),
+                                                        sourceSec
+                                                      )
                                                     );
                                                     if (
                                                       slicerVideoRef.current
@@ -3571,15 +3885,15 @@ export default function StudioWorkspace({
                                                   }}
                                                   onScrubEnd={() => {}}
                                                   onSeekPreview={(
-                                                    targetSec,
+                                                    targetSec
                                                   ) => {
                                                     const targetTime = Math.max(
                                                       0,
                                                       Math.min(
                                                         state.sourceVideo
                                                           ?.duration || 0,
-                                                        targetSec,
-                                                      ),
+                                                        targetSec
+                                                      )
                                                     );
                                                     if (
                                                       slicerVideoRef.current
@@ -3611,7 +3925,7 @@ export default function StudioWorkspace({
                                                     type="button"
                                                     onClick={() =>
                                                       handleToggleLockFlipH(
-                                                        accordionShot.id,
+                                                        accordionShot.id
                                                       )
                                                     }
                                                     className={`p-2 rounded-lg border flex items-center justify-between transition ${
@@ -3651,9 +3965,9 @@ export default function StudioWorkspace({
                                                         "object"
                                                           ? `${accordionShot.edits.zoom.depth}x`
                                                           : accordionShot.edits
-                                                                .zoom
-                                                            ? "1.2x"
-                                                            : "Tắt"}
+                                                              .zoom
+                                                          ? "1.2x"
+                                                          : "Tắt"}
                                                       </span>
                                                     </div>
                                                     <input
@@ -3668,19 +3982,19 @@ export default function StudioWorkspace({
                                                           ? accordionShot.edits
                                                               .zoom.depth
                                                           : accordionShot.edits
-                                                                .zoom
-                                                            ? 1.2
-                                                            : 1.0
+                                                              .zoom
+                                                          ? 1.2
+                                                          : 1.0
                                                       }
                                                       onChange={(e) => {
                                                         const depth = Number(
-                                                          e.target.value,
+                                                          e.target.value
                                                         );
                                                         handleSetZoom(
                                                           accordionShot.id,
                                                           depth <= 1.01
                                                             ? false
-                                                            : depth,
+                                                            : depth
                                                         );
                                                       }}
                                                       className="w-full accent-indigo-500 h-1 bg-slate-800 rounded mt-1"
@@ -3693,10 +4007,10 @@ export default function StudioWorkspace({
                                                       type="button"
                                                       onClick={() => {
                                                         handleDeleteShot(
-                                                          accordionShot.id,
+                                                          accordionShot.id
                                                         );
                                                         setAccordionShotId(
-                                                          null,
+                                                          null
                                                         );
                                                       }}
                                                       className="w-full py-2 px-3 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-semibold flex items-center justify-center gap-1.5 transition"
@@ -3722,10 +4036,10 @@ export default function StudioWorkspace({
                                                           onClick={() => {
                                                             handleCategoryChange(
                                                               accordionShot.id,
-                                                              c.id,
+                                                              c.id
                                                             );
                                                             setSplitEditingCategory(
-                                                              c.id,
+                                                              c.id
                                                             );
                                                           }}
                                                           disabled={
@@ -3742,7 +4056,7 @@ export default function StudioWorkspace({
                                                           {c.hotkey}.{" "}
                                                           {c.id.toUpperCase()}
                                                         </button>
-                                                      ),
+                                                      )
                                                     )}
                                                   </div>
                                                 </div>
@@ -3910,10 +4224,10 @@ export default function StudioWorkspace({
                           const totalDur = state.sourceVideo?.duration || 1;
                           const widthPct = Math.max(
                             2,
-                            ((shot.end - shot.begin) / totalDur) * 100,
+                            ((shot.end - shot.begin) / totalDur) * 100
                           );
                           const catObj = SHOT_CATEGORIES.find(
-                            (c) => c.id === shot.category,
+                            (c) => c.id === shot.category
                           );
                           const isSel = shot.id === selectedShotId;
                           return (
@@ -3945,7 +4259,9 @@ export default function StudioWorkspace({
                                   ? "ring-2 ring-white z-10 font-bold"
                                   : "opacity-80 hover:opacity-100"
                               }`}
-                              title={`${shot.label} (${shot.begin.toFixed(1)}s - ${shot.end.toFixed(1)}s)`}
+                              title={`${shot.label} (${shot.begin.toFixed(
+                                1
+                              )}s - ${shot.end.toFixed(1)}s)`}
                             >
                               {shot.category
                                 ? shot.category.slice(0, 3).toUpperCase()
@@ -4249,8 +4565,8 @@ export default function StudioWorkspace({
                             const driveUrl = driveFileId
                               ? `https://drive.google.com/file/d/${driveFileId}/view`
                               : isDrive
-                                ? it.localUrl
-                                : null;
+                              ? it.localUrl
+                              : null;
 
                             return (
                               <div
@@ -4307,7 +4623,9 @@ export default function StudioWorkspace({
                                       className="text-sky-400 hover:text-sky-300 hover:underline truncate max-w-[170px] inline-flex items-center gap-1"
                                       title={`Mở link Drive: ${driveUrl}`}
                                     >
-                                      <span className="truncate">{driveUrl}</span>
+                                      <span className="truncate">
+                                        {driveUrl}
+                                      </span>
                                       <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-70" />
                                     </a>
                                     <button
@@ -4437,8 +4755,8 @@ export default function StudioWorkspace({
                           (driveFileId
                             ? `https://drive.google.com/file/d/${driveFileId}/view`
                             : isDrive
-                              ? v.localUrl
-                              : null);
+                            ? v.localUrl
+                            : null);
 
                         return (
                           <div
@@ -4535,16 +4853,32 @@ export default function StudioWorkspace({
               </div>
             </div>
 
-            {/* Mixer Settings: Single Clean Row */}
-            <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 w-full sm:w-auto">
-                <div className="flex items-center gap-2">
+            {/* Mixer Settings: Single Clean Row Aligned Right */}
+            <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-3.5 sm:p-4 flex flex-wrap sm:flex-nowrap items-center justify-end gap-3 sm:gap-4">
+              <div className="flex items-center gap-3 sm:gap-4 flex-wrap sm:flex-nowrap min-w-0">
+                {/* Clip Name Pattern Input */}
+                <div className="flex items-center gap-2 shrink-0">
+                  <Edit3 className="w-4 h-4 text-indigo-400 shrink-0" />
+                  <label className="text-xs font-bold text-white whitespace-nowrap">
+                    Tên clip:
+                  </label>
+                  <input
+                    type="text"
+                    value={clipNamePrefix}
+                    onChange={(e) => setClipNamePrefix(e.target.value)}
+                    onBlur={() => persistProjectSettings()}
+                    placeholder={currentProjectName || "Ví dụ: Brand A"}
+                    className="w-36 sm:w-52 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-semibold text-white focus:outline-none focus:border-indigo-500 transition placeholder:text-slate-600"
+                    title="Tiền tố tên cho các video khi trộn (sẽ tự động thêm #1, #2...)"
+                  />
+                </div>
+
+                {/* Video Count Input */}
+                <div className="flex items-center gap-2 shrink-0">
                   <Clock className="w-4 h-4 text-rose-400 shrink-0" />
                   <label className="text-xs font-bold text-white whitespace-nowrap">
                     Số video muốn tạo:
                   </label>
-                </div>
-                <div className="flex items-center gap-2">
                   <input
                     type="number"
                     min="1"
@@ -4552,25 +4886,27 @@ export default function StudioWorkspace({
                     value={targetMixCount}
                     onChange={(e) =>
                       setTargetMixCount(
-                        Math.max(1, Math.min(50, parseInt(e.target.value) || 1)),
+                        Math.max(1, Math.min(50, parseInt(e.target.value) || 1))
                       )
                     }
-                    className="w-24 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono font-bold text-center text-white focus:outline-none focus:border-rose-500"
+                    onBlur={() => persistProjectSettings()}
+                    className="w-16 sm:w-20 px-2.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono font-bold text-center text-white focus:outline-none focus:border-rose-500"
                   />
-                  <span className="text-[11px] text-slate-400 hidden md:inline">
-                    video (Tối đa 50 video • Tự động kết hợp các cảnh và voice theo thuật toán
-                    ngẫu nhiên có kiểm soát)
+                  <span className="text-[11px] text-slate-400 hidden xl:inline whitespace-nowrap">
+                    video (Tối đa 50)
                   </span>
                 </div>
               </div>
 
-              <div className="w-full sm:w-auto shrink-0 flex items-center gap-2">
+              <div className="shrink-0">
                 <button
+                  type="button"
                   onClick={handlePlanDiverseMix}
-                  className="w-full sm:w-auto px-6 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-xs sm:text-sm shadow-xl shadow-indigo-600/20 flex items-center justify-center gap-2 transition"
+                  className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-sm shadow-lg shadow-indigo-600/25 flex items-center justify-center gap-2 transition hover:scale-[1.02] active:scale-[0.98]"
+                  title="Tạo tổ hợp trộn video tự động"
                 >
-                  <Sparkles className="w-4 h-4 animate-pulse" />
-                  <span>Tạo tổ hợp trộn video</span>
+                  <Sparkles className="w-4 h-4" />
+                  <span>Trộn</span>
                 </button>
               </div>
             </div>
@@ -4586,11 +4922,21 @@ export default function StudioWorkspace({
                         Danh sách {state.composedVideos.length} tổ hợp video
                       </h3>
                       <p className="text-xs text-slate-400">
-                        Click vào cảnh (OPEN, PRODUCT...) để chỉnh tốc độ, cắt
-                        giây, lật gương
+                        Click vào cảnh (OPEN,...) để chỉnh tốc độ, cắt giây, lật
+                        gương
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowMarkAllRenderedModal(true)}
+                        disabled={Boolean(busyMessage) || isMarkingAllRendered}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 text-xs font-semibold transition shadow-md shadow-slate-900/40 disabled:opacity-50"
+                        title="Đánh dấu tất cả video trong danh sách tổ hợp đã render vào lịch sử"
+                      >
+                        <CheckCheck className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Đánh dấu đã render</span>
+                      </button>
                       <button
                         onClick={handleRenderAllComposedZip}
                         disabled={Boolean(busyMessage)}
@@ -4598,7 +4944,7 @@ export default function StudioWorkspace({
                         title="Render toàn bộ video bằng FFmpeg và nén ZIP tải về máy"
                       >
                         <Download className="w-3.5 h-3.5" />
-                        <span>Tải ZIP toàn bộ MP4</span>
+                        <span>Tải tất cả</span>
                       </button>
                     </div>
                   </div>
@@ -4609,7 +4955,7 @@ export default function StudioWorkspace({
                       const activeSlotIdx =
                         isSelected && editingSlotCategory
                           ? comp.slots.findIndex(
-                              (s) => s.category === editingSlotCategory,
+                              (s) => s.category === editingSlotCategory
                             )
                           : -1;
                       const activeSlot =
@@ -4618,6 +4964,9 @@ export default function StudioWorkspace({
                         isSelected &&
                         isPreviewPlaying &&
                         previewMode === "full";
+                      const isRendered = renderedHistoryList.some(
+                        (r) => r.tupleKey === comp.tupleKey
+                      );
 
                       return (
                         <div
@@ -4630,15 +4979,21 @@ export default function StudioWorkspace({
                           }`}
                         >
                           <div className="flex items-center justify-between mb-2.5">
-                            <span className="text-xs font-bold text-white flex items-center gap-2">
+                            <span className="text-xs font-bold text-white flex items-center gap-2 flex-wrap">
                               <span>
                                 #{idx + 1} — {comp.name}
                               </span>
                               <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold">
                                 ⏱️ Tổng: {comp.finalDuration.toFixed(1)}s
                               </span>
+                              {isRendered && (
+                                <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                                  <Check className="w-3 h-3 text-emerald-400 stroke-[2.5]" />
+                                  <span>Đã render</span>
+                                </span>
+                              )}
                             </span>
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-1.5">
                               <button
                                 type="button"
                                 onClick={(e) => {
@@ -4653,7 +5008,7 @@ export default function StudioWorkspace({
                                     setPlayTrigger((prev) => prev + 1);
                                   }
                                 }}
-                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-white text-[11px] font-bold shadow-md transition ${
+                                className={`p-2 rounded-lg text-white shadow-md transition ${
                                   isCardPlaying
                                     ? "bg-amber-600 hover:bg-amber-500 shadow-amber-600/20"
                                     : "bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/20"
@@ -4663,29 +5018,27 @@ export default function StudioWorkspace({
                                     ? "Tạm dừng phát thử"
                                     : "Xem trước toàn bộ video (5 cảnh)"
                                 }
+                                aria-label={
+                                  isCardPlaying ? "Tạm dừng" : "Phát video"
+                                }
                               >
                                 {isCardPlaying ? (
-                                  <>
-                                    <Pause className="w-3 h-3 fill-current" />
-                                    <span>Tạm dừng</span>
-                                  </>
+                                  <Pause className="w-3.5 h-3.5 fill-current" />
                                 ) : (
-                                  <>
-                                    <Play className="w-3 h-3 fill-current" />
-                                    <span>Phát</span>
-                                  </>
+                                  <Play className="w-3.5 h-3.5 fill-current" />
                                 )}
                               </button>
                               <button
+                                type="button"
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   handleRenderSingleComposed(comp);
                                 }}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[11px] font-bold shadow-md shadow-rose-600/20 transition"
+                                className="p-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white shadow-md shadow-rose-600/20 transition"
                                 title="Xuất file MP4 hoàn chỉnh bằng FFmpeg"
+                                aria-label="Xuất file MP4"
                               >
-                                <Download className="w-3 h-3" />
-                                <span>Xuất MP4</span>
+                                <Download className="w-3.5 h-3.5" />
                               </button>
                             </div>
                           </div>
@@ -4708,13 +5061,13 @@ export default function StudioWorkspace({
                                     setSelectedComposedId(comp.id);
                                     const willBeActive = !isSlotActive;
                                     setEditingSlotCategory(
-                                      willBeActive ? slot.category : null,
+                                      willBeActive ? slot.category : null
                                     );
                                     setActiveSlotFocusIndex(
-                                      willBeActive ? sIdx : null,
+                                      willBeActive ? sIdx : null
                                     );
                                     setPreviewMode(
-                                      willBeActive ? "slot" : "full",
+                                      willBeActive ? "slot" : "full"
                                     );
                                   }}
                                   className={`p-1.5 rounded-lg text-left border text-[10px] transition cursor-pointer ${
@@ -4753,8 +5106,8 @@ export default function StudioWorkspace({
                                         slot.speed > 1
                                           ? "text-cyan-400 font-semibold"
                                           : slot.speed < 1
-                                            ? "text-amber-400 font-semibold"
-                                            : "text-slate-400"
+                                          ? "text-amber-400 font-semibold"
+                                          : "text-slate-400"
                                       }
                                     >
                                       {slot.speed}x
@@ -4780,7 +5133,7 @@ export default function StudioWorkspace({
                                 e.stopPropagation();
                                 handleChangeComposedVoice(
                                   comp.id,
-                                  e.target.value || null,
+                                  e.target.value || null
                                 );
                               }}
                               className="bg-slate-900 border border-slate-700 text-indigo-300 text-[10px] rounded-lg px-2 py-0.5 focus:outline-none focus:border-indigo-500 max-w-[210px] truncate"
@@ -4830,7 +5183,7 @@ export default function StudioWorkspace({
                                         activeSlotIdx,
                                         {
                                           flipH: !activeSlot.flipH,
-                                        },
+                                        }
                                       )
                                     }
                                     className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] font-semibold border transition ${
@@ -4893,7 +5246,7 @@ export default function StudioWorkspace({
                                               handleUpdateComposedSlot(
                                                 comp.id,
                                                 activeSlotIdx,
-                                                { speed: spd },
+                                                { speed: spd }
                                               )
                                             }
                                             className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition ${
@@ -4904,7 +5257,7 @@ export default function StudioWorkspace({
                                           >
                                             {spd}x
                                           </button>
-                                        ),
+                                        )
                                       )}
                                     </div>
                                     <input
@@ -4920,7 +5273,7 @@ export default function StudioWorkspace({
                                           {
                                             speed:
                                               parseFloat(e.target.value) || 1.0,
-                                          },
+                                          }
                                         )
                                       }
                                       className="w-full accent-rose-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
@@ -4961,7 +5314,7 @@ export default function StudioWorkspace({
                                         {
                                           videoBegin: begin,
                                           videoEnd: end,
-                                        },
+                                        }
                                       )
                                     }
                                     onScrubStart={() => {
@@ -5094,7 +5447,9 @@ export default function StudioWorkspace({
                       </span>
                     </h2>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      Quản lý trạng thái sử dụng của từng video đã xuất file. Thuật toán tự động ghi nhận và loại trừ các cảnh này khi tạo mẻ video mới.
+                      Quản lý trạng thái sử dụng của từng video đã xuất file.
+                      Thuật toán tự động ghi nhận và loại trừ các cảnh này khi
+                      tạo mẻ video mới.
                     </p>
                   </div>
                 </div>
@@ -5238,7 +5593,7 @@ export default function StudioWorkspace({
                     type="button"
                     onClick={() =>
                       setHistorySortOrder((prev) =>
-                        prev === "desc" ? "asc" : "desc",
+                        prev === "desc" ? "asc" : "desc"
                       )
                     }
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-xs font-semibold text-slate-300 transition"
@@ -5278,8 +5633,8 @@ export default function StudioWorkspace({
                   </h3>
                   <p className="text-xs text-slate-400">
                     Khi bạn xuất file MP4 đơn lẻ hoặc tải ZIP toàn bộ ở tab
-                    &quot;Trộn ghép&quot;, các video sẽ tự động được lưu vào đây và không
-                    bị trùng cảnh ở các lần tạo tiếp theo.
+                    &quot;Trộn ghép&quot;, các video sẽ tự động được lưu vào đây
+                    và không bị trùng cảnh ở các lần tạo tiếp theo.
                   </p>
                 </div>
                 <button
@@ -5319,11 +5674,19 @@ export default function StudioWorkspace({
                       <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400 font-semibold uppercase tracking-wider text-[11px]">
                         <th className="py-3.5 px-4 w-12 text-center">STT</th>
                         <th className="py-3.5 px-4 min-w-[220px]">Tên video</th>
-                        <th className="py-3.5 px-3 w-28 text-center">Thời lượng</th>
-                        <th className="py-3.5 px-4 min-w-[240px]">5 Cảnh tổ hợp</th>
+                        <th className="py-3.5 px-3 w-28 text-center">
+                          Thời lượng
+                        </th>
+                        <th className="py-3.5 px-4 min-w-[240px]">
+                          5 Cảnh tổ hợp
+                        </th>
                         <th className="py-3.5 px-3 min-w-[120px]">Voice</th>
-                        <th className="py-3.5 px-4 w-44 text-center">Trạng thái</th>
-                        <th className="py-3.5 px-4 w-24 text-right">Thao tác</th>
+                        <th className="py-3.5 px-4 w-44 text-center">
+                          Trạng thái
+                        </th>
+                        <th className="py-3.5 px-4 w-24 text-right">
+                          Thao tác
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800/60">
@@ -5385,7 +5748,7 @@ export default function StudioWorkspace({
                                 <div className="flex items-center gap-1">
                                   {comp.slots.map((s, sIdx) => {
                                     const catMeta = SHOT_CATEGORIES.find(
-                                      (c) => c.id === s.category,
+                                      (c) => c.id === s.category
                                     );
                                     return (
                                       <div
@@ -5396,7 +5759,9 @@ export default function StudioWorkspace({
                                         }`}
                                         title={`${s.category.toUpperCase()}: ${
                                           s.shotLabel || s.shotId
-                                        } (${s.videoBegin.toFixed(1)}s - ${s.videoEnd.toFixed(1)}s)`}
+                                        } (${s.videoBegin.toFixed(
+                                          1
+                                        )}s - ${s.videoEnd.toFixed(1)}s)`}
                                       >
                                         {s.category.slice(0, 1).toUpperCase()}:{" "}
                                         {s.shotLabel || s.shotId}
@@ -5455,9 +5820,7 @@ export default function StudioWorkspace({
                                   <span
                                     aria-hidden="true"
                                     className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                                      isUsed
-                                        ? "translate-x-4"
-                                        : "translate-x-0"
+                                      isUsed ? "translate-x-4" : "translate-x-0"
                                     }`}
                                   />
                                 </button>
@@ -5494,7 +5857,7 @@ export default function StudioWorkspace({
                                 <button
                                   type="button"
                                   onClick={() =>
-                                    handleDeleteHistoryItem(rec.id)
+                                    setHistoryItemPendingDelete(rec)
                                   }
                                   className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 border border-transparent hover:border-rose-500/20 transition"
                                   title="Xóa bản ghi này khỏi lịch sử"
@@ -5522,7 +5885,7 @@ export default function StudioWorkspace({
                       <strong className="text-white">
                         {Math.min(
                           filteredHistoryList.length,
-                          historyPage * historyPageSize,
+                          historyPage * historyPageSize
                         )}
                       </strong>{" "}
                       trên tổng số{" "}
@@ -5571,7 +5934,7 @@ export default function StudioWorkspace({
                         disabled={historyPage >= totalHistoryPages}
                         onClick={() =>
                           setHistoryPage((prev) =>
-                            Math.min(totalHistoryPages, prev + 1),
+                            Math.min(totalHistoryPages, prev + 1)
                           )
                         }
                         className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 disabled:hover:bg-slate-800 transition"
@@ -5608,7 +5971,7 @@ export default function StudioWorkspace({
                           <p className="text-xs text-slate-400 font-mono mt-0.5">
                             ⏱️ Đã render lúc:{" "}
                             {new Date(
-                              selectedHistoryDetail.renderedAt,
+                              selectedHistoryDetail.renderedAt
                             ).toLocaleString("vi-VN", {
                               hour: "2-digit",
                               minute: "2-digit",
@@ -5696,9 +6059,12 @@ export default function StudioWorkspace({
 
                           <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 flex justify-center">
                             {(() => {
-                              const comp = selectedHistoryDetail.payload as ComposedVideo;
+                              const comp =
+                                selectedHistoryDetail.payload as ComposedVideo;
                               const vItem = comp?.voiceTrackId
-                                ? multiVoices.find((v) => v.id === comp.voiceTrackId)
+                                ? multiVoices.find(
+                                    (v) => v.id === comp.voiceTrackId
+                                  )
                                 : null;
                               const vTrack: VoiceTrack | null = vItem
                                 ? {
@@ -5744,7 +6110,7 @@ export default function StudioWorkspace({
                               selectedHistoryDetail.payload as ComposedVideo
                             ).slots.map((s, idx) => {
                               const catMeta = SHOT_CATEGORIES.find(
-                                (c) => c.id === s.category,
+                                (c) => c.id === s.category
                               );
                               const driveLink = getGoogleDriveLinkFromSlot(s);
 
@@ -5757,7 +6123,8 @@ export default function StudioWorkspace({
                                     <div className="flex items-center gap-2.5 min-w-0 flex-1">
                                       <span
                                         className={`w-[72px] shrink-0 text-center px-1.5 py-1 rounded text-[10px] font-extrabold uppercase border tracking-wider ${
-                                          catMeta?.badgeClass || "text-slate-300"
+                                          catMeta?.badgeClass ||
+                                          "text-slate-300"
                                         }`}
                                       >
                                         {s.category}
@@ -5768,12 +6135,14 @@ export default function StudioWorkspace({
                                         </div>
                                         <div className="flex items-center gap-2 text-[10px] text-slate-400 font-mono">
                                           <span className="shrink-0">
-                                            Cắt gốc: {s.videoBegin.toFixed(1)}s →{" "}
-                                            {s.videoEnd.toFixed(1)}s
+                                            Cắt gốc: {s.videoBegin.toFixed(1)}s
+                                            → {s.videoEnd.toFixed(1)}s
                                           </span>
                                           {driveLink ? (
                                             <>
-                                              <span className="text-slate-600 shrink-0">•</span>
+                                              <span className="text-slate-600 shrink-0">
+                                                •
+                                              </span>
                                               <a
                                                 href={driveLink}
                                                 target="_blank"
@@ -5782,14 +6151,20 @@ export default function StudioWorkspace({
                                                 title={`Mở video gốc trên Google Drive: ${driveLink}`}
                                               >
                                                 <Cloud className="w-3 h-3 text-sky-400 shrink-0" />
-                                                <span className="truncate">{driveLink}</span>
+                                                <span className="truncate">
+                                                  {driveLink}
+                                                </span>
                                                 <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-70" />
                                               </a>
                                             </>
                                           ) : (
                                             <>
-                                              <span className="text-slate-600 shrink-0">•</span>
-                                              <span className="text-slate-500 italic shrink-0">File máy tính</span>
+                                              <span className="text-slate-600 shrink-0">
+                                                •
+                                              </span>
+                                              <span className="text-slate-500 italic shrink-0">
+                                                File máy tính
+                                              </span>
                                             </>
                                           )}
                                         </div>
@@ -5831,9 +6206,8 @@ export default function StudioWorkspace({
                             const vItem = multiVoices.find(
                               (v) =>
                                 v.id ===
-                                (
-                                  selectedHistoryDetail.payload as ComposedVideo
-                                ).voiceTrackId,
+                                (selectedHistoryDetail.payload as ComposedVideo)
+                                  .voiceTrackId
                             );
                             const voiceDriveLink =
                               getGoogleDriveLinkFromVoice(vItem);
@@ -5851,7 +6225,9 @@ export default function StudioWorkspace({
                                       </span>
                                       {voiceDriveLink ? (
                                         <>
-                                          <span className="text-slate-600 shrink-0">•</span>
+                                          <span className="text-slate-600 shrink-0">
+                                            •
+                                          </span>
                                           <a
                                             href={voiceDriveLink}
                                             target="_blank"
@@ -5860,14 +6236,20 @@ export default function StudioWorkspace({
                                             title={`Mở file voice trên Google Drive: ${voiceDriveLink}`}
                                           >
                                             <Cloud className="w-3 h-3 text-sky-400 shrink-0" />
-                                            <span className="truncate">{voiceDriveLink}</span>
+                                            <span className="truncate">
+                                              {voiceDriveLink}
+                                            </span>
                                             <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-70" />
                                           </a>
                                         </>
                                       ) : (
                                         <>
-                                          <span className="text-slate-600 shrink-0">•</span>
-                                          <span className="text-slate-500 italic shrink-0">File máy tính</span>
+                                          <span className="text-slate-600 shrink-0">
+                                            •
+                                          </span>
+                                          <span className="text-slate-500 italic shrink-0">
+                                            File máy tính
+                                          </span>
                                         </>
                                       )}
                                     </div>
@@ -5897,7 +6279,7 @@ export default function StudioWorkspace({
                           type="button"
                           onClick={() => {
                             navigator.clipboard.writeText(
-                              selectedHistoryDetail.tupleKey,
+                              selectedHistoryDetail.tupleKey
                             );
                             addToast({
                               type: "info",
@@ -5920,7 +6302,7 @@ export default function StudioWorkspace({
                             type="button"
                             onClick={() => {
                               handlePreviewHistoryComposed(
-                                selectedHistoryDetail,
+                                selectedHistoryDetail
                               );
                               setSelectedHistoryDetail(null);
                             }}
@@ -5935,7 +6317,7 @@ export default function StudioWorkspace({
                             type="button"
                             onClick={() =>
                               handleRenderSingleComposed(
-                                selectedHistoryDetail.payload as ComposedVideo,
+                                selectedHistoryDetail.payload as ComposedVideo
                               )
                             }
                             className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-bold transition"
@@ -6039,7 +6421,7 @@ export default function StudioWorkspace({
                   </button>
                   {CATEGORY_ORDER.map((cat) => {
                     const count = allDriveLinks.filter(
-                      (l) => l.category === cat,
+                      (l) => l.category === cat
                     ).length;
                     const meta = SHOT_CATEGORIES.find((c) => c.id === cat);
                     return (
@@ -6059,7 +6441,7 @@ export default function StudioWorkspace({
                   })}
                   {(() => {
                     const voiceCount = allDriveLinks.filter(
-                      (l) => l.category === "voice",
+                      (l) => l.category === "voice"
                     ).length;
                     return (
                       <button
@@ -6088,7 +6470,7 @@ export default function StudioWorkspace({
                 ) : (
                   filteredDriveLinks.map((item) => {
                     const catMeta = SHOT_CATEGORIES.find(
-                      (c) => c.id === item.category,
+                      (c) => c.id === item.category
                     );
                     return (
                       <div
@@ -6131,7 +6513,7 @@ export default function StudioWorkspace({
                                 } else {
                                   handleRemoveCategoryItem(
                                     item.category as ShotCategory,
-                                    item.id,
+                                    item.id
                                   );
                                 }
                                 addToast({
@@ -6263,7 +6645,7 @@ export default function StudioWorkspace({
                 onClick={() =>
                   handleIngestSingleCategoryDrive(
                     singleCategoryDriveModal.category,
-                    singleCategoryDriveModal.text,
+                    singleCategoryDriveModal.text
                   )
                 }
                 className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold transition shadow-lg shadow-sky-600/20 disabled:opacity-50"
@@ -6296,7 +6678,8 @@ export default function StudioWorkspace({
                   Xác nhận xoá trắng kho
                 </h3>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Bạn có chắc chắn muốn xóa toàn bộ clip trong kho, các file voice và toàn bộ tổ hợp đã tạo để bắt đầu mẻ mới?
+                  Bạn có chắc chắn muốn xóa toàn bộ clip trong kho, các file
+                  voice và toàn bộ tổ hợp đã tạo để bắt đầu mẻ mới?
                 </p>
               </div>
             </div>
@@ -6307,7 +6690,10 @@ export default function StudioWorkspace({
                 <span>Các mục sẽ bị dọn sạch vĩnh viễn:</span>
               </div>
               <ul className="list-disc list-inside space-y-1 pl-1 text-slate-300">
-                <li>Toàn bộ clip trong 5 thư mục (Open, Product, Texture, Apply, End)</li>
+                <li>
+                  Toàn bộ clip trong 5 thư mục (Open, Product, Texture, Apply,
+                  End)
+                </li>
                 <li>Toàn bộ file voice lồng tiếng đã nạp</li>
                 <li>Toàn bộ danh sách tổ hợp video đã tạo trong phiên này</li>
                 <li>Dữ liệu lưu trữ trong SQLite Cloud của dự án này</li>
@@ -6334,7 +6720,9 @@ export default function StudioWorkspace({
                 ) : (
                   <Trash2 className="w-3.5 h-3.5" />
                 )}
-                <span>{isClearingAll ? "Đang xóa..." : "Xác nhận xóa sạch"}</span>
+                <span>
+                  {isClearingAll ? "Đang xóa..." : "Xác nhận xóa sạch"}
+                </span>
               </button>
             </div>
           </div>
@@ -6357,7 +6745,8 @@ export default function StudioWorkspace({
                   Xác nhận xóa toàn bộ lịch sử
                 </h3>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Bạn có chắc chắn muốn xóa toàn bộ lịch sử các video đã render của dự án này?
+                  Bạn có chắc chắn muốn xóa toàn bộ lịch sử các video đã render
+                  của dự án này?
                 </p>
               </div>
             </div>
@@ -6368,8 +6757,14 @@ export default function StudioWorkspace({
                 <span>Lưu ý quan trọng:</span>
               </div>
               <ul className="list-disc list-inside space-y-1 pl-1 text-slate-300">
-                <li>Toàn bộ {renderedHistoryList.length} bản ghi video đã render sẽ bị xóa khỏi lịch sử.</li>
-                <li>Sau khi xóa, các mẻ trộn tiếp theo có thể trùng với các clip/tổ hợp đã từng render trước đây.</li>
+                <li>
+                  Toàn bộ {renderedHistoryList.length} bản ghi video đã render
+                  sẽ bị xóa khỏi lịch sử.
+                </li>
+                <li>
+                  Sau khi xóa, các mẻ trộn tiếp theo có thể trùng với các
+                  clip/tổ hợp đã từng render trước đây.
+                </li>
                 <li>Hành động này không thể hoàn tác.</li>
               </ul>
             </div>
@@ -6394,7 +6789,149 @@ export default function StudioWorkspace({
                 ) : (
                   <Trash2 className="w-3.5 h-3.5" />
                 )}
-                <span>{isClearingHistory ? "Đang xóa..." : "Xác nhận xóa"}</span>
+                <span>
+                  {isClearingHistory ? "Đang xóa..." : "Xác nhận xóa"}
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Mark All Rendered Confirmation Modal */}
+      {showMarkAllRenderedModal && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-slate-700/80 rounded-2xl max-w-md w-full p-6 space-y-5 shadow-2xl relative overflow-hidden animate-in zoom-in-95 duration-200">
+            <div className="absolute -top-10 -right-10 w-32 h-32 bg-emerald-500/15 rounded-full blur-3xl pointer-events-none" />
+
+            <div className="flex items-start gap-3.5">
+              <div className="w-10 h-10 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center shrink-0 text-emerald-400">
+                <CheckCheck className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-sm font-bold text-white">
+                  Xác nhận đánh dấu tất cả đã render
+                </h3>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Bạn có chắc muốn đánh dấu toàn bộ{" "}
+                  {state?.composedVideos?.length || 0} video trong danh sách tổ
+                  hợp này đã render?
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-slate-950/70 border border-slate-800 p-3 space-y-1.5 text-[11px] text-slate-400">
+              <div className="flex items-center gap-2 text-emerald-300 font-medium">
+                <Info className="w-3.5 h-3.5 shrink-0" />
+                <span>Chi tiết thực hiện:</span>
+              </div>
+              <ul className="list-disc list-inside space-y-1 pl-1 text-slate-300">
+                <li>
+                  {unrecordedComposedCount > 0
+                    ? `Sẽ thêm ${unrecordedComposedCount} video mới vào lịch sử render (bỏ qua ${
+                        (state?.composedVideos?.length || 0) -
+                        unrecordedComposedCount
+                      } video đã có trong lịch sử).`
+                    : "Toàn bộ video trong danh sách đều đã có trong lịch sử render."}
+                </li>
+                <li>
+                  Hệ thống coi như bỏ qua bước tải MP4 về máy và lưu mã tổ hợp
+                  để tránh trùng lặp ở các lần trộn tiếp theo.
+                </li>
+              </ul>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                disabled={isMarkingAllRendered}
+                onClick={() => setShowMarkAllRenderedModal(false)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition disabled:opacity-50"
+              >
+                Hủy bỏ
+              </button>
+              <button
+                type="button"
+                disabled={isMarkingAllRendered || unrecordedComposedCount === 0}
+                onClick={handleConfirmMarkAllRendered}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow-lg shadow-emerald-600/25 disabled:opacity-50"
+              >
+                {isMarkingAllRendered ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <CheckCheck className="w-3.5 h-3.5" />
+                )}
+                <span>
+                  {isMarkingAllRendered
+                    ? "Đang ghi nhận..."
+                    : unrecordedComposedCount === 0
+                    ? "Đã có trong lịch sử"
+                    : "Đồng ý đánh dấu"}
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Single History Item Confirmation Modal */}
+      {historyItemPendingDelete && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-slate-700/80 rounded-2xl max-w-md w-full p-6 space-y-5 shadow-2xl relative overflow-hidden animate-in zoom-in-95 duration-200">
+            <div className="absolute -top-10 -right-10 w-32 h-32 bg-rose-500/15 rounded-full blur-3xl pointer-events-none" />
+
+            <div className="flex items-start gap-3.5">
+              <div className="w-10 h-10 rounded-xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center shrink-0 text-rose-400">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-sm font-bold text-white">
+                  Xác nhận xóa bản ghi video
+                </h3>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Bạn có chắc muốn xóa video{" "}
+                  <span className="text-rose-300 font-bold">
+                    &quot;{historyItemPendingDelete.name || historyItemPendingDelete.id}&quot;
+                  </span>{" "}
+                  khỏi lịch sử render?
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-slate-950/70 border border-slate-800 p-3 space-y-1.5 text-[11px] text-slate-400">
+              <div className="flex items-center gap-2 text-amber-300 font-medium">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>Lưu ý quan trọng:</span>
+              </div>
+              <ul className="list-disc list-inside space-y-1 pl-1 text-slate-300">
+                <li>Bản ghi này sẽ bị xóa khỏi lịch sử render của dự án.</li>
+                <li>Sau khi xóa, tổ hợp các cảnh này có thể xuất hiện lại ở các lần trộn tiếp theo.</li>
+              </ul>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                disabled={isDeletingHistoryItem}
+                onClick={() => setHistoryItemPendingDelete(null)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition disabled:opacity-50"
+              >
+                Hủy bỏ
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingHistoryItem}
+                onClick={handleConfirmDeleteHistoryItem}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold transition shadow-lg shadow-rose-600/25 disabled:opacity-50"
+              >
+                {isDeletingHistoryItem ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+                <span>
+                  {isDeletingHistoryItem ? "Đang xóa..." : "Xác nhận xóa"}
+                </span>
               </button>
             </div>
           </div>
@@ -6418,7 +6955,9 @@ export default function StudioWorkspace({
             {/* Title and Detail */}
             <div className="space-y-1.5 z-10 w-full">
               <h3 className="text-base font-semibold text-white tracking-wide">
-                {renderProgress ? "Đang kết xuất video..." : "Đang thực hiện..."}
+                {renderProgress
+                  ? "Đang kết xuất video..."
+                  : "Đang thực hiện..."}
               </h3>
               <p className="text-xs text-slate-300 leading-relaxed max-w-xs mx-auto font-mono">
                 {busyMessage}
@@ -6437,14 +6976,20 @@ export default function StudioWorkspace({
                   </div>
                   {renderProgress.name && (
                     <div className="text-[11px] text-slate-400 truncate max-w-xs mx-auto">
-                      Đang xử lý: <span className="text-slate-200">{renderProgress.name}</span>
+                      Đang xử lý:{" "}
+                      <span className="text-slate-200">
+                        {renderProgress.name}
+                      </span>
                     </div>
                   )}
                   <div className="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden border border-slate-700/60 p-0.5">
                     <div
                       className="bg-gradient-to-r from-emerald-500 via-teal-500 to-indigo-500 h-full rounded-full transition-all duration-300 shadow-sm shadow-emerald-500/50"
                       style={{
-                        width: `${Math.min(100, Math.max(0, renderProgress.percent))}%`,
+                        width: `${Math.min(
+                          100,
+                          Math.max(0, renderProgress.percent)
+                        )}%`,
                       }}
                     />
                   </div>
@@ -6475,8 +7020,8 @@ export default function StudioWorkspace({
                 isSuccess
                   ? "bg-slate-900/95 border-emerald-500/40 text-emerald-100 shadow-emerald-950/40"
                   : isError
-                    ? "bg-slate-900/95 border-rose-500/40 text-rose-100 shadow-rose-950/40"
-                    : "bg-slate-900/95 border-sky-500/40 text-sky-100 shadow-sky-950/40"
+                  ? "bg-slate-900/95 border-rose-500/40 text-rose-100 shadow-rose-950/40"
+                  : "bg-slate-900/95 border-sky-500/40 text-sky-100 shadow-sky-950/40"
               }`}
             >
               <div className="mt-0.5 shrink-0">
@@ -6494,8 +7039,8 @@ export default function StudioWorkspace({
                   {isSuccess
                     ? "Thành công"
                     : isError
-                      ? "Có lỗi xảy ra"
-                      : "Thông báo"}
+                    ? "Có lỗi xảy ra"
+                    : "Thông báo"}
                 </p>
                 <p className="text-slate-300 text-[11px] whitespace-pre-wrap break-words">
                   {toast.text}

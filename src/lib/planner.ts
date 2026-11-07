@@ -339,6 +339,7 @@ export function buildComposedVideo(params: {
   existingJobId?: string;
   existingId?: string;
   preserveOriginalClips?: boolean;
+  clipNamePrefix?: string;
 }): ComposedVideo {
   const {
     index,
@@ -351,6 +352,7 @@ export function buildComposedVideo(params: {
     existingJobId,
     existingId,
     preserveOriginalClips = false,
+    clipNamePrefix,
   } = params;
 
   const minDurs: CategoryMinDurations = {
@@ -642,10 +644,12 @@ export function buildComposedVideo(params: {
   const now = new Date().toISOString();
   const tupleKey = tuple.map((s) => getShotFingerprint(s)).join("|");
 
+  const prefix = (clipNamePrefix || "").trim() || "Video Remix";
+
   return {
     id: existingId || `comp_${index + 1}_${Date.now()}`,
     jobId: existingJobId || crypto.randomUUID(),
-    name: `Video Remix #${index + 1}`,
+    name: `${prefix} #${index + 1}`,
     tupleKey,
     shotIds,
     slots: resolvedSlots,

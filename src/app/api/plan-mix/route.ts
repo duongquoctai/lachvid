@@ -26,6 +26,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json().catch(() => ({}));
     const sessionId = sanitizeSessionId(body.sessionId || getSessionIdFromHeaders(req.headers));
     const projectId = (body.projectId as string) || "";
+    const clipNamePrefix = typeof body.clipNamePrefix === "string" ? body.clipNamePrefix.trim() : undefined;
     const state = readProjectState(sessionId);
 
     const pools: CategoryPools = body.categoryPools || state.categoryPools || {
@@ -207,6 +208,7 @@ export async function POST(req: NextRequest) {
         diversityConfig,
         categoryMinDurations: state.categoryMinDurations,
         preserveOriginalClips,
+        clipNamePrefix,
       });
     });
 

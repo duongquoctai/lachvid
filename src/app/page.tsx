@@ -25,8 +25,9 @@ interface ProjectItem {
   description?: string;
   createdAt: string;
   updatedAt: string;
-  renderedCount?: number;
+  foldersCount?: number;
   poolCount?: number;
+  renderedCount?: number;
 }
 
 export default function HomePage() {
@@ -41,6 +42,8 @@ export default function HomePage() {
   const [editProjectDesc, setEditProjectDesc] = useState<string>("");
   const [isUpdating, setIsUpdating] = useState<boolean>(false);
   const [openMenuProjectId, setOpenMenuProjectId] = useState<string | null>(null);
+  const [projectToDelete, setProjectToDelete] = useState<ProjectItem | null>(null);
+  const [isDeleting, setIsDeleting] = useState<boolean>(false);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
 
   const [toasts, setToasts] = useState<
@@ -68,10 +71,10 @@ export default function HomePage() {
 
   const fetchProjects = useCallback(async () => {
     try {
-      const res = await fetch("/api/project");
+      const res = await fetch("/api/parent-projects");
       const data = await res.json();
-      if (data.projects) {
-        setProjectList(data.projects);
+      if (data.parentProjects) {
+        setProjectList(data.parentProjects);
       }
     } catch {
       // ignore
@@ -82,11 +85,11 @@ export default function HomePage() {
 
   useEffect(() => {
     let ignore = false;
-    fetch("/api/project")
+    fetch("/api/parent-projects")
       .then((res) => res.json())
       .then((data) => {
-        if (!ignore && data.projects) {
-          setProjectList(data.projects);
+        if (!ignore && data.parentProjects) {
+          setProjectList(data.parentProjects);
         }
       })
       .catch(() => {})
@@ -113,11 +116,10 @@ export default function HomePage() {
     }
     setBusyMessage("Đang tạo dự án mới...");
     try {
-      const res = await fetch("/api/project", {
+      const res = await fetch("/api/parent-projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          action: "create",
           name: newProjectName.trim(),
           description: newProjectDesc.trim(),
         }),
@@ -130,11 +132,11 @@ export default function HomePage() {
       setNewProjectDesc("");
       addToast({
         type: "success",
-        text: `Đã tạo thành công dự án "${data.project.name}"!`,
+        text: `Đã tạo thành công dự án "${data.parentProject.name}"!`,
       });
 
-      // Chuyển trực tiếp sang route /projects/[id]
-      router.push(`/projects/${data.project.id}`);
+      // Chuyển trực tiếp sang trang danh sách Folder của dự án đó
+      router.push(`/projects/${data.parentProject.id}`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       addToast({ type: "error", text: msg });
@@ -160,7 +162,7 @@ export default function HomePage() {
     }
     setIsUpdating(true);
     try {
-      const res = await fetch(`/api/project/${editingProject.id}`, {
+      const res = await fetch(`/api/parent-projects/${editingProject.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -180,8 +182,8 @@ export default function HomePage() {
                 description: editProjectDesc.trim(),
                 updatedAt: new Date().toISOString(),
               }
-            : item
-        )
+            : item,
+        ),
       );
       setEditingProject(null);
       addToast({
@@ -196,37 +198,30 @@ export default function HomePage() {
     }
   };
 
-  const handleDeleteProject = async (
-    id: string,
-    name: string,
-    e: React.MouseEvent,
-  ) => {
-    e.stopPropagation();
-    e.preventDefault();
-    if (
-      !confirm(
-        `Bạn có chắc chắn muốn xóa dự án "${name}"?\nToàn bộ dữ liệu (kho clip import, lịch sử video đã render) của dự án này sẽ bị xóa hoàn toàn.`,
-      )
-    ) {
-      return;
-    }
-
+  const handleConfirmDeleteProject = async () => {
+    if (!projectToDelete) return;
+    setIsDeleting(true);
     try {
-      const res = await fetch(`/api/project/${id}`, { method: "DELETE" });
+      const res = await fetch(`/api/parent-projects/${projectToDelete.id}`, {
+        method: "DELETE",
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Không thể xóa dự án");
 
-      addToast({ type: "success", text: `Đã xóa dự án "${name}".` });
+      addToast({ type: "success", text: `Đã xóa dự án "${projectToDelete.name}".` });
+      setProjectToDelete(null);
       fetchProjects();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       addToast({ type: "error", text: msg });
+    } finally {
+      setIsDeleting(false);
     }
   };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
-      {/* Top Header - Không còn nút tạo dự án ở header */}
+      {/* Top Header */}
       <header className="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800 px-6 py-3.5 flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-rose-500 to-indigo-500 flex items-center justify-center shadow-lg shadow-rose-500/20">
@@ -251,17 +246,17 @@ export default function HomePage() {
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 relative z-10">
               <div className="space-y-1.5">
                 <h2 className="text-xl font-extrabold text-white tracking-tight flex items-center gap-2">
-                  <span>Quản lý dự án & brand</span>
+                  <span>Quản lý dự án & thương hiệu</span>
                   <span className="text-xs font-normal px-2.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
-                    Cloud sync
+                    Project layer
                   </span>
                 </h2>
                 <p className="text-xs text-slate-400 max-w-2xl leading-relaxed">
-                  Chọn một dự án để tiếp tục làm việc hoặc tạo mới. Dữ liệu kho clip và lịch sử render sẽ được lưu trữ đồng bộ, giúp các thành viên cùng team không bị trùng lặp video khi render qua các ngày.
+                  Mỗi dự án đại diện cho một thương hiệu hoặc chiến dịch lớn. Bên trong mỗi dự án, bạn có thể tạo các folder cho từng dòng sản phẩm để quản lý kho clip và lịch sử render độc lập.
                 </p>
               </div>
 
-              {/* Nút Tạo dự án màu indigo-600 */}
+              {/* Nút Tạo dự án */}
               <button
                 type="button"
                 onClick={() => setShowCreateModal(true)}
@@ -282,16 +277,15 @@ export default function HomePage() {
           ) : projectList.length === 0 ? (
             <div className="bg-slate-900/40 border border-dashed border-slate-800 rounded-3xl p-12 text-center space-y-4">
               <div className="w-16 h-16 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center mx-auto text-indigo-400">
-                <FolderOpen className="w-8 h-8" />
+                <Layers className="w-8 h-8" />
               </div>
               <div className="space-y-1">
-                <h3 className="text-base font-bold text-white">Chưa có dự án hoặc brand nào</h3>
+                <h3 className="text-base font-bold text-white">Chưa có dự án hoặc thương hiệu nào</h3>
                 <p className="text-xs text-slate-400 max-w-md mx-auto">
-                  Mời tạo dự án để bắt đầu import kho clip Drive và quản lý lịch sử render không trùng lặp cho team của bạn.
+                  Hãy tạo dự án đầu tiên để bắt đầu thêm các folder sản phẩm và quản lý quy trình trộn video.
                 </p>
               </div>
 
-              {/* Nút Tạo dự án màu indigo-600 */}
               <button
                 type="button"
                 onClick={() => setShowCreateModal(true)}
@@ -370,8 +364,10 @@ export default function HomePage() {
                             <button
                               type="button"
                               onClick={(e) => {
+                                e.stopPropagation();
+                                e.preventDefault();
                                 setOpenMenuProjectId(null);
-                                handleDeleteProject(p.id, p.name, e);
+                                setProjectToDelete(p);
                               }}
                               className="w-full px-3 py-2 text-left text-xs font-medium text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 flex items-center gap-2 transition"
                             >
@@ -392,8 +388,12 @@ export default function HomePage() {
 
                   <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
                     <div className="flex items-center gap-3">
+                      <span className="flex items-center gap-1 font-medium text-indigo-300">
+                        <FolderOpen className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>{p.foldersCount || 0} folder</span>
+                      </span>
                       <span className="flex items-center gap-1 font-medium text-slate-300">
-                        <Film className="w-3.5 h-3.5 text-indigo-400" />
+                        <Film className="w-3.5 h-3.5 text-sky-400" />
                         <span>{p.poolCount || 0} clip</span>
                       </span>
                       <span className="flex items-center gap-1 font-medium text-emerald-300">
@@ -443,7 +443,7 @@ export default function HomePage() {
                   type="text"
                   value={newProjectName}
                   onChange={(e) => setNewProjectName(e.target.value)}
-                  placeholder="Ví dụ: Brand A - Kem chống nắng"
+                  placeholder="Ví dụ: Brand A"
                   className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 transition"
                   autoFocus
                   onKeyDown={(e) => {
@@ -460,7 +460,7 @@ export default function HomePage() {
                   rows={2}
                   value={newProjectDesc}
                   onChange={(e) => setNewProjectDesc(e.target.value)}
-                  placeholder="Ghi chú về chiến dịch, sản phẩm, hướng dẫn..."
+                  placeholder="Ghi chú về thương hiệu, chiến dịch..."
                   className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 transition resize-none"
                 />
               </div>
@@ -472,7 +472,7 @@ export default function HomePage() {
                 onClick={() => setShowCreateModal(false)}
                 className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition"
               >
-                Hủy
+                Hủy bỏ
               </button>
               <button
                 type="button"
@@ -533,7 +533,7 @@ export default function HomePage() {
                   rows={2}
                   value={editProjectDesc}
                   onChange={(e) => setEditProjectDesc(e.target.value)}
-                  placeholder="Ghi chú về chiến dịch, sản phẩm, hướng dẫn..."
+                  placeholder="Ghi chú về thương hiệu, chiến dịch..."
                   className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 transition resize-none"
                 />
               </div>
@@ -546,7 +546,7 @@ export default function HomePage() {
                 disabled={isUpdating}
                 className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition disabled:opacity-50"
               >
-                Hủy
+                Hủy bỏ
               </button>
               <button
                 type="button"
@@ -556,6 +556,78 @@ export default function HomePage() {
               >
                 {isUpdating && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                 <span>Lưu thay đổi</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal xác nhận xóa dự án */}
+      {projectToDelete && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-5 shadow-2xl relative overflow-hidden animate-in zoom-in-95 duration-200">
+            <div className="absolute -top-10 -right-10 w-32 h-32 bg-rose-500/15 rounded-full blur-3xl pointer-events-none" />
+
+            <div className="flex items-start gap-3.5">
+              <div className="w-10 h-10 rounded-xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center shrink-0 text-rose-400">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-sm font-bold text-white">
+                  Xác nhận xóa dự án
+                </h3>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Bạn có chắc muốn xóa dự án{" "}
+                  <span className="text-rose-300 font-bold">
+                    &quot;{projectToDelete.name}&quot;
+                  </span>
+                  ?
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-slate-950/70 border border-slate-800 p-3 space-y-1.5 text-[11px] text-slate-400">
+              <div className="flex items-center gap-2 text-amber-300 font-medium">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>Lưu ý quan trọng:</span>
+              </div>
+              <ul className="list-disc list-inside space-y-1 pl-1 text-slate-300">
+                <li>
+                  Toàn bộ{" "}
+                  <span className="text-amber-200 font-bold">
+                    {projectToDelete.foldersCount || 0} folder
+                  </span>{" "}
+                  bên trong dự án này sẽ bị xóa hoàn toàn.
+                </li>
+                <li>
+                  Tất cả kho clip, voice và lịch sử video đã render của các folder
+                  cũng sẽ bị xóa vĩnh viễn.
+                </li>
+                <li>Hành động này không thể hoàn tác.</li>
+              </ul>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={() => setProjectToDelete(null)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition disabled:opacity-50"
+              >
+                Hủy bỏ
+              </button>
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={handleConfirmDeleteProject}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold transition shadow-lg shadow-rose-600/25 disabled:opacity-50"
+              >
+                {isDeleting ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+                <span>{isDeleting ? "Đang xóa..." : "Xác nhận xóa"}</span>
               </button>
             </div>
           </div>
