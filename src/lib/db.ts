@@ -115,6 +115,7 @@ function writeLocalStorage(data: LocalStorageSchema) {
 
 let dbClient: Database | null = null;
 let dbInitialized = false;
+let dbInitPromise: Promise<void> | null = null;
 
 function getClient(): Database | null {
   const connectionUrl = process.env.SQLITE_CLOUD_URL?.trim();
@@ -127,150 +128,179 @@ function getClient(): Database | null {
 
 export async function initDatabase() {
   if (dbInitialized) return;
-  const client = getClient();
-  if (!client) {
-    // Using local storage fallback
-    readLocalStorage();
-    dbInitialized = true;
-    return;
-  }
-
-  try {
-    await client.sql`
-      CREATE TABLE IF NOT EXISTS lachvid_parent_projects (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        description TEXT,
-        owner_id TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `;
-
-    await client.sql`
-      CREATE TABLE IF NOT EXISTS lachvid_projects (
-        id TEXT PRIMARY KEY,
-        parent_project_id TEXT,
-        name TEXT NOT NULL,
-        description TEXT,
-        settings TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `;
-
-    try {
-      await client.sql`ALTER TABLE lachvid_projects ADD COLUMN settings TEXT;`;
-    } catch {
-      // ignore if column already exists
-    }
-
-    try {
-      await client.sql`ALTER TABLE lachvid_projects ADD COLUMN parent_project_id TEXT;`;
-    } catch {
-      // ignore if column already exists
-    }
-
-    // Auto-migrate legacy projects to parent projects in SQLite Cloud
-    try {
-      const orphans = (await client.sql`
-        SELECT id, name, description, created_at, updated_at
-        FROM lachvid_projects
-        WHERE parent_project_id IS NULL OR parent_project_id = '';
-      `) as Array<{
-        id: string;
-        name: string;
-        description?: string;
-        created_at: string;
-        updated_at: string;
-      }>;
-
-      if (orphans && orphans.length > 0) {
-        for (const orphan of orphans) {
-          const parentId = `parent_${orphan.id}`;
-          await client.sql`
-            INSERT OR IGNORE INTO lachvid_parent_projects (id, name, description, created_at, updated_at)
-            VALUES (${parentId}, ${orphan.name}, ${orphan.description || ""}, ${orphan.created_at}, ${orphan.updated_at});
-          `;
-          await client.sql`
-            UPDATE lachvid_projects
-            SET parent_project_id = ${parentId}
-            WHERE id = ${orphan.id};
-          `;
-        }
+  if (!dbInitPromise) {
+    dbInitPromise = (async () => {
+      const client = getClient();
+      if (!client) {
+        // Using local storage fallback
+        readLocalStorage();
+        dbInitialized = true;
+        return;
       }
-    } catch (migErr) {
-      console.warn("Migration orphan projects error:", migErr);
-    }
 
-    await client.sql`
-      CREATE TABLE IF NOT EXISTS lachvid_category_items (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        category TEXT NOT NULL,
-        name TEXT NOT NULL,
-        file_name TEXT NOT NULL,
-        local_url TEXT NOT NULL,
-        local_path TEXT,
-        duration REAL NOT NULL,
-        size_bytes INTEGER,
-        lock_flip_h INTEGER DEFAULT 0,
-        drive_file_id TEXT,
-        source_type TEXT NOT NULL,
-        content_hash TEXT,
-        created_at TEXT NOT NULL
-      );
-    `;
+      try {
+        await client.sql`
+          CREATE TABLE IF NOT EXISTS lachvid_parent_projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            owner_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+        `;
 
-    try {
-      await client.sql`ALTER TABLE lachvid_category_items ADD COLUMN content_hash TEXT;`;
-    } catch {
-      // ignore if already exists
-    }
+        await client.sql`
+          CREATE TABLE IF NOT EXISTS lachvid_projects (
+            id TEXT PRIMARY KEY,
+            parent_project_id TEXT,
+            name TEXT NOT NULL,
+            description TEXT,
+            settings TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+        `;
 
-    await client.sql`
-      CREATE TABLE IF NOT EXISTS lachvid_voice_items (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        file_name TEXT NOT NULL,
-        local_url TEXT NOT NULL,
-        local_path TEXT,
-        duration REAL NOT NULL,
-        source_type TEXT NOT NULL,
-        drive_file_id TEXT,
-        drive_raw_url TEXT,
-        created_at TEXT NOT NULL
-      );
-    `;
+        // Safely check and add columns to lachvid_projects without triggering duplicate column errors
+        try {
+          const projectCols = (await client.sql`PRAGMA table_info(lachvid_projects);`) as Array<{ name?: string }>;
+          const projectColNames = new Set(
+            Array.isArray(projectCols)
+              ? projectCols.map((c) => String(c.name || "").toLowerCase())
+              : []
+          );
 
-    await client.sql`
-      CREATE TABLE IF NOT EXISTS lachvid_rendered_history (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        tuple_key TEXT NOT NULL,
-        video_name TEXT,
-        payload TEXT,
-        rendered_at TEXT NOT NULL
-      );
-    `;
+          if (!projectColNames.has("settings")) {
+            await client.sql`ALTER TABLE lachvid_projects ADD COLUMN settings TEXT;`;
+          }
+          if (!projectColNames.has("parent_project_id")) {
+            await client.sql`ALTER TABLE lachvid_projects ADD COLUMN parent_project_id TEXT;`;
+          }
+        } catch {
+          // ignore if pragma fails
+        }
 
-    try {
-      await client.sql`ALTER TABLE lachvid_rendered_history ADD COLUMN payload TEXT;`;
-    } catch {
-      // ignore if already exists
-    }
+        // Auto-migrate legacy projects to parent projects in SQLite Cloud
+        try {
+          const orphans = (await client.sql`
+            SELECT id, name, description, created_at, updated_at
+            FROM lachvid_projects
+            WHERE parent_project_id IS NULL OR parent_project_id = '';
+          `) as Array<{
+            id: string;
+            name: string;
+            description?: string;
+            created_at: string;
+            updated_at: string;
+          }>;
 
-    try {
-      await client.sql`ALTER TABLE lachvid_rendered_history ADD COLUMN status TEXT DEFAULT 'unused';`;
-    } catch {
-      // ignore if already exists
-    }
+          if (orphans && orphans.length > 0) {
+            for (const orphan of orphans) {
+              const parentId = `parent_${orphan.id}`;
+              await client.sql`
+                INSERT OR IGNORE INTO lachvid_parent_projects (id, name, description, created_at, updated_at)
+                VALUES (${parentId}, ${orphan.name}, ${orphan.description || ""}, ${orphan.created_at}, ${orphan.updated_at});
+              `;
+              await client.sql`
+                UPDATE lachvid_projects
+                SET parent_project_id = ${parentId}
+                WHERE id = ${orphan.id};
+              `;
+            }
+          }
+        } catch (migErr) {
+          console.warn("Migration orphan projects error:", migErr);
+        }
 
-    dbInitialized = true;
-  } catch (err) {
-    console.warn("Lỗi khi kết nối/khởi tạo SQLite Cloud, chuyển sang dùng local fallback:", err);
+        await client.sql`
+          CREATE TABLE IF NOT EXISTS lachvid_category_items (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            name TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            local_url TEXT NOT NULL,
+            local_path TEXT,
+            duration REAL NOT NULL,
+            size_bytes INTEGER,
+            lock_flip_h INTEGER DEFAULT 0,
+            drive_file_id TEXT,
+            source_type TEXT NOT NULL,
+            content_hash TEXT,
+            created_at TEXT NOT NULL
+          );
+        `;
+
+        // Safely check and add columns to lachvid_category_items
+        try {
+          const catCols = (await client.sql`PRAGMA table_info(lachvid_category_items);`) as Array<{ name?: string }>;
+          const catColNames = new Set(
+            Array.isArray(catCols)
+              ? catCols.map((c) => String(c.name || "").toLowerCase())
+              : []
+          );
+
+          if (!catColNames.has("content_hash")) {
+            await client.sql`ALTER TABLE lachvid_category_items ADD COLUMN content_hash TEXT;`;
+          }
+        } catch {
+          // ignore if pragma fails
+        }
+
+        await client.sql`
+          CREATE TABLE IF NOT EXISTS lachvid_voice_items (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            local_url TEXT NOT NULL,
+            local_path TEXT,
+            duration REAL NOT NULL,
+            source_type TEXT NOT NULL,
+            drive_file_id TEXT,
+            drive_raw_url TEXT,
+            created_at TEXT NOT NULL
+          );
+        `;
+
+        await client.sql`
+          CREATE TABLE IF NOT EXISTS lachvid_rendered_history (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            tuple_key TEXT NOT NULL,
+            video_name TEXT,
+            payload TEXT,
+            rendered_at TEXT NOT NULL
+          );
+        `;
+
+        // Safely check and add columns to lachvid_rendered_history
+        try {
+          const histCols = (await client.sql`PRAGMA table_info(lachvid_rendered_history);`) as Array<{ name?: string }>;
+          const histColNames = new Set(
+            Array.isArray(histCols)
+              ? histCols.map((c) => String(c.name || "").toLowerCase())
+              : []
+          );
+
+          if (!histColNames.has("payload")) {
+            await client.sql`ALTER TABLE lachvid_rendered_history ADD COLUMN payload TEXT;`;
+          }
+          if (!histColNames.has("status")) {
+            await client.sql`ALTER TABLE lachvid_rendered_history ADD COLUMN status TEXT DEFAULT 'unused';`;
+          }
+        } catch {
+          // ignore if pragma fails
+        }
+
+        dbInitialized = true;
+      } catch (err) {
+        console.warn("Lỗi khi kết nối/khởi tạo SQLite Cloud, chuyển sang dùng local fallback:", err);
+      }
+    })();
   }
+  return dbInitPromise;
 }
 
 export async function getParentProjects(): Promise<ParentProjectMeta[]> {
