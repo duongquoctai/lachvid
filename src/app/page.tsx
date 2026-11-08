@@ -12,26 +12,25 @@ import {
   Info,
   Layers,
   Loader2,
+  LogOut,
   MoreVertical,
   Pencil,
   Plus,
+  Share2,
   Trash2,
+  User as UserIcon,
   X,
 } from "lucide-react";
+import ShareProjectModal from "@/components/ShareProjectModal";
+import UserAvatarMenu from "@/components/UserAvatarMenu";
+import { ParentProjectMeta } from "@/lib/db";
+import { UserSafeProfile } from "@/types/lachvid";
 
-interface ProjectItem {
-  id: string;
-  name: string;
-  description?: string;
-  createdAt: string;
-  updatedAt: string;
-  foldersCount?: number;
-  poolCount?: number;
-  renderedCount?: number;
-}
+type ProjectItem = ParentProjectMeta;
 
 export default function HomePage() {
   const router = useRouter();
+  const [currentUser, setCurrentUser] = useState<UserSafeProfile | null>(null);
   const [projectList, setProjectList] = useState<ProjectItem[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [showCreateModal, setShowCreateModal] = useState<boolean>(false);
@@ -43,8 +42,14 @@ export default function HomePage() {
   const [isUpdating, setIsUpdating] = useState<boolean>(false);
   const [openMenuProjectId, setOpenMenuProjectId] = useState<string | null>(null);
   const [projectToDelete, setProjectToDelete] = useState<ProjectItem | null>(null);
+  const [projectToShare, setProjectToShare] = useState<ProjectItem | null>(null);
   const [isDeleting, setIsDeleting] = useState<boolean>(false);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
+  const [dbStatus, setDbStatus] = useState<{
+    isCloud: boolean;
+    connected: boolean;
+    error?: string;
+  } | null>(null);
 
   const [toasts, setToasts] = useState<
     Array<{
@@ -62,7 +67,7 @@ export default function HomePage() {
         setToasts((prev) => prev.filter((t) => t.id !== id));
       }, 5000);
     },
-    [],
+    []
   );
 
   const removeToast = useCallback((id: string) => {
@@ -76,6 +81,12 @@ export default function HomePage() {
       if (data.parentProjects) {
         setProjectList(data.parentProjects);
       }
+      if (data.currentUser) {
+        setCurrentUser(data.currentUser);
+      }
+      if (data.dbStatus) {
+        setDbStatus(data.dbStatus);
+      }
     } catch {
       // ignore
     } finally {
@@ -88,8 +99,10 @@ export default function HomePage() {
     fetch("/api/parent-projects")
       .then((res) => res.json())
       .then((data) => {
-        if (!ignore && data.parentProjects) {
-          setProjectList(data.parentProjects);
+        if (!ignore) {
+          if (data.parentProjects) setProjectList(data.parentProjects);
+          if (data.currentUser) setCurrentUser(data.currentUser);
+          if (data.dbStatus) setDbStatus(data.dbStatus);
         }
       })
       .catch(() => {})
@@ -101,6 +114,16 @@ export default function HomePage() {
       ignore = true;
     };
   }, []);
+
+  const handleLogout = async () => {
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+      router.push("/login");
+      router.refresh();
+    } catch {
+      router.push("/login");
+    }
+  };
 
   useEffect(() => {
     if (!openMenuProjectId) return;
@@ -229,13 +252,15 @@ export default function HomePage() {
           </div>
           <div>
             <h1 className="text-base font-extrabold tracking-tight">
-              <span>Lachvid Studio</span>
+              <span>OmniGen</span>
             </h1>
             <p className="text-xs text-slate-400">
               Hệ thống tách video slicer & trộn lách content mỹ phẩm
             </p>
           </div>
         </div>
+
+        <UserAvatarMenu user={currentUser} />
       </header>
 
       <main className="flex-1 p-6 max-w-7xl mx-auto w-full space-y-6">
@@ -268,6 +293,34 @@ export default function HomePage() {
             </div>
           </div>
 
+          {/* Cảnh báo kết nối SQLite Cloud */}
+          {dbStatus?.isCloud && !dbStatus?.connected && (
+            <div className="rounded-2xl border border-amber-500/40 bg-amber-500/10 p-4 flex items-start gap-3 text-amber-200">
+              <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+              <div className="space-y-1 text-xs">
+                <div className="font-bold text-amber-100">
+                  Kết nối SQLite Cloud tạm thời gián đoạn (Đang dùng dữ liệu cục bộ tạm thời)
+                </div>
+                <p className="text-amber-200/90 leading-relaxed">
+                  {dbStatus.error?.includes("paused")
+                    ? "Cụm cơ sở dữ liệu trên SQLite Cloud đã bị tạm dừng do không hoạt động (Inactivity pause). Vui lòng vào SQLite Cloud Dashboard và bấm nút Restart node để khôi phục toàn bộ các dự án cũ của bạn."
+                    : `Không thể kết nối với SQLite Cloud: ${dbStatus.error}. Hệ thống đang hiển thị dữ liệu lưu trữ cục bộ.`}
+                </p>
+                {dbStatus.error?.includes("paused") && (
+                  <a
+                    href="https://dashboard.sqlitecloud.io"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 px-3 py-1 mt-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 font-semibold transition"
+                  >
+                    <span>Mở SQLite Cloud Dashboard</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </a>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Project List */}
           {isLoading ? (
             <div className="py-20 flex flex-col items-center justify-center gap-3 text-slate-400">
@@ -297,118 +350,196 @@ export default function HomePage() {
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-              {projectList.map((p) => (
-                <Link
-                  key={p.id}
-                  href={`/projects/${p.id}`}
-                  className={`group bg-slate-900/80 hover:bg-slate-900 border border-slate-800 hover:border-indigo-500/50 rounded-2xl p-5 space-y-4 cursor-pointer transition-all hover:shadow-xl hover:shadow-indigo-950/40 relative flex flex-col justify-between ${
-                    openMenuProjectId === p.id ? "z-20 border-slate-700" : "z-0"
-                  }`}
-                >
-                  <div className="space-y-2.5">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex items-center gap-2.5">
-                        <div className="w-10 h-10 rounded-xl bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center text-indigo-300 group-hover:scale-105 transition">
-                          <Layers className="w-5 h-5" />
-                        </div>
-                        <div>
-                          <h3 className="text-sm font-bold text-white group-hover:text-indigo-300 transition">
-                            {p.name}
-                          </h3>
-                          <p className="text-[11px] text-slate-400">
-                            Cập nhật {new Date(p.updatedAt).toLocaleDateString("vi-VN")}
-                          </p>
-                        </div>
-                      </div>
+              {projectList.map((p) => {
+                const isOwner = p.isOwner ?? true;
+                const canEdit =
+                  isOwner ||
+                  Boolean(
+                    p.sharePermissions?.split?.enabled &&
+                      p.sharePermissions?.split?.actions.includes("edit")
+                  ) ||
+                  Boolean(
+                    p.sharePermissions?.mix?.enabled &&
+                      p.sharePermissions?.mix?.actions.includes("edit")
+                  ) ||
+                  Boolean(
+                    p.sharePermissions?.history?.enabled &&
+                      p.sharePermissions?.history?.actions.includes("edit")
+                  );
 
-                      <div className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            setOpenMenuProjectId((prev) => (prev === p.id ? null : p.id));
-                          }}
-                          className={`p-1.5 rounded-lg transition ${
-                            openMenuProjectId === p.id
-                              ? "text-white bg-slate-800"
-                              : "text-slate-500 hover:text-slate-300 hover:bg-slate-800"
-                          }`}
-                          title="Tùy chọn"
-                        >
-                          <MoreVertical className="w-4 h-4" />
-                        </button>
+                return (
+                  <Link
+                    key={p.id}
+                    href={`/projects/${p.id}`}
+                    className={`group bg-slate-900/80 hover:bg-slate-900 border border-slate-800 hover:border-indigo-500/50 rounded-2xl p-5 space-y-4 cursor-pointer transition-all hover:shadow-xl hover:shadow-indigo-950/40 relative flex flex-col justify-between ${
+                      openMenuProjectId === p.id ? "z-20 border-slate-700" : "z-0"
+                    }`}
+                  >
+                    <div className="space-y-2.5">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-start gap-2.5 min-w-0">
+                          <div className="w-10 h-10 rounded-xl bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center text-indigo-300 group-hover:scale-105 transition shrink-0 mt-0.5">
+                            <Layers className="w-5 h-5" />
+                          </div>
+                          <div className="min-w-0 space-y-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <h3 className="text-sm font-bold text-white group-hover:text-indigo-300 transition truncate">
+                                {p.name}
+                              </h3>
+                              {isOwner ? (
+                                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
+                                  Của tôi
+                                </span>
+                              ) : (
+                                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                                  Được chia sẻ
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[11px] text-slate-400">
+                              Cập nhật {new Date(p.updatedAt).toLocaleDateString("vi-VN")}
+                              {!isOwner && p.ownerEmail && (
+                                <span className="ml-1 text-slate-500">
+                                  • Bởi: {p.ownerName || p.ownerEmail}
+                                </span>
+                              )}
+                            </p>
+                          </div>
+                        </div>
 
-                        {openMenuProjectId === p.id && (
-                          <div
-                            className="absolute right-0 top-full mt-1.5 w-36 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl py-1 z-30 animate-in fade-in zoom-in-95 duration-150 backdrop-blur-md"
+                        <div className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            type="button"
                             onClick={(e) => {
                               e.stopPropagation();
                               e.preventDefault();
+                              setOpenMenuProjectId((prev) => (prev === p.id ? null : p.id));
                             }}
+                            className={`p-1.5 rounded-lg transition ${
+                              openMenuProjectId === p.id
+                                ? "text-white bg-slate-800"
+                                : "text-slate-500 hover:text-slate-300 hover:bg-slate-800"
+                            }`}
+                            title="Tùy chọn"
                           >
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                setOpenMenuProjectId(null);
-                                handleOpenEditModal(p, e);
-                              }}
-                              className="w-full px-3 py-2 text-left text-xs font-medium text-slate-300 hover:text-white hover:bg-indigo-600/20 flex items-center gap-2 transition"
-                            >
-                              <Pencil className="w-3.5 h-3.5 text-indigo-400" />
-                              <span>Sửa tên</span>
-                            </button>
+                            <MoreVertical className="w-4 h-4" />
+                          </button>
 
-                            <div className="h-px bg-slate-800 my-1" />
-
-                            <button
-                              type="button"
+                          {openMenuProjectId === p.id && (
+                            <div
+                              className="absolute right-0 top-full mt-1.5 w-40 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl py-1 z-30 animate-in fade-in zoom-in-95 duration-150 backdrop-blur-md"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 e.preventDefault();
-                                setOpenMenuProjectId(null);
-                                setProjectToDelete(p);
                               }}
-                              className="w-full px-3 py-2 text-left text-xs font-medium text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 flex items-center gap-2 transition"
                             >
-                              <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-                              <span>Xóa</span>
-                            </button>
-                          </div>
-                        )}
+                              {isOwner && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      setOpenMenuProjectId(null);
+                                      e.stopPropagation();
+                                      e.preventDefault();
+                                      setProjectToShare(p);
+                                    }}
+                                    className="w-full px-3 py-2 text-left text-xs font-medium text-indigo-300 hover:text-white hover:bg-indigo-600/20 flex items-center gap-2 transition"
+                                  >
+                                    <Share2 className="w-3.5 h-3.5 text-indigo-400" />
+                                    <span>Chia sẻ dự án</span>
+                                  </button>
+                                  <div className="h-px bg-slate-800 my-1" />
+                                </>
+                              )}
+
+                              {canEdit && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    setOpenMenuProjectId(null);
+                                    handleOpenEditModal(p, e);
+                                  }}
+                                  className="w-full px-3 py-2 text-left text-xs font-medium text-slate-300 hover:text-white hover:bg-indigo-600/20 flex items-center gap-2 transition"
+                                >
+                                  <Pencil className="w-3.5 h-3.5 text-indigo-400" />
+                                  <span>Sửa tên</span>
+                                </button>
+                              )}
+
+                              {isOwner && (
+                                <>
+                                  <div className="h-px bg-slate-800 my-1" />
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      e.preventDefault();
+                                      setOpenMenuProjectId(null);
+                                      setProjectToDelete(p);
+                                    }}
+                                    className="w-full px-3 py-2 text-left text-xs font-medium text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 flex items-center gap-2 transition"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                                    <span>Xóa</span>
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </div>
                       </div>
+
+                      {p.description && (
+                        <p className="text-xs text-slate-400 line-clamp-2 leading-relaxed">
+                          {p.description}
+                        </p>
+                      )}
+
+                      {!isOwner && p.sharePermissions && (
+                        <div className="flex items-center gap-1.5 flex-wrap pt-1">
+                          {p.sharePermissions.split?.enabled && (
+                            <span className="text-[10px] font-medium px-2 py-0.5 rounded bg-rose-500/10 text-rose-300 border border-rose-500/30">
+                              Tách: {p.sharePermissions.split.actions.join(", ")}
+                            </span>
+                          )}
+                          {p.sharePermissions.mix?.enabled && (
+                            <span className="text-[10px] font-medium px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/30">
+                              Trộn: {p.sharePermissions.mix.actions.join(", ")}
+                            </span>
+                          )}
+                          {p.sharePermissions.history?.enabled && (
+                            <span className="text-[10px] font-medium px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
+                              Lịch sử: {p.sharePermissions.history.actions.join(", ")}
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
 
-                    {p.description && (
-                      <p className="text-xs text-slate-400 line-clamp-2 leading-relaxed">
-                        {p.description}
-                      </p>
-                    )}
-                  </div>
+                    <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
+                      <div className="flex items-center gap-3">
+                        <span className="flex items-center gap-1 font-medium text-indigo-300">
+                          <FolderOpen className="w-3.5 h-3.5 text-indigo-400" />
+                          <span>{p.foldersCount || 0} folder</span>
+                        </span>
+                        <span className="flex items-center gap-1 font-medium text-slate-300">
+                          <Film className="w-3.5 h-3.5 text-sky-400" />
+                          <span>{p.poolCount || 0} clip</span>
+                        </span>
+                        <span className="flex items-center gap-1 font-medium text-emerald-300">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>{p.renderedCount || 0} đã render</span>
+                        </span>
+                      </div>
 
-                  <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
-                    <div className="flex items-center gap-3">
-                      <span className="flex items-center gap-1 font-medium text-indigo-300">
-                        <FolderOpen className="w-3.5 h-3.5 text-indigo-400" />
-                        <span>{p.foldersCount || 0} folder</span>
-                      </span>
-                      <span className="flex items-center gap-1 font-medium text-slate-300">
-                        <Film className="w-3.5 h-3.5 text-sky-400" />
-                        <span>{p.poolCount || 0} clip</span>
-                      </span>
-                      <span className="flex items-center gap-1 font-medium text-emerald-300">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                        <span>{p.renderedCount || 0} đã render</span>
+                      <span className="text-[11px] font-bold text-indigo-400 group-hover:translate-x-0.5 transition flex items-center gap-1">
+                        <span>Mở</span>
+                        <ChevronRight className="w-3 h-3" />
                       </span>
                     </div>
-
-                    <span className="text-[11px] font-bold text-indigo-400 group-hover:translate-x-0.5 transition flex items-center gap-1">
-                      <span>Mở</span>
-                      <ChevronRight className="w-3 h-3" />
-                    </span>
-                  </div>
-                </Link>
-              ))}
+                  </Link>
+                );
+              })}
             </div>
           )}
         </div>
@@ -632,6 +763,16 @@ export default function HomePage() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Modal chia sẻ dự án */}
+      {projectToShare && (
+        <ShareProjectModal
+          projectId={projectToShare.id}
+          projectName={projectToShare.name}
+          onClose={() => setProjectToShare(null)}
+          onToast={addToast}
+        />
       )}
 
       {/* Global Loading Overlay */}

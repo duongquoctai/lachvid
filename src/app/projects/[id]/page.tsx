@@ -16,9 +16,13 @@ import {
   MoreVertical,
   Pencil,
   Plus,
+  Share2,
   Trash2,
   X,
 } from "lucide-react";
+import ShareProjectModal from "@/components/ShareProjectModal";
+import UserAvatarMenu from "@/components/UserAvatarMenu";
+import { ProjectAccessInfo } from "@/types/lachvid";
 
 interface FolderItem {
   id: string;
@@ -34,6 +38,9 @@ interface ParentProjectInfo {
   id: string;
   name: string;
   description?: string;
+  ownerId?: string;
+  ownerName?: string;
+  ownerEmail?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -44,6 +51,8 @@ export default function ProjectFoldersPage() {
   const projectId = typeof params?.id === "string" ? params.id : "";
 
   const [parentProject, setParentProject] = useState<ParentProjectInfo | null>(null);
+  const [access, setAccess] = useState<ProjectAccessInfo | null>(null);
+  const [showShareModal, setShowShareModal] = useState<boolean>(false);
   const [folders, setFolders] = useState<FolderItem[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
@@ -97,6 +106,9 @@ export default function ProjectFoldersPage() {
         if (data.parentProject) {
           setParentProject(data.parentProject);
           setFolders(data.folders || []);
+          if (data.access) {
+            setAccess(data.access);
+          }
           setIsLoading(false);
           return;
         }
@@ -121,8 +133,29 @@ export default function ProjectFoldersPage() {
   }, [projectId, router]);
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    let ignore = false;
+    if (!projectId) return;
+
+    fetch(`/api/parent-projects/${encodeURIComponent(projectId)}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (!ignore) {
+          if (data.parentProject) {
+            setParentProject(data.parentProject);
+            setFolders(data.folders || []);
+            if (data.access) setAccess(data.access);
+          }
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!ignore) setIsLoading(false);
+      });
+
+    return () => {
+      ignore = true;
+    };
+  }, [projectId]);
 
   useEffect(() => {
     if (!openMenuFolderId) return;
@@ -270,6 +303,8 @@ export default function ProjectFoldersPage() {
             </span>
           </div>
         </div>
+
+        <UserAvatarMenu showProjectsShortcut={true} />
       </header>
 
       <main className="flex-1 p-6 max-w-7xl mx-auto w-full space-y-6">
@@ -279,13 +314,22 @@ export default function ProjectFoldersPage() {
             <div className="absolute -top-12 -right-12 w-48 h-48 bg-indigo-500/10 rounded-full blur-3xl pointer-events-none" />
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 relative z-10">
               <div className="space-y-1.5">
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <h2 className="text-xl font-extrabold text-white tracking-tight">
                     {parentProject?.name || "Dự án"}
                   </h2>
                   <span className="text-xs font-normal px-2.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
                     {folders.length} folder
                   </span>
+                  {access?.isOwner ? (
+                    <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
+                      Chủ sở hữu
+                    </span>
+                  ) : access?.owner ? (
+                    <span className="text-xs font-medium px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                      Được chia sẻ bởi {access.owner.name || access.owner.email}
+                    </span>
+                  ) : null}
                 </div>
                 <p className="text-xs text-slate-400 max-w-2xl leading-relaxed">
                   {parentProject?.description ||
@@ -303,14 +347,29 @@ export default function ProjectFoldersPage() {
                 </div>
               </div>
 
-              <button
-                type="button"
-                onClick={() => setShowCreateModal(true)}
-                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow-xl shadow-indigo-600/30 transition shrink-0"
-              >
-                <Plus className="w-4 h-4" />
-                <span>Tạo folder mới</span>
-              </button>
+              <div className="flex items-center gap-2.5 shrink-0 flex-wrap">
+                {access?.isOwner && (
+                  <button
+                    type="button"
+                    onClick={() => setShowShareModal(true)}
+                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 hover:bg-slate-700 text-indigo-300 text-xs font-bold border border-slate-700 transition"
+                  >
+                    <Share2 className="w-4 h-4 text-indigo-400" />
+                    <span>Chia sẻ dự án</span>
+                  </button>
+                )}
+
+                {access?.canManageFolders && (
+                  <button
+                    type="button"
+                    onClick={() => setShowCreateModal(true)}
+                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow-xl shadow-indigo-600/30 transition shrink-0"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>Tạo folder mới</span>
+                  </button>
+                )}
+              </div>
             </div>
           </div>
 
@@ -367,62 +426,64 @@ export default function ProjectFoldersPage() {
                         </div>
                       </div>
 
-                      <div className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            setOpenMenuFolderId((prev) => (prev === f.id ? null : f.id));
-                          }}
-                          className={`p-1.5 rounded-lg transition ${
-                            openMenuFolderId === f.id
-                              ? "text-white bg-slate-800"
-                              : "text-slate-500 hover:text-slate-300 hover:bg-slate-800"
-                          }`}
-                          title="Tùy chọn"
-                        >
-                          <MoreVertical className="w-4 h-4" />
-                        </button>
-
-                        {openMenuFolderId === f.id && (
-                          <div
-                            className="absolute right-0 top-full mt-1.5 w-36 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl py-1 z-30 animate-in fade-in zoom-in-95 duration-150 backdrop-blur-md"
+                      {access?.canManageFolders && (
+                        <div className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            type="button"
                             onClick={(e) => {
                               e.stopPropagation();
                               e.preventDefault();
+                              setOpenMenuFolderId((prev) => (prev === f.id ? null : f.id));
                             }}
+                            className={`p-1.5 rounded-lg transition ${
+                              openMenuFolderId === f.id
+                                ? "text-white bg-slate-800"
+                                : "text-slate-500 hover:text-slate-300 hover:bg-slate-800"
+                            }`}
+                            title="Tùy chọn"
                           >
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                setOpenMenuFolderId(null);
-                                handleOpenEditModal(f, e);
-                              }}
-                              className="w-full px-3 py-2 text-left text-xs font-medium text-slate-300 hover:text-white hover:bg-indigo-600/20 flex items-center gap-2 transition"
-                            >
-                              <Pencil className="w-3.5 h-3.5 text-indigo-400" />
-                              <span>Sửa tên</span>
-                            </button>
+                            <MoreVertical className="w-4 h-4" />
+                          </button>
 
-                            <div className="h-px bg-slate-800 my-1" />
-
-                            <button
-                              type="button"
+                          {openMenuFolderId === f.id && (
+                            <div
+                              className="absolute right-0 top-full mt-1.5 w-36 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl py-1 z-30 animate-in fade-in zoom-in-95 duration-150 backdrop-blur-md"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 e.preventDefault();
-                                setOpenMenuFolderId(null);
-                                setFolderToDelete(f);
                               }}
-                              className="w-full px-3 py-2 text-left text-xs font-medium text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 flex items-center gap-2 transition"
                             >
-                              <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-                              <span>Xóa</span>
-                            </button>
-                          </div>
-                        )}
-                      </div>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  setOpenMenuFolderId(null);
+                                  handleOpenEditModal(f, e);
+                                }}
+                                className="w-full px-3 py-2 text-left text-xs font-medium text-slate-300 hover:text-white hover:bg-indigo-600/20 flex items-center gap-2 transition"
+                              >
+                                <Pencil className="w-3.5 h-3.5 text-indigo-400" />
+                                <span>Sửa tên</span>
+                              </button>
+
+                              <div className="h-px bg-slate-800 my-1" />
+
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  e.preventDefault();
+                                  setOpenMenuFolderId(null);
+                                  setFolderToDelete(f);
+                                }}
+                                className="w-full px-3 py-2 text-left text-xs font-medium text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 flex items-center gap-2 transition"
+                              >
+                                <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                                <span>Xóa</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
 
                     {f.description && (
@@ -674,6 +735,16 @@ export default function ProjectFoldersPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Modal chia sẻ dự án */}
+      {showShareModal && parentProject && (
+        <ShareProjectModal
+          projectId={parentProject.id}
+          projectName={parentProject.name}
+          onClose={() => setShowShareModal(false)}
+          onToast={addToast}
+        />
       )}
 
       {/* Global Loading Overlay */}

@@ -351,3 +351,74 @@ export interface RenderedVideoRecord {
   renderedAt: string;
 }
 
+// ==========================================
+// User & Auth Types
+// ==========================================
+
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+  passwordHash?: string | null;
+  avatarUrl?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type UserSafeProfile = Omit<User, "passwordHash">;
+
+export interface SessionPayload {
+  userId: string;
+  email: string;
+  name: string;
+  exp: number;
+}
+
+// ==========================================
+// Project Sharing & Module Permissions
+// ==========================================
+
+export type ModuleAction = "view" | "export" | "edit";
+
+export interface ModulePermissionConfig {
+  enabled: boolean;
+  actions: ModuleAction[];
+}
+
+export interface ProjectSharePermissions {
+  split: ModulePermissionConfig;
+  mix: ModulePermissionConfig;
+  history: ModulePermissionConfig;
+}
+
+export const DEFAULT_SHARE_PERMISSIONS: ProjectSharePermissions = {
+  split: { enabled: true, actions: ["view", "export"] },
+  mix: { enabled: true, actions: ["view", "export"] },
+  history: { enabled: true, actions: ["view", "export"] },
+};
+
+export interface ResourceShare {
+  id: string;
+  resourceType: "project" | "folder";
+  resourceId: string;
+  ownerId: string;
+  sharedWithEmail: string;
+  sharedWithUserId?: string | null;
+  permissions: ProjectSharePermissions;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectAccessInfo {
+  role: "owner" | "shared" | "none";
+  isOwner: boolean;
+  canManageFolders: boolean; // True nếu là owner hoặc có quyền edit ở ít nhất 1 module
+  permissions: ProjectSharePermissions;
+  owner?: {
+    id: string;
+    email: string;
+    name: string;
+  };
+}
+
+

@@ -1,13 +1,25 @@
 import { Database } from "@sqlitecloud/drivers";
 import fs from "node:fs";
 import path from "node:path";
+import { hashPassword } from "@/lib/password";
 import {
   CategoryPools,
   CategoryVideoItem,
+  DEFAULT_SHARE_PERMISSIONS,
   MultiVoiceItem,
+  ProjectAccessInfo,
+  ProjectSharePermissions,
   RenderedVideoRecord,
+  ResourceShare,
   ShotCategory,
+  User,
+  UserSafeProfile,
 } from "@/types/lachvid";
+
+export const DEFAULT_USER_ID = "usr_skin1004";
+export const DEFAULT_USER_EMAIL = "skin1004@omnigen.local";
+export const DEFAULT_USER_NAME = "Skin1004 Team";
+export const DEFAULT_USER_PASSWORD = "skin1004";
 
 export interface ParentProjectMeta {
   id: string;
@@ -20,6 +32,11 @@ export interface ParentProjectMeta {
   poolCount?: number;
   renderedCount?: number;
   voiceCount?: number;
+  // Sharing & ownership context
+  isOwner?: boolean;
+  sharePermissions?: ProjectSharePermissions;
+  ownerName?: string;
+  ownerEmail?: string;
 }
 
 export interface ProjectMeta {
@@ -46,6 +63,8 @@ function ensureLocalDataDir() {
 }
 
 interface LocalStorageSchema {
+  users: Record<string, User>;
+  shares: Record<string, ResourceShare>;
   parentProjects: Record<string, ParentProjectMeta>;
   projects: Record<string, ProjectMeta>;
   pools: Record<string, CategoryPools>;
@@ -55,8 +74,20 @@ interface LocalStorageSchema {
 
 function readLocalStorage(): LocalStorageSchema {
   ensureLocalDataDir();
+  const now = new Date().toISOString();
   if (!fs.existsSync(LOCAL_FALLBACK_FILE)) {
     const init: LocalStorageSchema = {
+      users: {
+        [DEFAULT_USER_ID]: {
+          id: DEFAULT_USER_ID,
+          email: DEFAULT_USER_EMAIL,
+          name: DEFAULT_USER_NAME,
+          passwordHash: hashPassword(DEFAULT_USER_PASSWORD),
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+      shares: {},
       parentProjects: {},
       projects: {},
       pools: {},
@@ -68,14 +99,30 @@ function readLocalStorage(): LocalStorageSchema {
   }
   try {
     const data = JSON.parse(fs.readFileSync(LOCAL_FALLBACK_FILE, "utf8"));
+    if (!data.users) data.users = {};
+    if (!data.shares) data.shares = {};
     if (!data.parentProjects) data.parentProjects = {};
     if (!data.voices) data.voices = {};
     if (!data.rendered) data.rendered = {};
     if (!data.pools) data.pools = {};
     if (!data.projects) data.projects = {};
 
-    // Auto-migrate legacy projects to each have a matching parent project
     let changed = false;
+
+    // Đảm bảo có user mặc định
+    if (!data.users[DEFAULT_USER_ID]) {
+      data.users[DEFAULT_USER_ID] = {
+        id: DEFAULT_USER_ID,
+        email: DEFAULT_USER_EMAIL,
+        name: DEFAULT_USER_NAME,
+        passwordHash: hashPassword(DEFAULT_USER_PASSWORD),
+        createdAt: now,
+        updatedAt: now,
+      };
+      changed = true;
+    }
+
+    // Auto-migrate legacy projects to each have a matching parent project and default owner
     for (const p of Object.values(data.projects as Record<string, ProjectMeta>)) {
       if (!p.parentProjectId) {
         const parentId = `parent_${p.id}`;
@@ -84,6 +131,7 @@ function readLocalStorage(): LocalStorageSchema {
             id: parentId,
             name: p.name,
             description: p.description || "",
+            ownerId: DEFAULT_USER_ID,
             createdAt: p.createdAt,
             updatedAt: p.updatedAt,
           };
@@ -92,6 +140,75 @@ function readLocalStorage(): LocalStorageSchema {
         changed = true;
       }
     }
+
+    // Migrate owner_id cho tất cả parent_projects cũ
+    for (const parent of Object.values(data.parentProjects as Record<string, ParentProjectMeta>)) {
+      if (!parent.ownerId) {
+        parent.ownerId = DEFAULT_USER_ID;
+        changed = true;
+      }
+    }
+
+    // Tự động chuyển dữ liệu cũ từ project_state.json nếu chưa có dự án nào
+    if (Object.keys(data.parentProjects).length === 0) {
+      const stateFile = path.join(process.cwd(), "data", "project_state.json");
+      if (fs.existsSync(stateFile)) {
+        try {
+          const stateData = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+          if (stateData && (stateData.sourceVideo || Array.isArray(stateData.shots))) {
+            const parentId = "parent_legacy_skin1004";
+            const folderId = "folder_legacy_skin1004";
+            const pName = stateData.sourceVideo?.name || "Dự án Skin1004 (Gốc)";
+            data.parentProjects[parentId] = {
+              id: parentId,
+              name: pName,
+              description: "Dự án tự động chuyển đổi từ dữ liệu cục bộ",
+              ownerId: DEFAULT_USER_ID,
+              createdAt: stateData.sourceVideo?.createdAt || now,
+              updatedAt: now,
+            };
+            data.projects[folderId] = {
+              id: folderId,
+              parentProjectId: parentId,
+              name: "Folder mặc định",
+              description: "Thư mục video và cắt cảnh",
+              settings: stateData.diversityConfig || {},
+              createdAt: stateData.sourceVideo?.createdAt || now,
+              updatedAt: now,
+            };
+            if (Array.isArray(stateData.shots) && stateData.shots.length > 0) {
+              const poolObj: CategoryPools = {
+                open: [],
+                product: [],
+                texture: [],
+                apply: [],
+                end: [],
+              };
+              for (const s of stateData.shots) {
+                const cat = (s.category || "open") as ShotCategory;
+                if (poolObj[cat]) {
+                  poolObj[cat].push({
+                    id: s.id,
+                    name: s.label || s.id,
+                    fileName: stateData.sourceVideo?.fileName || "video.mp4",
+                    category: cat,
+                    localUrl: stateData.sourceVideo?.localUrl || "",
+                    localPath: stateData.sourceVideo?.localPath,
+                    duration: (s.end || 0) - (s.begin || 0),
+                    sourceType: "local",
+                  });
+                }
+              }
+              data.pools[folderId] = poolObj;
+            }
+            changed = true;
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
     if (changed) {
       fs.writeFileSync(LOCAL_FALLBACK_FILE, JSON.stringify(data, null, 2), "utf8");
     }
@@ -99,6 +216,17 @@ function readLocalStorage(): LocalStorageSchema {
     return data;
   } catch {
     return {
+      users: {
+        [DEFAULT_USER_ID]: {
+          id: DEFAULT_USER_ID,
+          email: DEFAULT_USER_EMAIL,
+          name: DEFAULT_USER_NAME,
+          passwordHash: hashPassword(DEFAULT_USER_PASSWORD),
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+      shares: {},
       parentProjects: {},
       projects: {},
       pools: {},
@@ -116,6 +244,20 @@ function writeLocalStorage(data: LocalStorageSchema) {
 let dbClient: Database | null = null;
 let dbInitialized = false;
 let dbInitPromise: Promise<void> | null = null;
+let lastCloudError: string | null = null;
+
+export function getDatabaseStatus(): {
+  isCloud: boolean;
+  connected: boolean;
+  error?: string;
+} {
+  const isCloud = Boolean(process.env.SQLITE_CLOUD_URL?.trim());
+  return {
+    isCloud,
+    connected: isCloud ? dbInitialized : true,
+    error: isCloud && !dbInitialized ? lastCloudError || undefined : undefined,
+  };
+}
 
 function getClient(): Database | null {
   const connectionUrl = process.env.SQLITE_CLOUD_URL?.trim();
@@ -139,6 +281,48 @@ export async function initDatabase() {
       }
 
       try {
+        const now = new Date().toISOString();
+
+        // 1. Users table
+        await client.sql`
+          CREATE TABLE IF NOT EXISTS lachvid_users (
+            id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            password_hash TEXT,
+            avatar_url TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+        `;
+
+        // 2. OAuth accounts table (chuẩn bị mở rộng Google / Facebook)
+        await client.sql`
+          CREATE TABLE IF NOT EXISTS lachvid_oauth_accounts (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            provider_account_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+        `;
+
+        // 3. Resource shares table
+        await client.sql`
+          CREATE TABLE IF NOT EXISTS lachvid_resource_shares (
+            id TEXT PRIMARY KEY,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            shared_with_email TEXT NOT NULL,
+            shared_with_user_id TEXT,
+            permissions TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+        `;
+
+        // 4. Parent projects table
         await client.sql`
           CREATE TABLE IF NOT EXISTS lachvid_parent_projects (
             id TEXT PRIMARY KEY,
@@ -150,6 +334,7 @@ export async function initDatabase() {
           );
         `;
 
+        // 5. Folders table
         await client.sql`
           CREATE TABLE IF NOT EXISTS lachvid_projects (
             id TEXT PRIMARY KEY,
@@ -161,6 +346,21 @@ export async function initDatabase() {
             updated_at TEXT NOT NULL
           );
         `;
+
+        // Safely check and add columns to lachvid_parent_projects
+        try {
+          const parentCols = (await client.sql`PRAGMA table_info(lachvid_parent_projects);`) as Array<{ name?: string }>;
+          const parentColNames = new Set(
+            Array.isArray(parentCols)
+              ? parentCols.map((c) => String(c.name || "").toLowerCase())
+              : []
+          );
+          if (!parentColNames.has("owner_id")) {
+            await client.sql`ALTER TABLE lachvid_parent_projects ADD COLUMN owner_id TEXT;`;
+          }
+        } catch {
+          // ignore if pragma fails
+        }
 
         // Safely check and add columns to lachvid_projects without triggering duplicate column errors
         try {
@@ -181,7 +381,18 @@ export async function initDatabase() {
           // ignore if pragma fails
         }
 
-        // Auto-migrate legacy projects to parent projects in SQLite Cloud
+        // Tạo user mặc định skin1004@omnigen.local trong SQLite Cloud nếu chưa có
+        try {
+          const defaultPasswordHash = hashPassword(DEFAULT_USER_PASSWORD);
+          await client.sql`
+            INSERT OR IGNORE INTO lachvid_users (id, email, name, password_hash, created_at, updated_at)
+            VALUES (${DEFAULT_USER_ID}, ${DEFAULT_USER_EMAIL}, ${DEFAULT_USER_NAME}, ${defaultPasswordHash}, ${now}, ${now});
+          `;
+        } catch (uErr) {
+          console.warn("Default user create warning:", uErr);
+        }
+
+        // Auto-migrate legacy projects to parent projects in SQLite Cloud & assign owner_id
         try {
           const orphans = (await client.sql`
             SELECT id, name, description, created_at, updated_at
@@ -199,8 +410,8 @@ export async function initDatabase() {
             for (const orphan of orphans) {
               const parentId = `parent_${orphan.id}`;
               await client.sql`
-                INSERT OR IGNORE INTO lachvid_parent_projects (id, name, description, created_at, updated_at)
-                VALUES (${parentId}, ${orphan.name}, ${orphan.description || ""}, ${orphan.created_at}, ${orphan.updated_at});
+                INSERT OR IGNORE INTO lachvid_parent_projects (id, name, description, owner_id, created_at, updated_at)
+                VALUES (${parentId}, ${orphan.name}, ${orphan.description || ""}, ${DEFAULT_USER_ID}, ${orphan.created_at}, ${orphan.updated_at});
               `;
               await client.sql`
                 UPDATE lachvid_projects
@@ -209,6 +420,13 @@ export async function initDatabase() {
               `;
             }
           }
+
+          // Migrate các parent projects cũ chưa có owner_id
+          await client.sql`
+            UPDATE lachvid_parent_projects
+            SET owner_id = ${DEFAULT_USER_ID}
+            WHERE owner_id IS NULL OR owner_id = '';
+          `;
         } catch (migErr) {
           console.warn("Migration orphan projects error:", migErr);
         }
@@ -295,7 +513,11 @@ export async function initDatabase() {
         }
 
         dbInitialized = true;
-      } catch (err) {
+        lastCloudError = null;
+      } catch (err: unknown) {
+        dbInitialized = false;
+        dbInitPromise = null;
+        lastCloudError = err instanceof Error ? err.message : String(err);
         console.warn("Lỗi khi kết nối/khởi tạo SQLite Cloud, chuyển sang dùng local fallback:", err);
       }
     })();
@@ -303,12 +525,606 @@ export async function initDatabase() {
   return dbInitPromise;
 }
 
-export async function getParentProjects(): Promise<ParentProjectMeta[]> {
+// ==========================================
+// User Operations
+// ==========================================
+
+export async function getUserById(id: string): Promise<User | null> {
   await initDatabase();
   const client = getClient();
   if (!client || !dbInitialized) {
     const local = readLocalStorage();
-    const list = Object.values(local.parentProjects || {});
+    return local.users?.[id] || null;
+  }
+  try {
+    const rows = (await client.sql`
+      SELECT * FROM lachvid_users WHERE id = ${id} LIMIT 1;
+    `) as Array<{
+      id: string;
+      email: string;
+      name: string;
+      password_hash?: string;
+      avatar_url?: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+    if (!rows || rows.length === 0) return null;
+    const r = rows[0];
+    return {
+      id: r.id,
+      email: r.email,
+      name: r.name,
+      passwordHash: r.password_hash || undefined,
+      avatarUrl: r.avatar_url || undefined,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    };
+  } catch (err) {
+    console.error("Lỗi getUserById:", err);
+    return null;
+  }
+}
+
+export async function getUserByEmail(email: string): Promise<User | null> {
+  await initDatabase();
+  const normalized = email.trim().toLowerCase();
+  const client = getClient();
+  if (!client || !dbInitialized) {
+    const local = readLocalStorage();
+    const user = Object.values(local.users || {}).find(
+      (u) => u.email.toLowerCase() === normalized
+    );
+    return user || null;
+  }
+  try {
+    const rows = (await client.sql`
+      SELECT * FROM lachvid_users WHERE LOWER(email) = ${normalized} LIMIT 1;
+    `) as Array<{
+      id: string;
+      email: string;
+      name: string;
+      password_hash?: string;
+      avatar_url?: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+    if (!rows || rows.length === 0) return null;
+    const r = rows[0];
+    return {
+      id: r.id,
+      email: r.email,
+      name: r.name,
+      passwordHash: r.password_hash || undefined,
+      avatarUrl: r.avatar_url || undefined,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    };
+  } catch (err) {
+    console.error("Lỗi getUserByEmail:", err);
+    return null;
+  }
+}
+
+export async function listUsers(
+  excludeUserId?: string
+): Promise<UserSafeProfile[]> {
+  await initDatabase();
+  const client = getClient();
+  if (!client || !dbInitialized) {
+    const local = readLocalStorage();
+    return Object.values(local.users || {})
+      .filter((u) => !excludeUserId || u.id !== excludeUserId)
+      .map((u) => ({
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        avatarUrl: u.avatarUrl || undefined,
+        createdAt: u.createdAt,
+        updatedAt: u.updatedAt,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+  try {
+    const rows = (await client.sql`
+      SELECT id, email, name, avatar_url, created_at, updated_at
+      FROM lachvid_users
+      WHERE (${excludeUserId || ""} = '' OR id != ${excludeUserId || ""})
+      ORDER BY name ASC;
+    `) as Array<{
+      id: string;
+      email: string;
+      name: string;
+      avatar_url?: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+
+    return (rows || []).map((r) => ({
+      id: r.id,
+      email: r.email,
+      name: r.name,
+      avatarUrl: r.avatar_url || undefined,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    }));
+  } catch (err) {
+    console.error("Lỗi listUsers:", err);
+    return [];
+  }
+}
+
+export async function createUser(data: {
+  email: string;
+  name: string;
+  passwordHash?: string;
+  avatarUrl?: string;
+}): Promise<User> {
+  await initDatabase();
+  const id = `usr_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 6)}`;
+  const now = new Date().toISOString();
+  const newUser: User = {
+    id,
+    email: data.email.trim().toLowerCase(),
+    name: data.name.trim(),
+    passwordHash: data.passwordHash,
+    avatarUrl: data.avatarUrl,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const client = getClient();
+  if (!client || !dbInitialized) {
+    const local = readLocalStorage();
+    local.users[id] = newUser;
+    writeLocalStorage(local);
+    await claimPendingSharesForUser(newUser.id, newUser.email);
+    return newUser;
+  }
+
+  try {
+    await client.sql`
+      INSERT INTO lachvid_users (id, email, name, password_hash, avatar_url, created_at, updated_at)
+      VALUES (${id}, ${newUser.email}, ${newUser.name}, ${
+      newUser.passwordHash || null
+    }, ${newUser.avatarUrl || null}, ${now}, ${now});
+    `;
+    await claimPendingSharesForUser(newUser.id, newUser.email);
+    return newUser;
+  } catch (err) {
+    console.error("Lỗi createUser:", err);
+    throw err;
+  }
+}
+
+/**
+ * Tự động liên kết các bản ghi chia sẻ đang chờ kích hoạt theo email khi user mới đăng ký
+ */
+export async function claimPendingSharesForUser(
+  userId: string,
+  email: string
+): Promise<void> {
+  const normalized = email.trim().toLowerCase();
+  const client = getClient();
+  if (!client || !dbInitialized) {
+    const local = readLocalStorage();
+    let changed = false;
+    for (const s of Object.values(local.shares || {})) {
+      if (s.sharedWithEmail.toLowerCase() === normalized && !s.sharedWithUserId) {
+        s.sharedWithUserId = userId;
+        changed = true;
+      }
+    }
+    if (changed) writeLocalStorage(local);
+    return;
+  }
+  try {
+    await client.sql`
+      UPDATE lachvid_resource_shares
+      SET shared_with_user_id = ${userId}
+      WHERE LOWER(shared_with_email) = ${normalized} AND (shared_with_user_id IS NULL OR shared_with_user_id = '');
+    `;
+  } catch (err) {
+    console.warn("Lỗi claimPendingSharesForUser:", err);
+  }
+}
+
+// ==========================================
+// Project Sharing Operations
+// ==========================================
+
+export async function getProjectShares(
+  projectId: string
+): Promise<Array<ResourceShare & { sharedUserName?: string }>> {
+  await initDatabase();
+  const client = getClient();
+  if (!client || !dbInitialized) {
+    const local = readLocalStorage();
+    const list = Object.values(local.shares || {}).filter(
+      (s) => s.resourceType === "project" && s.resourceId === projectId
+    );
+    return list.map((s) => ({
+      ...s,
+      sharedUserName: s.sharedWithUserId
+        ? local.users?.[s.sharedWithUserId]?.name
+        : undefined,
+    }));
+  }
+  try {
+    const rows = (await client.sql`
+      SELECT s.*, u.name as user_name
+      FROM lachvid_resource_shares s
+      LEFT JOIN lachvid_users u ON s.shared_with_user_id = u.id
+      WHERE s.resource_type = 'project' AND s.resource_id = ${projectId}
+      ORDER BY s.created_at DESC;
+    `) as Array<{
+      id: string;
+      resource_type: "project" | "folder";
+      resource_id: string;
+      owner_id: string;
+      shared_with_email: string;
+      shared_with_user_id?: string;
+      permissions: string;
+      created_at: string;
+      updated_at: string;
+      user_name?: string;
+    }>;
+
+    return rows.map((r) => {
+      let perms = DEFAULT_SHARE_PERMISSIONS;
+      try {
+        perms = JSON.parse(r.permissions);
+      } catch {
+        // fallback
+      }
+      return {
+        id: r.id,
+        resourceType: r.resource_type,
+        resourceId: r.resource_id,
+        ownerId: r.owner_id,
+        sharedWithEmail: r.shared_with_email,
+        sharedWithUserId: r.shared_with_user_id || undefined,
+        permissions: perms,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+        sharedUserName: r.user_name || undefined,
+      };
+    });
+  } catch (err) {
+    console.error("Lỗi getProjectShares:", err);
+    return [];
+  }
+}
+
+export async function shareProject(
+  ownerId: string,
+  projectId: string,
+  sharedWithEmail: string,
+  permissions: ProjectSharePermissions
+): Promise<ResourceShare> {
+  await initDatabase();
+  const normalizedEmail = sharedWithEmail.trim().toLowerCase();
+  const existingUser = await getUserByEmail(normalizedEmail);
+  const now = new Date().toISOString();
+  const permsStr = JSON.stringify(permissions);
+
+  const client = getClient();
+  if (!client || !dbInitialized) {
+    const local = readLocalStorage();
+    // Kiểm tra xem đã có share cho email này với project này chưa
+    const existingShare = Object.values(local.shares || {}).find(
+      (s) =>
+        s.resourceType === "project" &&
+        s.resourceId === projectId &&
+        s.sharedWithEmail.toLowerCase() === normalizedEmail
+    );
+
+    if (existingShare) {
+      existingShare.permissions = permissions;
+      existingShare.sharedWithUserId = existingUser?.id || existingShare.sharedWithUserId;
+      existingShare.updatedAt = now;
+      writeLocalStorage(local);
+      return existingShare;
+    }
+
+    const id = `shr_${Date.now().toString(36)}_${Math.random()
+      .toString(36)
+      .slice(2, 6)}`;
+    const newShare: ResourceShare = {
+      id,
+      resourceType: "project",
+      resourceId: projectId,
+      ownerId,
+      sharedWithEmail: normalizedEmail,
+      sharedWithUserId: existingUser?.id || null,
+      permissions,
+      createdAt: now,
+      updatedAt: now,
+    };
+    local.shares[id] = newShare;
+    writeLocalStorage(local);
+    return newShare;
+  }
+
+  try {
+    const existingRows = (await client.sql`
+      SELECT id FROM lachvid_resource_shares
+      WHERE resource_type = 'project' AND resource_id = ${projectId} AND LOWER(shared_with_email) = ${normalizedEmail}
+      LIMIT 1;
+    `) as Array<{ id: string }>;
+
+    if (existingRows && existingRows.length > 0) {
+      const shareId = existingRows[0].id;
+      await client.sql`
+        UPDATE lachvid_resource_shares
+        SET permissions = ${permsStr}, shared_with_user_id = ${
+        existingUser?.id || null
+      }, updated_at = ${now}
+        WHERE id = ${shareId};
+      `;
+      return {
+        id: shareId,
+        resourceType: "project",
+        resourceId: projectId,
+        ownerId,
+        sharedWithEmail: normalizedEmail,
+        sharedWithUserId: existingUser?.id || null,
+        permissions,
+        createdAt: now,
+        updatedAt: now,
+      };
+    }
+
+    const id = `shr_${Date.now().toString(36)}_${Math.random()
+      .toString(36)
+      .slice(2, 6)}`;
+    await client.sql`
+      INSERT INTO lachvid_resource_shares (id, resource_type, resource_id, owner_id, shared_with_email, shared_with_user_id, permissions, created_at, updated_at)
+      VALUES (${id}, 'project', ${projectId}, ${ownerId}, ${normalizedEmail}, ${
+      existingUser?.id || null
+    }, ${permsStr}, ${now}, ${now});
+    `;
+
+    return {
+      id,
+      resourceType: "project",
+      resourceId: projectId,
+      ownerId,
+      sharedWithEmail: normalizedEmail,
+      sharedWithUserId: existingUser?.id || null,
+      permissions,
+      createdAt: now,
+      updatedAt: now,
+    };
+  } catch (err) {
+    console.error("Lỗi shareProject:", err);
+    throw err;
+  }
+}
+
+export async function removeShare(
+  shareId: string,
+  ownerId: string
+): Promise<boolean> {
+  await initDatabase();
+  const client = getClient();
+  if (!client || !dbInitialized) {
+    const local = readLocalStorage();
+    const share = local.shares?.[shareId];
+    if (!share) return false;
+    // Kiểm tra owner
+    const project = local.parentProjects?.[share.resourceId];
+    if (share.ownerId !== ownerId && project?.ownerId !== ownerId) {
+      return false;
+    }
+    delete local.shares[shareId];
+    writeLocalStorage(local);
+    return true;
+  }
+
+  try {
+    await client.sql`
+      DELETE FROM lachvid_resource_shares
+      WHERE id = ${shareId} AND (owner_id = ${ownerId} OR resource_id IN (SELECT id FROM lachvid_parent_projects WHERE owner_id = ${ownerId}));
+    `;
+    return true;
+  } catch (err) {
+    console.error("Lỗi removeShare:", err);
+    return false;
+  }
+}
+
+// ==========================================
+// Authorization Resolution Helpers
+// ==========================================
+
+export async function resolveProjectAccess(
+  projectId: string,
+  userId?: string,
+  userEmail?: string
+): Promise<ProjectAccessInfo> {
+  await initDatabase();
+  const project = await getParentProjectById(projectId);
+  if (!project) {
+    return {
+      role: "none",
+      isOwner: false,
+      canManageFolders: false,
+      permissions: {
+        split: { enabled: false, actions: [] },
+        mix: { enabled: false, actions: [] },
+        history: { enabled: false, actions: [] },
+      },
+    };
+  }
+
+  const owner = project.ownerId ? await getUserById(project.ownerId) : null;
+  const ownerInfo = owner
+    ? { id: owner.id, email: owner.email, name: owner.name }
+    : undefined;
+
+  // Nếu user là chủ sở hữu
+  if (userId && project.ownerId === userId) {
+    return {
+      role: "owner",
+      isOwner: true,
+      canManageFolders: true,
+      permissions: {
+        split: { enabled: true, actions: ["view", "export", "edit"] },
+        mix: { enabled: true, actions: ["view", "export", "edit"] },
+        history: { enabled: true, actions: ["view", "export", "edit"] },
+      },
+      owner: ownerInfo,
+    };
+  }
+
+  // Kiểm tra quyền chia sẻ
+  let share: ResourceShare | null = null;
+  const client = getClient();
+
+  if (!client || !dbInitialized) {
+    const local = readLocalStorage();
+    share =
+      Object.values(local.shares || {}).find(
+        (s) =>
+          s.resourceType === "project" &&
+          s.resourceId === projectId &&
+          ((userId && s.sharedWithUserId === userId) ||
+            (userEmail &&
+              s.sharedWithEmail.toLowerCase() === userEmail.toLowerCase()))
+      ) || null;
+  } else {
+    try {
+      const normalizedEmail = (userEmail || "").trim().toLowerCase();
+      const rows = (await client.sql`
+        SELECT * FROM lachvid_resource_shares
+        WHERE resource_type = 'project' AND resource_id = ${projectId}
+          AND ((${userId || ""} != '' AND shared_with_user_id = ${
+        userId || ""
+      }) OR (${normalizedEmail} != '' AND LOWER(shared_with_email) = ${normalizedEmail}))
+        LIMIT 1;
+      `) as Array<{ permissions: string }>;
+
+      if (rows && rows.length > 0) {
+        try {
+          const perms = JSON.parse(rows[0].permissions);
+          share = {
+            id: "",
+            resourceType: "project",
+            resourceId: projectId,
+            ownerId: project.ownerId || "",
+            sharedWithEmail: normalizedEmail,
+            permissions: perms,
+            createdAt: "",
+            updatedAt: "",
+          };
+        } catch {
+          // ignore
+        }
+      }
+    } catch (err) {
+      console.warn("Lỗi kiểm tra quyền share:", err);
+    }
+  }
+
+  if (share) {
+    const perms = share.permissions;
+    // canManageFolders: true nếu có ít nhất 1 module có action "edit"
+    const canManageFolders =
+      Boolean(perms.split?.enabled && perms.split?.actions?.includes("edit")) ||
+      Boolean(perms.mix?.enabled && perms.mix?.actions?.includes("edit")) ||
+      Boolean(perms.history?.enabled && perms.history?.actions?.includes("edit"));
+
+    return {
+      role: "shared",
+      isOwner: false,
+      canManageFolders,
+      permissions: perms,
+      owner: ownerInfo,
+    };
+  }
+
+  return {
+    role: "none",
+    isOwner: false,
+    canManageFolders: false,
+    permissions: {
+      split: { enabled: false, actions: [] },
+      mix: { enabled: false, actions: [] },
+      history: { enabled: false, actions: [] },
+    },
+    owner: ownerInfo,
+  };
+}
+
+export async function resolveFolderAccess(
+  folderId: string,
+  userId?: string,
+  userEmail?: string
+): Promise<ProjectAccessInfo & { folder: ProjectMeta | null }> {
+  await initDatabase();
+  const folder = await getProjectById(folderId);
+  if (!folder || !folder.parentProjectId) {
+    return {
+      role: "none",
+      isOwner: false,
+      canManageFolders: false,
+      permissions: {
+        split: { enabled: false, actions: [] },
+        mix: { enabled: false, actions: [] },
+        history: { enabled: false, actions: [] },
+      },
+      folder: folder || null,
+    };
+  }
+
+  const access = await resolveProjectAccess(
+    folder.parentProjectId,
+    userId,
+    userEmail
+  );
+  return {
+    ...access,
+    folder,
+  };
+}
+
+export async function getParentProjects(
+  currentUserId?: string,
+  currentUserEmail?: string
+): Promise<ParentProjectMeta[]> {
+  await initDatabase();
+  const client = getClient();
+  const normalizedEmail = (currentUserEmail || "").trim().toLowerCase();
+
+  if (!client || !dbInitialized) {
+    const local = readLocalStorage();
+    let list = Object.values(local.parentProjects || {});
+
+    // Nếu có user hiện tại, lọc các project thuộc về user hoặc được share cho user
+    if (currentUserId || normalizedEmail) {
+      const myIds = new Set(
+        list
+          .filter((p) => p.ownerId && p.ownerId === currentUserId)
+          .map((p) => p.id)
+      );
+
+      const sharedMap = new Map<string, ProjectSharePermissions>();
+      for (const s of Object.values(local.shares || {})) {
+        if (
+          s.resourceType === "project" &&
+          ((currentUserId && s.sharedWithUserId === currentUserId) ||
+            (normalizedEmail &&
+              s.sharedWithEmail.toLowerCase() === normalizedEmail))
+        ) {
+          sharedMap.set(s.resourceId, s.permissions);
+        }
+      }
+
+      list = list.filter((p) => myIds.has(p.id) || sharedMap.has(p.id));
+    }
+
     return list
       .map((parent) => {
         const childFolders = Object.values(local.projects).filter(
@@ -335,12 +1151,37 @@ export async function getParentProjects(): Promise<ParentProjectMeta[]> {
           totalRendered += (local.rendered[f.id] || []).length;
           totalVoices += (local.voices?.[f.id] || []).length;
         }
+
+        const isOwner = Boolean(
+          currentUserId && parent.ownerId === currentUserId
+        );
+        let sharePermissions: ProjectSharePermissions | undefined;
+        if (!isOwner && (currentUserId || normalizedEmail)) {
+          const s = Object.values(local.shares || {}).find(
+            (sh) =>
+              sh.resourceType === "project" &&
+              sh.resourceId === parent.id &&
+              ((currentUserId && sh.sharedWithUserId === currentUserId) ||
+                (normalizedEmail &&
+                  sh.sharedWithEmail.toLowerCase() === normalizedEmail))
+          );
+          if (s) sharePermissions = s.permissions;
+        }
+
+        const ownerUser = parent.ownerId
+          ? local.users?.[parent.ownerId]
+          : undefined;
+
         return {
           ...parent,
           foldersCount: childFolders.length,
           poolCount: totalClips,
           renderedCount: totalRendered,
           voiceCount: totalVoices,
+          isOwner,
+          sharePermissions,
+          ownerName: ownerUser?.name,
+          ownerEmail: ownerUser?.email,
         };
       })
       .sort(
@@ -350,15 +1191,7 @@ export async function getParentProjects(): Promise<ParentProjectMeta[]> {
   }
 
   try {
-    const rows = (await client.sql`
-      SELECT p.*,
-        (SELECT COUNT(*) FROM lachvid_projects f WHERE f.parent_project_id = p.id) as folders_count,
-        (SELECT COUNT(*) FROM lachvid_category_items c WHERE c.project_id IN (SELECT id FROM lachvid_projects WHERE parent_project_id = p.id)) as pool_count,
-        (SELECT COUNT(*) FROM lachvid_rendered_history r WHERE r.project_id IN (SELECT id FROM lachvid_projects WHERE parent_project_id = p.id)) as rendered_count,
-        (SELECT COUNT(*) FROM lachvid_voice_items v WHERE v.project_id IN (SELECT id FROM lachvid_projects WHERE parent_project_id = p.id)) as voice_count
-      FROM lachvid_parent_projects p
-      ORDER BY p.updated_at DESC;
-    `) as Array<{
+    let rows: Array<{
       id: string;
       name: string;
       description?: string;
@@ -369,20 +1202,81 @@ export async function getParentProjects(): Promise<ParentProjectMeta[]> {
       pool_count: number;
       rendered_count: number;
       voice_count: number;
+      owner_name?: string;
+      owner_email?: string;
+      share_permissions?: string;
     }>;
 
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      description: r.description || undefined,
-      ownerId: r.owner_id || undefined,
-      createdAt: r.created_at,
-      updatedAt: r.updated_at,
-      foldersCount: Number(r.folders_count || 0),
-      poolCount: Number(r.pool_count || 0),
-      renderedCount: Number(r.rendered_count || 0),
-      voiceCount: Number(r.voice_count || 0),
-    }));
+    if (currentUserId || normalizedEmail) {
+      rows = (await client.sql`
+        SELECT p.*,
+          u.name as owner_name,
+          u.email as owner_email,
+          s.permissions as share_permissions,
+          (SELECT COUNT(*) FROM lachvid_projects f WHERE f.parent_project_id = p.id) as folders_count,
+          (SELECT COUNT(*) FROM lachvid_category_items c WHERE c.project_id IN (SELECT id FROM lachvid_projects WHERE parent_project_id = p.id)) as pool_count,
+          (SELECT COUNT(*) FROM lachvid_rendered_history r WHERE r.project_id IN (SELECT id FROM lachvid_projects WHERE parent_project_id = p.id)) as rendered_count,
+          (SELECT COUNT(*) FROM lachvid_voice_items v WHERE v.project_id IN (SELECT id FROM lachvid_projects WHERE parent_project_id = p.id)) as voice_count
+        FROM lachvid_parent_projects p
+        LEFT JOIN lachvid_users u ON p.owner_id = u.id
+        LEFT JOIN lachvid_resource_shares s ON (
+          s.resource_type = 'project' AND s.resource_id = p.id AND (
+            (${currentUserId || ""} != '' AND s.shared_with_user_id = ${
+        currentUserId || ""
+      }) OR (${normalizedEmail} != '' AND LOWER(s.shared_with_email) = ${normalizedEmail})
+          )
+        )
+        WHERE (p.owner_id = ${currentUserId || ""} OR (${currentUserId || ""} = ${DEFAULT_USER_ID} AND (p.owner_id IS NULL OR p.owner_id = '')) OR s.id IS NOT NULL)
+        ORDER BY p.updated_at DESC;
+      `) as typeof rows;
+    } else {
+      rows = (await client.sql`
+        SELECT p.*,
+          u.name as owner_name,
+          u.email as owner_email,
+          NULL as share_permissions,
+          (SELECT COUNT(*) FROM lachvid_projects f WHERE f.parent_project_id = p.id) as folders_count,
+          (SELECT COUNT(*) FROM lachvid_category_items c WHERE c.project_id IN (SELECT id FROM lachvid_projects WHERE parent_project_id = p.id)) as pool_count,
+          (SELECT COUNT(*) FROM lachvid_rendered_history r WHERE r.project_id IN (SELECT id FROM lachvid_projects WHERE parent_project_id = p.id)) as rendered_count,
+          (SELECT COUNT(*) FROM lachvid_voice_items v WHERE v.project_id IN (SELECT id FROM lachvid_projects WHERE parent_project_id = p.id)) as voice_count
+        FROM lachvid_parent_projects p
+        LEFT JOIN lachvid_users u ON p.owner_id = u.id
+        ORDER BY p.updated_at DESC;
+      `) as typeof rows;
+    }
+
+    return rows.map((r) => {
+      const isOwner = Boolean(
+        currentUserId &&
+          (r.owner_id === currentUserId ||
+            (currentUserId === DEFAULT_USER_ID && (!r.owner_id || r.owner_id === "")))
+      );
+      let sharePermissions: ProjectSharePermissions | undefined;
+      if (r.share_permissions) {
+        try {
+          sharePermissions = JSON.parse(r.share_permissions);
+        } catch {
+          // ignore
+        }
+      }
+
+      return {
+        id: r.id,
+        name: r.name,
+        description: r.description || undefined,
+        ownerId: r.owner_id || undefined,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+        foldersCount: Number(r.folders_count || 0),
+        poolCount: Number(r.pool_count || 0),
+        renderedCount: Number(r.rendered_count || 0),
+        voiceCount: Number(r.voice_count || 0),
+        isOwner,
+        sharePermissions,
+        ownerName: r.owner_name || undefined,
+        ownerEmail: r.owner_email || undefined,
+      };
+    });
   } catch (err) {
     console.error("Lỗi getParentProjects:", err);
     return [];
@@ -396,11 +1290,21 @@ export async function getParentProjectById(
   const client = getClient();
   if (!client || !dbInitialized) {
     const local = readLocalStorage();
-    return local.parentProjects?.[id] || null;
+    const p = local.parentProjects?.[id] || null;
+    if (!p) return null;
+    const owner = p.ownerId ? local.users?.[p.ownerId] : undefined;
+    return {
+      ...p,
+      ownerName: owner?.name,
+      ownerEmail: owner?.email,
+    };
   }
   try {
     const rows = (await client.sql`
-      SELECT * FROM lachvid_parent_projects WHERE id = ${id} LIMIT 1;
+      SELECT p.*, u.name as owner_name, u.email as owner_email
+      FROM lachvid_parent_projects p
+      LEFT JOIN lachvid_users u ON p.owner_id = u.id
+      WHERE p.id = ${id} LIMIT 1;
     `) as Array<{
       id: string;
       name: string;
@@ -408,6 +1312,8 @@ export async function getParentProjectById(
       owner_id?: string;
       created_at: string;
       updated_at: string;
+      owner_name?: string;
+      owner_email?: string;
     }>;
     if (!rows || rows.length === 0) return null;
     const r = rows[0];
@@ -418,6 +1324,8 @@ export async function getParentProjectById(
       ownerId: r.owner_id || undefined,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
+      ownerName: r.owner_name || undefined,
+      ownerEmail: r.owner_email || undefined,
     };
   } catch (err) {
     console.error("Lỗi getParentProjectById:", err);

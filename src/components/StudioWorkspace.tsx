@@ -2,6 +2,7 @@
 
 import IPhoneVideoTrimmer from "@/components/IPhoneVideoTrimmer";
 import PreviewPlayer916 from "@/components/PreviewPlayer916";
+import UserAvatarMenu from "@/components/UserAvatarMenu";
 import {
   extractGoogleDriveFileId,
   parseExcelFiveColumnClipboard,
@@ -14,6 +15,7 @@ import {
   computeShotSpeedForMinDuration,
   DEFAULT_CATEGORY_MIN_DURATIONS,
   MultiVoiceItem,
+  ProjectAccessInfo,
   ProjectState,
   RenderedVideoRecord,
   ResolvedShotSlot,
@@ -90,6 +92,7 @@ interface StudioWorkspaceProps {
   projectName?: string;
   parentProjectId?: string;
   initialTab?: string;
+  access?: ProjectAccessInfo;
 }
 
 const createDefaultState = (): ProjectState => ({
@@ -125,7 +128,24 @@ export default function StudioWorkspace({
   projectName,
   parentProjectId,
   initialTab,
+  access,
 }: StudioWorkspaceProps) {
+  const [accessState, setAccessState] = useState<ProjectAccessInfo | null>(
+    access || null
+  );
+
+  const canViewSplit = !accessState || Boolean(accessState.permissions.split?.enabled);
+  const canEditSplit = !accessState || Boolean(accessState.permissions.split?.actions?.includes("edit"));
+  const canExportSplit = !accessState || Boolean(accessState.permissions.split?.actions?.includes("export"));
+
+  const canViewMix = !accessState || Boolean(accessState.permissions.mix?.enabled);
+  const canEditMix = !accessState || Boolean(accessState.permissions.mix?.actions?.includes("edit"));
+  const canExportMix = !accessState || Boolean(accessState.permissions.mix?.actions?.includes("export"));
+
+  const canViewHistory = !accessState || Boolean(accessState.permissions.history?.enabled);
+  const canEditHistory = !accessState || Boolean(accessState.permissions.history?.actions?.includes("edit"));
+  const canExportHistory = !accessState || Boolean(accessState.permissions.history?.actions?.includes("export"));
+
   const [currentProjectName, setCurrentProjectName] = useState<string>(
     projectName || ""
   );
@@ -194,6 +214,24 @@ export default function StudioWorkspace({
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
+
+  // Tự động chuyển tab nếu tab hiện tại không được cấp quyền view
+  useEffect(() => {
+    if (!accessState) return;
+    const isCurrentAllowed =
+      (mainTab === "split" && canViewSplit) ||
+      (mainTab === "mix" && canViewMix) ||
+      (mainTab === "history" && canViewHistory);
+
+    if (!isCurrentAllowed) {
+      const timer = setTimeout(() => {
+        if (canViewMix) setMainTab("mix");
+        else if (canViewHistory) setMainTab("history");
+        else if (canViewSplit) setMainTab("split");
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+  }, [accessState, mainTab, canViewSplit, canViewMix, canViewHistory, setMainTab]);
   const [historyFilterStatus, setHistoryFilterStatus] = useState<
     "all" | "unused" | "used"
   >("all");
@@ -520,6 +558,9 @@ export default function StudioWorkspace({
         }
         if (data.voiceTracks) {
           setMultiVoices(data.voiceTracks);
+        }
+        if (data.access) {
+          setAccessState(data.access);
         }
 
         const fullDefaultPrefix = data.project?.parentProjectName
@@ -1929,10 +1970,21 @@ export default function StudioWorkspace({
   }, [projectId]);
 
   useEffect(() => {
+    let ignore = false;
     if (projectId) {
-      fetchRenderedHistory();
+      fetch(`/api/project?id=${projectId}&history=1`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (!ignore && data.history) {
+            setRenderedHistoryList(data.history);
+          }
+        })
+        .catch(() => {});
     }
-  }, [projectId, fetchRenderedHistory]);
+    return () => {
+      ignore = true;
+    };
+  }, [projectId]);
 
   const handleConfirmClearHistory = async () => {
     if (!projectId) return;
@@ -1971,7 +2023,7 @@ export default function StudioWorkspace({
     return state.composedVideos.filter(
       (comp) => !renderedHistoryList.some((r) => r.tupleKey === comp.tupleKey)
     ).length;
-  }, [state?.composedVideos, renderedHistoryList]);
+  }, [state, renderedHistoryList]);
 
   const handleConfirmMarkAllRendered = async () => {
     if (
@@ -2334,7 +2386,7 @@ export default function StudioWorkspace({
       };
     });
 
-    const projectNameSafe = (currentProjectName || "Lachvid").replace(
+    const projectNameSafe = (currentProjectName || "OmniGen").replace(
       /\s+/g,
       "_"
     );
@@ -2767,7 +2819,7 @@ export default function StudioWorkspace({
             </div>
             <div>
               <h1 className="text-base font-extrabold tracking-tight">
-                <span>Lachvid Studio</span>
+                <span>OmniGen</span>
               </h1>
               <p className="text-xs text-slate-400">
                 Hệ thống tách video slicer & trộn lách content mỹ phẩm
@@ -2882,7 +2934,7 @@ export default function StudioWorkspace({
               )}
             </div>
 
-            {projectRenderedCount > 0 && (
+            {projectRenderedCount > 0 && canViewHistory && (
               <button
                 type="button"
                 onClick={() => {
@@ -2896,61 +2948,79 @@ export default function StudioWorkspace({
                 <span>Đã render {projectRenderedCount} video</span>
               </button>
             )}
+
+            {!accessState?.isOwner && accessState?.owner && (
+              <span className="hidden xl:inline-flex items-center text-[10px] font-medium px-2.5 py-1 rounded-xl bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
+                Được chia sẻ bởi {accessState.owner.name || accessState.owner.email}
+              </span>
+            )}
           </div>
         </div>
 
-        {/* 3 Dedicated Workspaces / Tabs */}
-        <div className="flex items-center bg-slate-950 p-1.5 rounded-2xl border border-slate-800 shadow-inner gap-1">
-          <button
-            type="button"
-            onClick={() => setMainTab("split")}
-            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all ${
-              mainTab === "split"
-                ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/30 scale-100"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-            }`}
-          >
-            <Scissors className="w-4 h-4" />
-            <span>Tách video</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setMainTab("mix")}
-            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all ${
-              mainTab === "mix"
-                ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/30 scale-100"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-            }`}
-          >
-            <Shuffle className="w-4 h-4" />
-            <span>Trộn ghép</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setMainTab("history");
-              fetchRenderedHistory();
-            }}
-            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all ${
-              mainTab === "history"
-                ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/30 scale-100"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-            }`}
-          >
-            <History className="w-4 h-4" />
-            <span>Lịch sử render</span>
-            {projectRenderedCount > 0 && (
-              <span
-                className={`text-[10px] font-mono px-1.5 py-0.5 rounded-full font-bold transition-colors ${
-                  mainTab === "history"
-                    ? "bg-white/25 text-white"
-                    : "bg-indigo-500/20 text-indigo-300 border border-indigo-500/30"
+        {/* 3 Dedicated Workspaces / Tabs & User Avatar */}
+        <div className="flex items-center gap-3">
+          <div className="flex items-center bg-slate-950 p-1.5 rounded-2xl border border-slate-800 shadow-inner gap-1">
+            {canViewSplit && (
+              <button
+                type="button"
+                onClick={() => setMainTab("split")}
+                className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all ${
+                  mainTab === "split"
+                    ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/30 scale-100"
+                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
                 }`}
               >
-                {projectRenderedCount}
-              </span>
+                <Scissors className="w-4 h-4" />
+                <span>Tách video</span>
+              </button>
             )}
-          </button>
+
+            {canViewMix && (
+              <button
+                type="button"
+                onClick={() => setMainTab("mix")}
+                className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all ${
+                  mainTab === "mix"
+                    ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/30 scale-100"
+                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+                }`}
+              >
+                <Shuffle className="w-4 h-4" />
+                <span>Trộn ghép</span>
+              </button>
+            )}
+
+            {canViewHistory && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMainTab("history");
+                  fetchRenderedHistory();
+                }}
+                className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all ${
+                  mainTab === "history"
+                    ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/30 scale-100"
+                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+                }`}
+              >
+                <History className="w-4 h-4" />
+                <span>Lịch sử render</span>
+                {projectRenderedCount > 0 && (
+                  <span
+                    className={`text-[10px] font-mono px-1.5 py-0.5 rounded-full font-bold transition-colors ${
+                      mainTab === "history"
+                        ? "bg-white/25 text-white"
+                        : "bg-indigo-500/20 text-indigo-300 border border-indigo-500/30"
+                    }`}
+                  >
+                    {projectRenderedCount}
+                  </span>
+                )}
+              </button>
+            )}
+          </div>
+
+          <UserAvatarMenu showProjectsShortcut={true} />
         </div>
       </header>
 
@@ -3169,14 +3239,16 @@ export default function StudioWorkspace({
                     </label>
                   </div>
 
-                  <button
-                    onClick={handleRunPySceneDetect}
-                    disabled={!state?.sourceVideo}
-                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-bold transition shadow-lg shadow-rose-500/20 disabled:opacity-50 disabled:pointer-events-none"
-                  >
-                    <Wand2 className="w-3.5 h-3.5" />
-                    <span>Auto detect cắt scene</span>
-                  </button>
+                  {canEditSplit && (
+                    <button
+                      onClick={handleRunPySceneDetect}
+                      disabled={!state?.sourceVideo}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-bold transition shadow-lg shadow-rose-500/20 disabled:opacity-50 disabled:pointer-events-none"
+                    >
+                      <Wand2 className="w-3.5 h-3.5" />
+                      <span>Auto detect cắt scene</span>
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -3254,49 +3326,51 @@ export default function StudioWorkspace({
                             Kho video theo 5 category (đã tách từ video gốc)
                           </h3>
                         </div>
-                        <button
-                          onClick={() => {
-                            const lastEnd =
-                              state.shots[state.shots.length - 1]?.end || 0;
-                            const maxDur = state.sourceVideo?.duration || 30;
-                            const newBegin =
-                              lastEnd < maxDur - 1
-                                ? lastEnd
-                                : Math.max(0, maxDur - 4);
-                            const newEnd =
-                              Math.round(Math.min(maxDur, newBegin + 4) * 10) /
-                              10;
-                            const catToAssign =
-                              splitEditingCategory || "product";
-                            const newShot: Shot = {
-                              id: `shot_${Date.now()}`,
-                              sourceVideoId: state.sourceVideo?.id || "src_vid",
-                              label: `Cảnh #${state.shots.length + 1}`,
-                              begin: Math.round(newBegin * 10) / 10,
-                              end: newEnd,
-                              rawBegin: Math.round(newBegin * 10) / 10,
-                              rawEnd: newEnd,
-                              category: catToAssign,
-                              edits: {
-                                flipH: false,
-                                lockFlipH: false,
-                                speed: 1,
-                                zoom: false,
-                              },
-                            };
-                            persistState({
-                              ...state,
-                              shots: [...state.shots, newShot],
-                            });
-                            handleSelectSplitShot(newShot);
-                            setSplitEditingCategory(catToAssign);
-                            setAccordionShotId(newShot.id);
-                          }}
-                          className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition"
-                        >
-                          <Plus className="w-3.5 h-3.5 text-indigo-400" />
-                          <span>Thêm shot thủ công</span>
-                        </button>
+                        {canEditSplit && (
+                          <button
+                            onClick={() => {
+                              const lastEnd =
+                                state.shots[state.shots.length - 1]?.end || 0;
+                              const maxDur = state.sourceVideo?.duration || 30;
+                              const newBegin =
+                                lastEnd < maxDur - 1
+                                  ? lastEnd
+                                  : Math.max(0, maxDur - 4);
+                              const newEnd =
+                                Math.round(Math.min(maxDur, newBegin + 4) * 10) /
+                                10;
+                              const catToAssign =
+                                splitEditingCategory || "product";
+                              const newShot: Shot = {
+                                id: `shot_${Date.now()}`,
+                                sourceVideoId: state.sourceVideo?.id || "src_vid",
+                                label: `Cảnh #${state.shots.length + 1}`,
+                                begin: Math.round(newBegin * 10) / 10,
+                                end: newEnd,
+                                rawBegin: Math.round(newBegin * 10) / 10,
+                                rawEnd: newEnd,
+                                category: catToAssign,
+                                edits: {
+                                  flipH: false,
+                                  lockFlipH: false,
+                                  speed: 1,
+                                  zoom: false,
+                                },
+                              };
+                              persistState({
+                                ...state,
+                                shots: [...state.shots, newShot],
+                              });
+                              handleSelectSplitShot(newShot);
+                              setSplitEditingCategory(catToAssign);
+                              setAccordionShotId(newShot.id);
+                            }}
+                            className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition"
+                          >
+                            <Plus className="w-3.5 h-3.5 text-indigo-400" />
+                            <span>Thêm shot thủ công</span>
+                          </button>
+                        )}
                       </div>
 
                       {/* 5 Slots Badges / Category Cards */}
@@ -4288,32 +4362,38 @@ export default function StudioWorkspace({
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2.5">
-                      <button
-                        type="button"
-                        onClick={handleSliceAndDownloadZip}
-                        disabled={isSlicing}
-                        className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition disabled:opacity-50"
-                      >
-                        <Download className="w-4 h-4 text-rose-400" />
-                        <span>Tải ZIP toàn bộ (5 folder)</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleDirectSaveToFolder}
-                        disabled={isSlicing}
-                        className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow-lg shadow-emerald-600/20 disabled:opacity-50"
-                      >
-                        <FolderDown className="w-4 h-4" />
-                        <span>Lưu thẳng vào thư mục máy tính</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleNextVideo}
-                        className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow-lg shadow-indigo-600/20"
-                      >
-                        <Plus className="w-4 h-4" />
-                        <span>Tách video tiếp theo</span>
-                      </button>
+                      {canExportSplit && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={handleSliceAndDownloadZip}
+                            disabled={isSlicing}
+                            className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition disabled:opacity-50"
+                          >
+                            <Download className="w-4 h-4 text-rose-400" />
+                            <span>Tải ZIP toàn bộ (5 folder)</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleDirectSaveToFolder}
+                            disabled={isSlicing}
+                            className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow-lg shadow-emerald-600/20 disabled:opacity-50"
+                          >
+                            <FolderDown className="w-4 h-4" />
+                            <span>Lưu thẳng vào thư mục máy tính</span>
+                          </button>
+                        </>
+                      )}
+                      {canEditSplit && (
+                        <button
+                          type="button"
+                          onClick={handleNextVideo}
+                          className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow-lg shadow-indigo-600/20"
+                        >
+                          <Plus className="w-4 h-4" />
+                          <span>Tách video tiếp theo</span>
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -4354,23 +4434,27 @@ export default function StudioWorkspace({
                     <Cloud className="w-4 h-4 text-sky-400" />
                     <span>Lịch sử link Drive ({allDriveLinks.length})</span>
                   </button>
-                  <button
-                    onClick={() => masterFolderInputRef.current?.click()}
-                    className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition"
-                    title="Upload thư mục chứa 5 folder OPEN, PRODUCT, TEXTURE, APPLY, END từ máy tính"
-                  >
-                    <FolderSync className="w-4 h-4 text-indigo-400" />
-                    <span>Chọn thư mục tổng từ máy (tự phân 5 cột)</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setShowClearConfirmModal(true)}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-slate-100 transition shadow-md shadow-rose-600/20"
-                    title="Xóa toàn bộ clip trong kho, voice và danh sách tổ hợp"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>Xóa</span>
-                  </button>
+                  {canEditMix && (
+                    <>
+                      <button
+                        onClick={() => masterFolderInputRef.current?.click()}
+                        className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition"
+                        title="Upload thư mục chứa 5 folder OPEN, PRODUCT, TEXTURE, APPLY, END từ máy tính"
+                      >
+                        <FolderSync className="w-4 h-4 text-indigo-400" />
+                        <span>Chọn thư mục tổng từ máy (tự phân 5 cột)</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowClearConfirmModal(true)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-slate-100 transition shadow-md shadow-rose-600/20"
+                        title="Xóa toàn bộ clip trong kho, voice và danh sách tổ hợp"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Xóa</span>
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -4927,25 +5011,29 @@ export default function StudioWorkspace({
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setShowMarkAllRenderedModal(true)}
-                        disabled={Boolean(busyMessage) || isMarkingAllRendered}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 text-xs font-semibold transition shadow-md shadow-slate-900/40 disabled:opacity-50"
-                        title="Đánh dấu tất cả video trong danh sách tổ hợp đã render vào lịch sử"
-                      >
-                        <CheckCheck className="w-3.5 h-3.5 text-emerald-400" />
-                        <span>Đánh dấu đã render</span>
-                      </button>
-                      <button
-                        onClick={handleRenderAllComposedZip}
-                        disabled={Boolean(busyMessage)}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition shadow-md shadow-emerald-600/20 disabled:opacity-50"
-                        title="Render toàn bộ video bằng FFmpeg và nén ZIP tải về máy"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        <span>Tải tất cả</span>
-                      </button>
+                      {canEditMix && (
+                        <button
+                          type="button"
+                          onClick={() => setShowMarkAllRenderedModal(true)}
+                          disabled={Boolean(busyMessage) || isMarkingAllRendered}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 text-xs font-semibold transition shadow-md shadow-slate-900/40 disabled:opacity-50"
+                          title="Đánh dấu tất cả video trong danh sách tổ hợp đã render vào lịch sử"
+                        >
+                          <CheckCheck className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Đánh dấu đã render</span>
+                        </button>
+                      )}
+                      {canExportMix && (
+                        <button
+                          onClick={handleRenderAllComposedZip}
+                          disabled={Boolean(busyMessage)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition shadow-md shadow-emerald-600/20 disabled:opacity-50"
+                          title="Render toàn bộ video bằng FFmpeg và nén ZIP tải về máy"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Tải tất cả</span>
+                        </button>
+                      )}
                     </div>
                   </div>
 
@@ -5028,18 +5116,20 @@ export default function StudioWorkspace({
                                   <Play className="w-3.5 h-3.5 fill-current" />
                                 )}
                               </button>
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleRenderSingleComposed(comp);
-                                }}
-                                className="p-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white shadow-md shadow-rose-600/20 transition"
-                                title="Xuất file MP4 hoàn chỉnh bằng FFmpeg"
-                                aria-label="Xuất file MP4"
-                              >
-                                <Download className="w-3.5 h-3.5" />
-                              </button>
+                                {canExportMix && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleRenderSingleComposed(comp);
+                                    }}
+                                    className="p-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white shadow-md shadow-rose-600/20 transition"
+                                    title="Xuất file MP4 hoàn chỉnh bằng FFmpeg"
+                                    aria-label="Xuất file MP4"
+                                  >
+                                    <Download className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
                             </div>
                           </div>
 
@@ -5397,7 +5487,7 @@ export default function StudioWorkspace({
             )}
 
             {/* Direct Local Export Section */}
-            {state?.composedVideos && state.composedVideos.length > 0 && (
+            {canExportMix && state?.composedVideos && state.composedVideos.length > 0 && (
               <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-4">
                   <div>
@@ -5456,46 +5546,48 @@ export default function StudioWorkspace({
 
                 <div className="flex items-center gap-2">
                   {/* Export Dropdown */}
-                  <div className="relative">
-                    <button
-                      type="button"
-                      disabled={renderedHistoryList.length === 0}
-                      onClick={() => setShowExportMenu((prev) => !prev)}
-                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold transition disabled:opacity-50"
-                      title="Xuất toàn bộ lịch sử video ra file bảng tính"
-                    >
-                      <Download className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Xuất file</span>
-                      <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
-                    </button>
+                  {canExportHistory && (
+                    <div className="relative">
+                      <button
+                        type="button"
+                        disabled={renderedHistoryList.length === 0}
+                        onClick={() => setShowExportMenu((prev) => !prev)}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold transition disabled:opacity-50"
+                        title="Xuất toàn bộ lịch sử video ra file bảng tính"
+                      >
+                        <Download className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Xuất file</span>
+                        <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                      </button>
 
-                    {showExportMenu && (
-                      <>
-                        <div
-                          className="fixed inset-0 z-40"
-                          onClick={() => setShowExportMenu(false)}
-                        />
-                        <div className="absolute right-0 mt-1.5 w-48 rounded-xl bg-slate-900 border border-slate-700/80 shadow-2xl py-1.5 z-50 animate-in fade-in zoom-in-95 duration-150">
-                          <button
-                            type="button"
-                            onClick={() => handleExportHistory("xlsx")}
-                            className="w-full px-3.5 py-2 text-left text-xs font-medium text-slate-200 hover:bg-slate-800 hover:text-white flex items-center gap-2 transition"
-                          >
-                            <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
-                            <span>Xuất Excel (.xlsx)</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleExportHistory("csv")}
-                            className="w-full px-3.5 py-2 text-left text-xs font-medium text-slate-200 hover:bg-slate-800 hover:text-white flex items-center gap-2 transition"
-                          >
-                            <Code2 className="w-4 h-4 text-sky-400" />
-                            <span>Xuất CSV (.csv)</span>
-                          </button>
-                        </div>
-                      </>
-                    )}
-                  </div>
+                      {showExportMenu && (
+                        <>
+                          <div
+                            className="fixed inset-0 z-40"
+                            onClick={() => setShowExportMenu(false)}
+                          />
+                          <div className="absolute right-0 mt-1.5 w-48 rounded-xl bg-slate-900 border border-slate-700/80 shadow-2xl py-1.5 z-50 animate-in fade-in zoom-in-95 duration-150">
+                            <button
+                              type="button"
+                              onClick={() => handleExportHistory("xlsx")}
+                              className="w-full px-3.5 py-2 text-left text-xs font-medium text-slate-200 hover:bg-slate-800 hover:text-white flex items-center gap-2 transition"
+                            >
+                              <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+                              <span>Xuất Excel (.xlsx)</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleExportHistory("csv")}
+                              className="w-full px-3.5 py-2 text-left text-xs font-medium text-slate-200 hover:bg-slate-800 hover:text-white flex items-center gap-2 transition"
+                            >
+                              <Code2 className="w-4 h-4 text-sky-400" />
+                              <span>Xuất CSV (.csv)</span>
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
 
                   <button
                     type="button"
@@ -5511,7 +5603,7 @@ export default function StudioWorkspace({
                     />
                     <span>Làm mới</span>
                   </button>
-                  {renderedHistoryList.length > 0 && (
+                  {renderedHistoryList.length > 0 && canEditHistory && (
                     <button
                       type="button"
                       onClick={() => setShowClearHistoryConfirmModal(true)}
@@ -5805,14 +5897,21 @@ export default function StudioWorkspace({
                                   type="button"
                                   role="switch"
                                   aria-checked={isUsed}
+                                  disabled={!canExportHistory && !canEditHistory}
                                   onClick={(e) =>
                                     handleToggleHistoryStatus(rec, e)
                                   }
-                                  className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                                  className={`relative inline-flex h-5 w-9 shrink-0 rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
                                     isUsed ? "bg-emerald-500" : "bg-slate-700"
+                                  } ${
+                                    !canExportHistory && !canEditHistory
+                                      ? "opacity-50 cursor-not-allowed"
+                                      : "cursor-pointer"
                                   }`}
                                   title={
-                                    isUsed
+                                    !canExportHistory && !canEditHistory
+                                      ? "Chế độ chỉ xem, không thể đổi trạng thái"
+                                      : isUsed
                                       ? "Bấm để đánh dấu là chưa sử dụng"
                                       : "Bấm để đánh dấu là đã sử dụng"
                                   }
@@ -5842,7 +5941,7 @@ export default function StudioWorkspace({
                               onClick={(e) => e.stopPropagation()}
                             >
                               <div className="flex items-center justify-end gap-1.5">
-                                {comp && (
+                                {comp && canExportHistory && (
                                   <button
                                     type="button"
                                     onClick={() =>
@@ -5854,16 +5953,18 @@ export default function StudioWorkspace({
                                     <Download className="w-3.5 h-3.5 text-emerald-400" />
                                   </button>
                                 )}
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setHistoryItemPendingDelete(rec)
-                                  }
-                                  className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 border border-transparent hover:border-rose-500/20 transition"
-                                  title="Xóa bản ghi này khỏi lịch sử"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
+                                {canEditHistory && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setHistoryItemPendingDelete(rec)
+                                    }
+                                    className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 border border-transparent hover:border-rose-500/20 transition"
+                                    title="Xóa bản ghi này khỏi lịch sử"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
                               </div>
                             </td>
                           </tr>

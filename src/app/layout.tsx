@@ -4,7 +4,7 @@ import { GeistMono } from "geist/font/mono";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Lachvid Studio — Cosmetics Video Remix & Zvid.io Automation",
+  title: "OmniGen — Cosmetics Video Remix & Zvid.io Automation",
   description:
     "Upload 1 cosmetics review clip, slice & tag into 5 mandatory categories, generate diverse 9:16 combinations, and render with new Voice via Zvid.io API.",
   icons: {
