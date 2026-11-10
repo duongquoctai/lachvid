@@ -196,14 +196,14 @@ function LoginForm() {
             disabled
             className="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-[11px] font-medium text-slate-500 cursor-not-allowed opacity-60 flex items-center justify-center gap-2"
           >
-            <span>Google (Sắp ra mắt)</span>
+            <span>Google</span>
           </button>
           <button
             type="button"
             disabled
             className="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-[11px] font-medium text-slate-500 cursor-not-allowed opacity-60 flex items-center justify-center gap-2"
           >
-            <span>Facebook (Sắp ra mắt)</span>
+            <span>Facebook</span>
           </button>
         </div>
       </div>

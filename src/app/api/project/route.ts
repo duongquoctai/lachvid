@@ -7,11 +7,14 @@ import {
   getProjectVoiceTracks,
   getProjects,
   getRenderedHistory,
+  getRenderedHistoryItemById,
   recordRenderedVideos,
   clearProjectRenderedHistory,
   deleteRenderedHistoryItem,
+  resolveFolderAccess,
   updateRenderedHistoryStatus,
 } from "@/lib/db";
+import { getCurrentUser } from "@/lib/auth";
 import {
   clearSessionCategories,
   clearSessionSourceVideo,
@@ -101,6 +104,14 @@ export async function POST(req: NextRequest) {
       if (!projectId) {
         return NextResponse.json({ error: "Thiếu projectId" }, { status: 400 });
       }
+      const user = await getCurrentUser();
+      const access = await resolveFolderAccess(projectId, user?.id, user?.email);
+      if (!access.isOwner && !access.permissions.history?.actions?.includes("edit")) {
+        return NextResponse.json(
+          { error: "Bạn không có quyền xóa toàn bộ lịch sử render." },
+          { status: 403 }
+        );
+      }
       await clearProjectRenderedHistory(projectId);
       return NextResponse.json({ success: true });
     }
@@ -109,6 +120,18 @@ export async function POST(req: NextRequest) {
       const id = body.id as string;
       if (!id) {
         return NextResponse.json({ error: "Thiếu id bản ghi" }, { status: 400 });
+      }
+      const user = await getCurrentUser();
+      const item = await getRenderedHistoryItemById(id);
+      if (!item) {
+        return NextResponse.json({ error: "Không tìm thấy bản ghi lịch sử." }, { status: 404 });
+      }
+      const access = await resolveFolderAccess(item.projectId, user?.id, user?.email);
+      if (!access.isOwner && !access.permissions.history?.actions?.includes("edit")) {
+        return NextResponse.json(
+          { error: "Bạn không có quyền xóa bản ghi lịch sử render." },
+          { status: 403 }
+        );
       }
       await deleteRenderedHistoryItem(id);
       return NextResponse.json({ success: true });
@@ -120,11 +143,34 @@ export async function POST(req: NextRequest) {
       if (!id) {
         return NextResponse.json({ error: "Thiếu id bản ghi" }, { status: 400 });
       }
+      const user = await getCurrentUser();
+      const item = await getRenderedHistoryItemById(id);
+      if (!item) {
+        return NextResponse.json({ error: "Không tìm thấy bản ghi lịch sử." }, { status: 404 });
+      }
+      const access = await resolveFolderAccess(item.projectId, user?.id, user?.email);
+      if (!access.isOwner && !access.permissions.history?.actions?.includes("edit")) {
+        return NextResponse.json(
+          { error: "Bạn không có quyền chỉnh sửa trạng thái lịch sử render." },
+          { status: 403 }
+        );
+      }
       await updateRenderedHistoryStatus(id, status);
       return NextResponse.json({ success: true, status });
     }
 
     if (action === "reset_source") {
+      const projectId = body.projectId as string;
+      if (projectId) {
+        const user = await getCurrentUser();
+        const access = await resolveFolderAccess(projectId, user?.id, user?.email);
+        if (!access.isOwner && !access.permissions.split?.actions?.includes("edit")) {
+          return NextResponse.json(
+            { error: "Bạn không có quyền thay đổi video gốc của dự án." },
+            { status: 403 }
+          );
+        }
+      }
       const sessionId = sanitizeSessionId(body.sessionId || getSessionIdFromHeaders(req.headers));
       clearSessionSourceVideo(sessionId);
       const state = readProjectState(sessionId);
@@ -135,6 +181,17 @@ export async function POST(req: NextRequest) {
     }
 
     if (action === "reset_all") {
+      const projectId = body.projectId as string;
+      if (projectId) {
+        const user = await getCurrentUser();
+        const access = await resolveFolderAccess(projectId, user?.id, user?.email);
+        if (!access.isOwner && !access.permissions.mix?.actions?.includes("edit")) {
+          return NextResponse.json(
+            { error: "Bạn không có quyền xóa toàn bộ kho video của dự án." },
+            { status: 403 }
+          );
+        }
+      }
       const sessionId = sanitizeSessionId(body.sessionId || getSessionIdFromHeaders(req.headers));
       clearSessionSourceVideo(sessionId);
       clearSessionCategories(sessionId);

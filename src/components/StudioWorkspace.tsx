@@ -25,6 +25,10 @@ import {
   ShotEdits,
   VoiceTrack,
 } from "@/types/lachvid";
+import {
+  PermissionGate,
+  ProjectAccessProvider,
+} from "@/components/PermissionGate";
 import JSZip from "jszip";
 import {
   AlertTriangle,
@@ -64,6 +68,7 @@ import {
   RotateCcw,
   Scissors,
   Search,
+  ShieldAlert,
   Shuffle,
   Sliders,
   Sparkles,
@@ -134,17 +139,19 @@ export default function StudioWorkspace({
     access || null
   );
 
-  const canViewSplit = !accessState || Boolean(accessState.permissions.split?.enabled);
-  const canEditSplit = !accessState || Boolean(accessState.permissions.split?.actions?.includes("edit"));
-  const canExportSplit = !accessState || Boolean(accessState.permissions.split?.actions?.includes("export"));
+  const isOwner = Boolean(accessState?.isOwner);
 
-  const canViewMix = !accessState || Boolean(accessState.permissions.mix?.enabled);
-  const canEditMix = !accessState || Boolean(accessState.permissions.mix?.actions?.includes("edit"));
-  const canExportMix = !accessState || Boolean(accessState.permissions.mix?.actions?.includes("export"));
+  const canViewSplit = isOwner || !accessState || Boolean(accessState.permissions.split?.enabled);
+  const canEditSplit = isOwner || !accessState || Boolean(accessState.permissions.split?.actions?.includes("edit"));
+  const canExportSplit = isOwner || !accessState || Boolean(accessState.permissions.split?.actions?.includes("export"));
 
-  const canViewHistory = !accessState || Boolean(accessState.permissions.history?.enabled);
-  const canEditHistory = !accessState || Boolean(accessState.permissions.history?.actions?.includes("edit"));
-  const canExportHistory = !accessState || Boolean(accessState.permissions.history?.actions?.includes("export"));
+  const canViewMix = isOwner || !accessState || Boolean(accessState.permissions.mix?.enabled);
+  const canEditMix = isOwner || !accessState || Boolean(accessState.permissions.mix?.actions?.includes("edit"));
+  const canExportMix = isOwner || !accessState || Boolean(accessState.permissions.mix?.actions?.includes("export"));
+
+  const canViewHistory = isOwner || !accessState || Boolean(accessState.permissions.history?.enabled);
+  const canEditHistory = isOwner || !accessState || Boolean(accessState.permissions.history?.actions?.includes("edit"));
+  const canExportHistory = isOwner || !accessState || Boolean(accessState.permissions.history?.actions?.includes("export"));
 
   const [currentProjectName, setCurrentProjectName] = useState<string>(
     projectName || ""
@@ -463,13 +470,20 @@ export default function StudioWorkspace({
   const [toasts, setToasts] = useState<
     Array<{
       id: string;
-      type: "info" | "success" | "error";
+      type: "info" | "success" | "error" | "forbidden";
+      title?: string;
       text: string;
     }>
   >([]);
 
   const addToast = useCallback(
-    (toast: { type: "info" | "success" | "error"; text: string } | null) => {
+    (
+      toast: {
+        type: "info" | "success" | "error" | "forbidden";
+        title?: string;
+        text: string;
+      } | null
+    ) => {
       if (!toast) return;
       const id = `toast_${Date.now()}_${Math.random()
         .toString(36)
@@ -477,7 +491,7 @@ export default function StudioWorkspace({
       setToasts((prev) => [...prev, { id, ...toast }]);
       setTimeout(() => {
         setToasts((prev) => prev.filter((t) => t.id !== id));
-      }, 5000);
+      }, toast.type === "forbidden" ? 7000 : 5000);
     },
     []
   );
@@ -485,6 +499,35 @@ export default function StudioWorkspace({
   const removeToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
+
+  const notifyPermissionDenied = useCallback(
+    (customMessage?: string) => {
+      const detail = customMessage ? `: ${customMessage}` : "";
+      addToast({
+        type: "forbidden",
+        title: "Từ chối truy cập (403)",
+        text: `Bạn không có quyền thực hiện thao tác này${detail}. Vui lòng liên hệ chủ dự án để được cấp quyền.`,
+      });
+    },
+    [addToast]
+  );
+
+  const authFetch = useCallback(
+    async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const res = await fetch(input, init);
+      if (res.status === 403) {
+        try {
+          const cloned = res.clone();
+          const errData = await cloned.json();
+          notifyPermissionDenied(errData.error);
+        } catch {
+          notifyPermissionDenied();
+        }
+      }
+      return res;
+    },
+    [notifyPermissionDenied]
+  );
 
   // Backwards-compatible alias so existing logic continues to work seamlessly
   const setStatusBanner = addToast;
@@ -1538,7 +1581,7 @@ export default function StudioWorkspace({
   const handleNextVideo = async () => {
     if (!state) return;
     try {
-      await fetch("/api/project", {
+      await authFetch("/api/project", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1586,7 +1629,7 @@ export default function StudioWorkspace({
     setStatusBanner(null);
 
     try {
-      const res = await fetch("/api/category-library", {
+      const res = await authFetch("/api/category-library", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1671,7 +1714,7 @@ export default function StudioWorkspace({
     setStatusBanner(null);
 
     try {
-      const res = await fetch("/api/category-library", {
+      const res = await authFetch("/api/category-library", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1748,7 +1791,7 @@ export default function StudioWorkspace({
       for (let i = 0; i < files.length; i++) {
         fd.append("files", files[i]);
       }
-      const res = await fetch("/api/category-library", {
+      const res = await authFetch("/api/category-library", {
         method: "POST",
         headers: { "x-session-id": sessionId },
         body: fd,
@@ -1807,7 +1850,7 @@ export default function StudioWorkspace({
       for (let i = 0; i < files.length; i++) {
         fd.append("files", files[i]);
       }
-      const res = await fetch("/api/category-library", {
+      const res = await authFetch("/api/category-library", {
         method: "POST",
         headers: { "x-session-id": sessionId },
         body: fd,
@@ -1845,7 +1888,7 @@ export default function StudioWorkspace({
       for (let i = 0; i < files.length; i++) {
         fd.append("files", files[i]);
       }
-      const res = await fetch("/api/category-library", {
+      const res = await authFetch("/api/category-library", {
         method: "POST",
         headers: { "x-session-id": sessionId },
         body: fd,
@@ -1877,7 +1920,7 @@ export default function StudioWorkspace({
     fd.append("category", cat);
     fd.append("itemId", itemId);
     if (projectId) fd.append("projectId", projectId);
-    const res = await fetch("/api/category-library", {
+    const res = await authFetch("/api/category-library", {
       method: "POST",
       headers: { "x-session-id": sessionId },
       body: fd,
@@ -1896,7 +1939,7 @@ export default function StudioWorkspace({
     fd.append("action", "remove_voice");
     fd.append("voiceId", voiceId);
     if (projectId) fd.append("projectId", projectId);
-    const res = await fetch("/api/category-library", {
+    const res = await authFetch("/api/category-library", {
       method: "POST",
       headers: { "x-session-id": sessionId },
       body: fd,
@@ -1913,7 +1956,7 @@ export default function StudioWorkspace({
       fd.append("action", "clear_all");
       fd.append("sessionId", sessionId);
       if (projectId) fd.append("projectId", projectId);
-      const res = await fetch("/api/category-library", {
+      const res = await authFetch("/api/category-library", {
         method: "POST",
         headers: { "x-session-id": sessionId },
         body: fd,
@@ -1990,7 +2033,7 @@ export default function StudioWorkspace({
     if (!projectId) return;
     setIsClearingHistory(true);
     try {
-      const res = await fetch("/api/project", {
+      const res = await authFetch("/api/project", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "clear_history", projectId }),
@@ -2101,7 +2144,7 @@ export default function StudioWorkspace({
     const item = historyItemPendingDelete;
     setIsDeletingHistoryItem(true);
     try {
-      const res = await fetch("/api/project", {
+      const res = await authFetch("/api/project", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "delete_history_item", id: item.id }),
@@ -2140,7 +2183,7 @@ export default function StudioWorkspace({
       return;
     }
     try {
-      const res = await fetch("/api/project", {
+      const res = await authFetch("/api/project", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "delete_history_item", id }),
@@ -2167,6 +2210,12 @@ export default function StudioWorkspace({
     e?: React.MouseEvent
   ) => {
     if (e) e.stopPropagation();
+    if (!canEditHistory) {
+      notifyPermissionDenied(
+        "Bạn không có quyền chỉnh sửa trạng thái lịch sử render."
+      );
+      return;
+    }
     const newStatus: "unused" | "used" =
       record.status === "used" ? "unused" : "used";
 
@@ -2181,7 +2230,7 @@ export default function StudioWorkspace({
     }
 
     try {
-      const res = await fetch("/api/project", {
+      const res = await authFetch("/api/project", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2191,7 +2240,8 @@ export default function StudioWorkspace({
         }),
       });
       if (!res.ok) {
-        throw new Error("Không thể cập nhật trạng thái");
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || "Không thể cập nhật trạng thái");
       }
       setStatusBanner({
         type: "success",
@@ -2805,7 +2855,11 @@ export default function StudioWorkspace({
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+    <ProjectAccessProvider
+      access={accessState}
+      onPermissionDenied={notifyPermissionDenied}
+    >
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
       {/* Top Header & Two-Tab Navigation */}
       <header className="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800 px-6 py-3 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3">
@@ -3096,29 +3150,35 @@ export default function StudioWorkspace({
                 </div>
 
                 {!state?.sourceVideo ? (
-                  <div
-                    onClick={() => singleVideoInputRef.current?.click()}
-                    onDragOver={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                    }}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      if (e.dataTransfer.files?.[0]) {
-                        handleUploadSingleSource(e.dataTransfer.files[0]);
-                      }
-                    }}
-                    className="border-2 border-dashed border-slate-700 hover:border-rose-500 rounded-2xl p-6 flex flex-col items-center justify-center text-center cursor-pointer transition bg-slate-950/40 hover:bg-slate-950/70"
-                  >
-                    <Upload className="w-7 h-7 text-rose-400 mb-2 animate-bounce" />
-                    <p className="text-xs font-semibold text-white">
-                      Chọn hoặc kéo thả 1 video gốc vào đây
-                    </p>
-                    <p className="text-[11px] text-slate-400 mt-0.5">
-                      MP4, MOV, WebM (Khuyên dùng video dọc 9:16)
-                    </p>
-                  </div>
+                  canEditSplit ? (
+                    <div
+                      onClick={() => singleVideoInputRef.current?.click()}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (e.dataTransfer.files?.[0]) {
+                          handleUploadSingleSource(e.dataTransfer.files[0]);
+                        }
+                      }}
+                      className="border-2 border-dashed border-slate-700 hover:border-rose-500 rounded-2xl p-6 flex flex-col items-center justify-center text-center cursor-pointer transition bg-slate-950/40 hover:bg-slate-950/70"
+                    >
+                      <Upload className="w-7 h-7 text-rose-400 mb-2 animate-bounce" />
+                      <p className="text-xs font-semibold text-white">
+                        Chọn hoặc kéo thả 1 video gốc vào đây
+                      </p>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        MP4, MOV, WebM (Khuyên dùng video dọc 9:16)
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="border border-slate-800 rounded-2xl p-6 flex flex-col items-center justify-center text-center bg-slate-950/40 text-slate-500 text-xs">
+                      Chưa có video gốc và bạn không có quyền tải lên video.
+                    </div>
+                  )
                 ) : (
                   <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2 text-xs">
                     <div className="flex items-center justify-between">
@@ -3142,13 +3202,15 @@ export default function StudioWorkspace({
                           {state.sourceVideo.width}x{state.sourceVideo.height}
                         </span>
                       </div>
-                      <button
-                        onClick={() => singleVideoInputRef.current?.click()}
-                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/30 text-[11px] text-rose-300 transition"
-                      >
-                        <Upload className="w-3 h-3" />
-                        <span>Đổi video khác</span>
-                      </button>
+                      <PermissionGate module="split" action="edit">
+                        <button
+                          onClick={() => singleVideoInputRef.current?.click()}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/30 text-[11px] text-rose-300 transition"
+                        >
+                          <Upload className="w-3 h-3" />
+                          <span>Đổi video khác</span>
+                        </button>
+                      </PermissionGate>
                     </div>
                   </div>
                 )}
@@ -3184,6 +3246,7 @@ export default function StudioWorkspace({
                             step="0.1"
                             min="1.0"
                             max="30.0"
+                            disabled={!canEditSplit}
                             value={currentMin}
                             onChange={(e) => {
                               const val = parseFloat(e.target.value) || 1.0;
@@ -3202,7 +3265,7 @@ export default function StudioWorkspace({
                                 });
                               }
                             }}
-                            className="w-full px-2 py-1 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono text-center text-white focus:outline-none focus:border-rose-500"
+                            className="w-full px-2 py-1 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono text-center text-white focus:outline-none focus:border-rose-500 disabled:opacity-50 disabled:cursor-not-allowed"
                           />
                           <span className="text-xs text-slate-400">s</span>
                         </div>
@@ -3216,13 +3279,14 @@ export default function StudioWorkspace({
                     <label className="flex items-center gap-1">
                       <span>Thuật toán:</span>
                       <select
+                        disabled={!canEditSplit}
                         value={pyDetector}
                         onChange={(e) =>
                           setPyDetector(
                             e.target.value as "content" | "adaptive"
                           )
                         }
-                        className="px-2 py-0.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-200"
+                        className="px-2 py-0.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <option value="content">Content</option>
                         <option value="adaptive">Adaptive</option>
@@ -3232,14 +3296,15 @@ export default function StudioWorkspace({
                       <span>Threshold:</span>
                       <input
                         type="number"
+                        disabled={!canEditSplit}
                         value={pyThreshold}
                         onChange={(e) => setPyThreshold(Number(e.target.value))}
-                        className="w-12 px-1 py-0.5 rounded-lg bg-slate-950 border border-slate-800 text-xs font-mono text-center text-slate-200"
+                        className="w-12 px-1 py-0.5 rounded-lg bg-slate-950 border border-slate-800 text-xs font-mono text-center text-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
                       />
                     </label>
                   </div>
 
-                  {canEditSplit && (
+                  <PermissionGate module="split" action="edit">
                     <button
                       onClick={handleRunPySceneDetect}
                       disabled={!state?.sourceVideo}
@@ -3248,7 +3313,7 @@ export default function StudioWorkspace({
                       <Wand2 className="w-3.5 h-3.5" />
                       <span>Auto detect cắt scene</span>
                     </button>
-                  )}
+                  </PermissionGate>
                 </div>
               </div>
             </div>
@@ -3326,7 +3391,7 @@ export default function StudioWorkspace({
                             Kho video theo 5 category (đã tách từ video gốc)
                           </h3>
                         </div>
-                        {canEditSplit && (
+                        <PermissionGate module="split" action="edit">
                           <button
                             onClick={() => {
                               const lastEnd =
@@ -3370,7 +3435,7 @@ export default function StudioWorkspace({
                             <Plus className="w-3.5 h-3.5 text-indigo-400" />
                             <span>Thêm shot thủ công</span>
                           </button>
-                        )}
+                        </PermissionGate>
                       </div>
 
                       {/* 5 Slots Badges / Category Cards */}
@@ -3702,19 +3767,21 @@ export default function StudioWorkspace({
                                             <Edit3 className="w-3.5 h-3.5" />
                                           </button>
 
-                                          <button
-                                            type="button"
-                                            onClick={() => {
-                                              handleDeleteShot(shot.id);
-                                              if (accordionShotId === shot.id) {
-                                                setAccordionShotId(null);
-                                              }
-                                            }}
-                                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-slate-800 transition"
-                                            title="Xoá cảnh này"
-                                          >
-                                            <Trash2 className="w-3.5 h-3.5" />
-                                          </button>
+                                          <PermissionGate module="split" action="edit">
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                handleDeleteShot(shot.id);
+                                                if (accordionShotId === shot.id) {
+                                                  setAccordionShotId(null);
+                                                }
+                                              }}
+                                              className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-slate-800 transition"
+                                              title="Xoá cảnh này"
+                                            >
+                                              <Trash2 className="w-3.5 h-3.5" />
+                                            </button>
+                                          </PermissionGate>
                                         </div>
                                       </div>
 
@@ -3732,6 +3799,7 @@ export default function StudioWorkspace({
                                                 </span>
                                                 <input
                                                   type="text"
+                                                  disabled={!canEditSplit}
                                                   value={accordionShot.label}
                                                   onChange={(e) => {
                                                     const updated =
@@ -3750,8 +3818,8 @@ export default function StudioWorkspace({
                                                       shots: updated,
                                                     });
                                                   }}
-                                                  className="bg-transparent text-xs font-bold text-slate-100 focus:outline-none border-b border-transparent focus:border-indigo-500 truncate flex-1 min-w-[120px]"
-                                                  title="Click để đổi tên cảnh"
+                                                  className="bg-transparent text-xs font-bold text-slate-100 focus:outline-none border-b border-transparent focus:border-indigo-500 truncate flex-1 min-w-[120px] disabled:opacity-60 disabled:cursor-not-allowed"
+                                                  title={canEditSplit ? "Click để đổi tên cảnh" : "Chế độ chỉ xem"}
                                                 />
                                                 <span className="text-[10px] text-slate-400 font-mono hidden md:inline shrink-0">
                                                   (Gốc:{" "}
@@ -3764,27 +3832,34 @@ export default function StudioWorkspace({
 
                                               <div className="flex items-center gap-2 shrink-0">
                                                 {/* Mirror toggle button */}
-                                                <button
-                                                  type="button"
-                                                  onClick={() =>
-                                                    handleToggleFlipH(
-                                                      accordionShot.id
-                                                    )
-                                                  }
-                                                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] font-semibold border transition ${
-                                                    accordionShot.edits.flipH
-                                                      ? "bg-indigo-600/30 text-indigo-300 border-indigo-500/60 shadow-sm"
-                                                      : "bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700"
-                                                  }`}
-                                                  title="Lật gương ngang hình ảnh (Mirror)"
-                                                >
-                                                  <FlipHorizontal className="w-3.5 h-3.5" />
-                                                  <span>
-                                                    {accordionShot.edits.flipH
-                                                      ? "Đang lật gương"
-                                                      : "Lật gương"}
-                                                  </span>
-                                                </button>
+                                                <PermissionGate module="split" action="edit">
+                                                  <button
+                                                    type="button"
+                                                    disabled={!canEditSplit}
+                                                    onClick={() =>
+                                                      handleToggleFlipH(
+                                                        accordionShot.id
+                                                      )
+                                                    }
+                                                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] font-semibold border transition ${
+                                                      accordionShot.edits.flipH
+                                                        ? "bg-indigo-600/30 text-indigo-300 border-indigo-500/60 shadow-sm"
+                                                        : "bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700"
+                                                    }`}
+                                                    title={
+                                                      accordionShot.edits.flipH
+                                                        ? "Đang lật gương"
+                                                        : "Lật gương ngang hình ảnh (Mirror)"
+                                                    }
+                                                  >
+                                                    <FlipHorizontal className="w-3.5 h-3.5" />
+                                                    <span>
+                                                      {accordionShot.edits.flipH
+                                                        ? "Đang lật gương"
+                                                        : "Lật gương"}
+                                                    </span>
+                                                  </button>
+                                                </PermissionGate>
 
                                                 {/* Xem đoạn này button */}
                                                 <button
@@ -3834,6 +3909,7 @@ export default function StudioWorkspace({
                                                       <button
                                                         key={spd}
                                                         type="button"
+                                                        disabled={!canEditSplit}
                                                         onClick={() =>
                                                           handleUpdateShotEdits(
                                                             accordionShot.id,
@@ -3847,7 +3923,7 @@ export default function StudioWorkspace({
                                                           spd
                                                             ? "bg-indigo-600 text-white font-bold"
                                                             : "bg-slate-800 hover:bg-slate-700 text-slate-300"
-                                                        }`}
+                                                        } disabled:opacity-50 disabled:cursor-not-allowed`}
                                                       >
                                                         {spd}x
                                                       </button>
@@ -3858,6 +3934,7 @@ export default function StudioWorkspace({
                                                     min="0.25"
                                                     max="3.0"
                                                     step="0.05"
+                                                    disabled={!canEditSplit}
                                                     value={
                                                       splitShotTrimInfo.speed
                                                     }
@@ -3872,7 +3949,7 @@ export default function StudioWorkspace({
                                                         }
                                                       )
                                                     }
-                                                    className="w-full accent-indigo-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+                                                    className="w-full accent-indigo-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
                                                   />
                                                 </div>
                                                 <p className="text-[10px] text-slate-400 font-mono pt-1 border-t border-slate-800/80">
@@ -3995,37 +4072,39 @@ export default function StudioWorkspace({
 
                                                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
                                                   {/* Lock flipH */}
-                                                  <button
-                                                    type="button"
-                                                    onClick={() =>
-                                                      handleToggleLockFlipH(
-                                                        accordionShot.id
-                                                      )
-                                                    }
-                                                    className={`p-2 rounded-lg border flex items-center justify-between transition ${
-                                                      accordionShot.edits
-                                                        .lockFlipH
-                                                        ? "bg-amber-500/20 border-amber-500/50 text-amber-200"
-                                                        : "bg-slate-900 border-slate-800 text-slate-300"
-                                                    }`}
-                                                    title="Khoá không cho phép lật ngang nếu cảnh có chữ/tên thương hiệu"
-                                                  >
-                                                    <span className="flex items-center gap-1 font-medium text-[11px]">
-                                                      {accordionShot.edits
-                                                        .lockFlipH ? (
-                                                        <Lock className="w-3.5 h-3.5 text-amber-400" />
-                                                      ) : (
-                                                        <Unlock className="w-3.5 h-3.5 text-slate-500" />
-                                                      )}
-                                                      Khoá chữ (L)
-                                                    </span>
-                                                    <span className="font-mono text-[10px] font-bold">
-                                                      {accordionShot.edits
-                                                        .lockFlipH
-                                                        ? "LOCKED"
-                                                        : "FREE"}
-                                                    </span>
-                                                  </button>
+                                                  <PermissionGate module="split" action="edit">
+                                                    <button
+                                                      type="button"
+                                                      onClick={() =>
+                                                        handleToggleLockFlipH(
+                                                          accordionShot.id
+                                                        )
+                                                      }
+                                                      className={`p-2 rounded-lg border flex items-center justify-between transition ${
+                                                        accordionShot.edits
+                                                          .lockFlipH
+                                                          ? "bg-amber-500/20 border-amber-500/50 text-amber-200"
+                                                          : "bg-slate-900 border-slate-800 text-slate-300"
+                                                      }`}
+                                                      title="Khoá không cho phép lật ngang nếu cảnh có chữ/tên thương hiệu"
+                                                    >
+                                                      <span className="flex items-center gap-1 font-medium text-[11px]">
+                                                        {accordionShot.edits
+                                                          .lockFlipH ? (
+                                                          <Lock className="w-3.5 h-3.5 text-amber-400" />
+                                                        ) : (
+                                                          <Unlock className="w-3.5 h-3.5 text-slate-500" />
+                                                        )}
+                                                        Khoá chữ (L)
+                                                      </span>
+                                                      <span className="font-mono text-[10px] font-bold">
+                                                        {accordionShot.edits
+                                                          .lockFlipH
+                                                          ? "LOCKED"
+                                                          : "FREE"}
+                                                      </span>
+                                                    </button>
+                                                  </PermissionGate>
 
                                                   {/* Ken Burns Zoom */}
                                                   <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 flex flex-col justify-between">
@@ -4049,6 +4128,7 @@ export default function StudioWorkspace({
                                                       min="1.0"
                                                       max="1.5"
                                                       step="0.05"
+                                                      disabled={!canEditSplit}
                                                       value={
                                                         typeof accordionShot
                                                           .edits.zoom ===
@@ -4071,69 +4151,74 @@ export default function StudioWorkspace({
                                                             : depth
                                                         );
                                                       }}
-                                                      className="w-full accent-indigo-500 h-1 bg-slate-800 rounded mt-1"
+                                                      className="w-full accent-indigo-500 h-1 bg-slate-800 rounded mt-1 disabled:opacity-50 disabled:cursor-not-allowed"
                                                     />
                                                   </div>
 
                                                   {/* Delete current shot */}
-                                                  <div className="flex items-center justify-end">
-                                                    <button
-                                                      type="button"
-                                                      onClick={() => {
-                                                        handleDeleteShot(
-                                                          accordionShot.id
-                                                        );
-                                                        setAccordionShotId(
-                                                          null
-                                                        );
-                                                      }}
-                                                      className="w-full py-2 px-3 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-semibold flex items-center justify-center gap-1.5 transition"
-                                                      title="Xoá cảnh này khỏi danh sách"
-                                                    >
-                                                      <Trash2 className="w-3.5 h-3.5" />
-                                                      <span>Xoá cảnh này</span>
-                                                    </button>
-                                                  </div>
+                                                  <PermissionGate module="split" action="edit">
+                                                    <div className="flex items-center justify-end">
+                                                      <button
+                                                        type="button"
+                                                        onClick={() => {
+                                                          handleDeleteShot(
+                                                            accordionShot.id
+                                                          );
+                                                          setAccordionShotId(
+                                                            null
+                                                          );
+                                                        }}
+                                                        className="w-full py-2 px-3 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-semibold flex items-center justify-center gap-1.5 transition"
+                                                        title="Xoá cảnh này khỏi danh sách"
+                                                      >
+                                                        <Trash2 className="w-3.5 h-3.5" />
+                                                        <span>Xoá cảnh này</span>
+                                                      </button>
+                                                    </div>
+                                                  </PermissionGate>
                                                 </div>
 
                                                 {/* Reassign Category buttons */}
-                                                <div className="flex items-center gap-1.5 pt-1.5 border-t border-slate-800/80">
-                                                  <span className="text-[10px] text-slate-400 shrink-0 font-medium">
-                                                    Chuyển sang nhóm:
-                                                  </span>
-                                                  <div className="flex items-center gap-1 flex-wrap">
-                                                    {SHOT_CATEGORIES.map(
-                                                      (c) => (
-                                                        <button
-                                                          key={c.id}
-                                                          type="button"
-                                                          onClick={() => {
-                                                            handleCategoryChange(
-                                                              accordionShot.id,
+                                                <PermissionGate module="split" action="edit">
+                                                  <div className="flex items-center gap-1.5 pt-1.5 border-t border-slate-800/80">
+                                                    <span className="text-[10px] text-slate-400 shrink-0 font-medium">
+                                                      Chuyển sang nhóm:
+                                                    </span>
+                                                    <div className="flex items-center gap-1 flex-wrap">
+                                                      {SHOT_CATEGORIES.map(
+                                                        (c) => (
+                                                          <button
+                                                            key={c.id}
+                                                            type="button"
+                                                            onClick={() => {
+                                                              handleCategoryChange(
+                                                                accordionShot.id,
+                                                                c.id
+                                                              );
+                                                              setSplitEditingCategory(
+                                                                c.id
+                                                              );
+                                                            }}
+                                                            disabled={
+                                                              !canEditSplit ||
+                                                              accordionShot.category ===
+                                                                c.id
+                                                            }
+                                                            className={`px-2 py-0.5 rounded text-[10px] font-semibold border transition disabled:opacity-40 ${
+                                                              accordionShot.category ===
                                                               c.id
-                                                            );
-                                                            setSplitEditingCategory(
-                                                              c.id
-                                                            );
-                                                          }}
-                                                          disabled={
-                                                            accordionShot.category ===
-                                                            c.id
-                                                          }
-                                                          className={`px-2 py-0.5 rounded text-[10px] font-semibold border transition disabled:opacity-40 ${
-                                                            accordionShot.category ===
-                                                            c.id
-                                                              ? c.badgeClass
-                                                              : "bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200"
-                                                          }`}
-                                                        >
-                                                          {c.hotkey}.{" "}
-                                                          {c.id.toUpperCase()}
-                                                        </button>
-                                                      )
-                                                    )}
+                                                                ? c.badgeClass
+                                                                : "bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200"
+                                                            }`}
+                                                          >
+                                                            {c.hotkey}.{" "}
+                                                            {c.id.toUpperCase()}
+                                                          </button>
+                                                        )
+                                                      )}
+                                                    </div>
                                                   </div>
-                                                </div>
+                                                </PermissionGate>
                                               </div>
                                             </div>
                                           </div>
@@ -4258,27 +4343,29 @@ export default function StudioWorkspace({
                           </button>
                         </div>
 
-                        <div className="flex items-center gap-1">
-                          <button
-                            onClick={() => handleSplitAtTime(slicerTime)}
-                            className="px-2.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 text-xs font-semibold flex items-center gap-1"
-                            title="Tách đôi shot tại con trỏ (phím S)"
-                          >
-                            <Scissors className="w-3 h-3" />
-                            <span>Tách (S)</span>
-                          </button>
-                          {selectedShotId && (
+                        <PermissionGate module="split" action="edit">
+                          <div className="flex items-center gap-1">
                             <button
-                              onClick={() =>
-                                handleMergeWithNext(selectedShotId)
-                              }
-                              className="px-2.5 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40 text-xs font-semibold"
-                              title="Gộp với shot kế tiếp"
+                              onClick={() => handleSplitAtTime(slicerTime)}
+                              className="px-2.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 text-xs font-semibold flex items-center gap-1"
+                              title="Tách đôi shot tại con trỏ (phím S)"
                             >
-                              Gộp sau
+                              <Scissors className="w-3 h-3" />
+                              <span>Tách (S)</span>
                             </button>
-                          )}
-                        </div>
+                            {selectedShotId && (
+                              <button
+                                onClick={() =>
+                                  handleMergeWithNext(selectedShotId)
+                                }
+                                className="px-2.5 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40 text-xs font-semibold"
+                                title="Gộp với shot kế tiếp"
+                              >
+                                Gộp sau
+                              </button>
+                            )}
+                          </div>
+                        </PermissionGate>
                       </div>
                     </div>
 
@@ -4384,7 +4471,7 @@ export default function StudioWorkspace({
                           </button>
                         </>
                       )}
-                      {canEditSplit && (
+                      <PermissionGate module="split" action="edit">
                         <button
                           type="button"
                           onClick={handleNextVideo}
@@ -4393,7 +4480,7 @@ export default function StudioWorkspace({
                           <Plus className="w-4 h-4" />
                           <span>Tách video tiếp theo</span>
                         </button>
-                      )}
+                      </PermissionGate>
                     </div>
                   </div>
                 </div>
@@ -4434,27 +4521,25 @@ export default function StudioWorkspace({
                     <Cloud className="w-4 h-4 text-sky-400" />
                     <span>Lịch sử link Drive ({allDriveLinks.length})</span>
                   </button>
-                  {canEditMix && (
-                    <>
-                      <button
-                        onClick={() => masterFolderInputRef.current?.click()}
-                        className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition"
-                        title="Upload thư mục chứa 5 folder OPEN, PRODUCT, TEXTURE, APPLY, END từ máy tính"
-                      >
-                        <FolderSync className="w-4 h-4 text-indigo-400" />
-                        <span>Chọn thư mục tổng từ máy (tự phân 5 cột)</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setShowClearConfirmModal(true)}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-slate-100 transition shadow-md shadow-rose-600/20"
-                        title="Xóa toàn bộ clip trong kho, voice và danh sách tổ hợp"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>Xóa</span>
-                      </button>
-                    </>
-                  )}
+                  <PermissionGate module="mix" action="edit">
+                    <button
+                      onClick={() => masterFolderInputRef.current?.click()}
+                      className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition"
+                      title="Upload thư mục chứa 5 folder OPEN, PRODUCT, TEXTURE, APPLY, END từ máy tính"
+                    >
+                      <FolderSync className="w-4 h-4 text-indigo-400" />
+                      <span>Chọn thư mục tổng từ máy (tự phân 5 cột)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowClearConfirmModal(true)}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-slate-100 transition shadow-md shadow-rose-600/20"
+                      title="Xóa toàn bộ clip trong kho, voice và danh sách tổ hợp"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Xóa</span>
+                    </button>
+                  </PermissionGate>
                 </div>
               </div>
 
@@ -4515,69 +4600,71 @@ export default function StudioWorkspace({
               </div>
 
               {/* Mode chính: Dán nhanh bảng 5 cột từ Excel */}
-              <div className="bg-slate-950/80 border border-sky-500/30 rounded-xl p-4 space-y-3 shadow-lg shadow-sky-950/20">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <div className="w-7 h-7 rounded-lg bg-emerald-500/20 flex items-center justify-center border border-emerald-500/40">
-                      <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+              <PermissionGate module="mix" action="edit">
+                <div className="bg-slate-950/80 border border-sky-500/30 rounded-xl p-4 space-y-3 shadow-lg shadow-sky-950/20">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <div className="w-7 h-7 rounded-lg bg-emerald-500/20 flex items-center justify-center border border-emerald-500/40">
+                        <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+                      </div>
+                      <div>
+                        <h3 className="text-xs font-bold text-white flex items-center gap-2">
+                          <span>
+                            Dán nhanh bảng 5 cột từ Excel (Google Drive)
+                          </span>
+                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/40">
+                            Mode chính • Zero-disk stream
+                          </span>
+                        </h3>
+                        <p className="text-[11px] text-slate-400">
+                          Bôi đen cả bảng 5 cột (Open, Product, Texture, Apply,
+                          End) trong file Excel rồi dán (Ctrl+V) vào khung bên
+                          dưới.
+                        </p>
+                      </div>
                     </div>
-                    <div>
-                      <h3 className="text-xs font-bold text-white flex items-center gap-2">
-                        <span>
-                          Dán nhanh bảng 5 cột từ Excel (Google Drive)
-                        </span>
-                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/40">
-                          Mode chính • Zero-disk stream
-                        </span>
-                      </h3>
-                      <p className="text-[11px] text-slate-400">
-                        Bôi đen cả bảng 5 cột (Open, Product, Texture, Apply,
-                        End) trong file Excel rồi dán (Ctrl+V) vào khung bên
-                        dưới.
-                      </p>
-                    </div>
+
+                    {parsedExcel.totalExtracted > 0 && (
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setExcelPasteText("")}
+                          className="px-2.5 py-1 text-[11px] text-slate-400 hover:text-slate-200 transition"
+                        >
+                          Xoá nội dung dán
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleIngestExcelDriveLinks}
+                          disabled={isIngestingDrive}
+                          className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow-md shadow-emerald-600/20 disabled:opacity-50"
+                        >
+                          {isIngestingDrive ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Cloud className="w-3.5 h-3.5" />
+                          )}
+                          <span>
+                            {isIngestingDrive
+                              ? "Đang nạp file..."
+                              : `+ Nạp ${parsedExcel.totalExtracted} file vào kho (5 category & voice)`}
+                          </span>
+                        </button>
+                      </div>
+                    )}
                   </div>
 
-                  {parsedExcel.totalExtracted > 0 && (
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setExcelPasteText("")}
-                        className="px-2.5 py-1 text-[11px] text-slate-400 hover:text-slate-200 transition"
-                      >
-                        Xoá nội dung dán
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleIngestExcelDriveLinks}
-                        disabled={isIngestingDrive}
-                        className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow-md shadow-emerald-600/20 disabled:opacity-50"
-                      >
-                        {isIngestingDrive ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <Cloud className="w-3.5 h-3.5" />
-                        )}
-                        <span>
-                          {isIngestingDrive
-                            ? "Đang nạp file..."
-                            : `+ Nạp ${parsedExcel.totalExtracted} file vào kho (5 category & voice)`}
-                        </span>
-                      </button>
-                    </div>
-                  )}
+                  <div className="relative">
+                    <textarea
+                      rows={3}
+                      value={excelPasteText}
+                      onChange={(e) => setExcelPasteText(e.target.value)}
+                      placeholder="Dán vùng dữ liệu copy từ Excel vào đây (hệ thống tự động phân tách Tab thành các cột: Open, Product, Texture, Apply, End, Voice)..."
+                      className="w-full px-3.5 py-2.5 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition resize-y"
+                    />
+                  </div>
                 </div>
-
-                <div className="relative">
-                  <textarea
-                    rows={3}
-                    value={excelPasteText}
-                    onChange={(e) => setExcelPasteText(e.target.value)}
-                    placeholder="Dán vùng dữ liệu copy từ Excel vào đây (hệ thống tự động phân tách Tab thành các cột: Open, Product, Texture, Apply, End, Voice)..."
-                    className="w-full px-3.5 py-2.5 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition resize-y"
-                  />
-                </div>
-              </div>
+              </PermissionGate>
 
               {/* 6 Category & Voice Columns in 3x2 Grid */}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
@@ -4604,33 +4691,35 @@ export default function StudioWorkspace({
                             {items.length} clip
                           </span>
                         </div>
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setSingleCategoryDriveModal({
-                                category: catKey,
-                                text: "",
-                              })
-                            }
-                            className="py-1 px-2 rounded-lg bg-sky-950/60 hover:bg-sky-900/80 border border-sky-800/60 text-[10px] font-semibold text-sky-200 flex items-center gap-1 transition shadow-sm"
-                            title="Dán link Google Drive cho mục này"
-                          >
-                            <Link2 className="w-3 h-3 text-sky-400 shrink-0" />
-                            <span>Link Drive</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              categoryInputRefs.current[catKey]?.click()
-                            }
-                            className="py-1 px-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[10px] font-semibold text-slate-300 flex items-center gap-1 transition shadow-sm"
-                            title="Tải file clip từ máy tính"
-                          >
-                            <Plus className="w-3 h-3 text-slate-400 shrink-0" />
-                            <span>File</span>
-                          </button>
-                        </div>
+                        <PermissionGate module="mix" action="edit">
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setSingleCategoryDriveModal({
+                                  category: catKey,
+                                  text: "",
+                                })
+                              }
+                              className="py-1 px-2 rounded-lg bg-sky-950/60 hover:bg-sky-900/80 border border-sky-800/60 text-[10px] font-semibold text-sky-200 flex items-center gap-1 transition shadow-sm"
+                              title="Dán link Google Drive cho mục này"
+                            >
+                              <Link2 className="w-3 h-3 text-sky-400 shrink-0" />
+                              <span>Link Drive</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                categoryInputRefs.current[catKey]?.click()
+                              }
+                              className="py-1 px-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[10px] font-semibold text-slate-300 flex items-center gap-1 transition shadow-sm"
+                              title="Tải file clip từ máy tính"
+                            >
+                              <Plus className="w-3 h-3 text-slate-400 shrink-0" />
+                              <span>File</span>
+                            </button>
+                          </div>
+                        </PermissionGate>
                       </div>
 
                       {/* Items List */}
@@ -4685,16 +4774,18 @@ export default function StudioWorkspace({
                                     <span className="font-mono text-slate-400 font-semibold">
                                       {it.duration.toFixed(1)}s
                                     </span>
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        handleRemoveCategoryItem(catKey, it.id)
-                                      }
-                                      className="text-slate-500 hover:text-rose-400 opacity-60 group-hover:opacity-100 transition p-0.5 rounded hover:bg-slate-800"
-                                      title="Xóa clip này khỏi kho"
-                                    >
-                                      <Trash2 className="w-3 h-3" />
-                                    </button>
+                                    <PermissionGate module="mix" action="edit">
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleRemoveCategoryItem(catKey, it.id)
+                                        }
+                                        className="text-slate-500 hover:text-rose-400 opacity-60 group-hover:opacity-100 transition p-0.5 rounded hover:bg-slate-800"
+                                        title="Xóa clip này khỏi kho"
+                                      >
+                                        <Trash2 className="w-3 h-3" />
+                                      </button>
+                                    </PermissionGate>
                                   </div>
                                 </div>
 
@@ -4749,31 +4840,33 @@ export default function StudioWorkspace({
                         {multiVoices.length} voice
                       </span>
                     </div>
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setSingleCategoryDriveModal({
-                            category: "voice",
-                            text: "",
-                          })
-                        }
-                        className="py-1 px-2 rounded-lg bg-sky-950/60 hover:bg-sky-900/80 border border-sky-800/60 text-[10px] font-semibold text-sky-200 flex items-center gap-1 transition shadow-sm"
-                        title="Dán link Google Drive cho lồng tiếng"
-                      >
-                        <Link2 className="w-3 h-3 text-sky-400 shrink-0" />
-                        <span>Link Drive</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => voiceInputRef.current?.click()}
-                        className="py-1 px-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[10px] font-semibold text-slate-300 flex items-center gap-1 transition shadow-sm"
-                        title="Tải file voice từ máy tính"
-                      >
-                        <Plus className="w-3 h-3 text-slate-400 shrink-0" />
-                        <span>File</span>
-                      </button>
-                    </div>
+                    <PermissionGate module="mix" action="edit">
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setSingleCategoryDriveModal({
+                              category: "voice",
+                              text: "",
+                            })
+                          }
+                          className="py-1 px-2 rounded-lg bg-sky-950/60 hover:bg-sky-900/80 border border-sky-800/60 text-[10px] font-semibold text-sky-200 flex items-center gap-1 transition shadow-sm"
+                          title="Dán link Google Drive cho lồng tiếng"
+                        >
+                          <Link2 className="w-3 h-3 text-sky-400 shrink-0" />
+                          <span>Link Drive</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => voiceInputRef.current?.click()}
+                          className="py-1 px-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[10px] font-semibold text-slate-300 flex items-center gap-1 transition shadow-sm"
+                          title="Tải file voice từ máy tính"
+                        >
+                          <Plus className="w-3 h-3 text-slate-400 shrink-0" />
+                          <span>File</span>
+                        </button>
+                      </div>
+                    </PermissionGate>
                   </div>
 
                   {/* Inline Voice Mode Toggle */}
@@ -4786,9 +4879,10 @@ export default function StudioWorkspace({
                         <input
                           type="radio"
                           name="boxVoiceMode"
+                          disabled={!canEditMix}
                           checked={mixVoiceMode === "none"}
                           onChange={() => setMixVoiceMode("none")}
-                          className="accent-indigo-500"
+                          className="accent-indigo-500 disabled:opacity-50"
                         />
                         <span
                           className={
@@ -4804,9 +4898,10 @@ export default function StudioWorkspace({
                         <input
                           type="radio"
                           name="boxVoiceMode"
+                          disabled={!canEditMix}
                           checked={mixVoiceMode === "rotate"}
                           onChange={() => setMixVoiceMode("rotate")}
-                          className="accent-indigo-500"
+                          className="accent-indigo-500 disabled:opacity-50"
                         />
                         <span
                           className={
@@ -4889,14 +4984,16 @@ export default function StudioWorkspace({
                                 <span className="font-mono text-slate-400 font-semibold">
                                   {v.duration.toFixed(1)}s
                                 </span>
-                                <button
-                                  type="button"
-                                  onClick={() => handleRemoveVoiceItem(v.id)}
-                                  className="text-slate-500 hover:text-rose-400 opacity-60 group-hover:opacity-100 transition p-0.5 rounded hover:bg-slate-800"
-                                  title="Xóa voice này khỏi kho"
-                                >
-                                  <Trash2 className="w-3 h-3" />
-                                </button>
+                                <PermissionGate module="mix" action="edit">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRemoveVoiceItem(v.id)}
+                                    className="text-slate-500 hover:text-rose-400 opacity-60 group-hover:opacity-100 transition p-0.5 rounded hover:bg-slate-800"
+                                    title="Xóa voice này khỏi kho"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </PermissionGate>
                               </div>
                             </div>
 
@@ -4948,12 +5045,13 @@ export default function StudioWorkspace({
                   </label>
                   <input
                     type="text"
+                    disabled={!canEditMix}
                     value={clipNamePrefix}
                     onChange={(e) => setClipNamePrefix(e.target.value)}
                     onBlur={() => persistProjectSettings()}
                     placeholder={currentProjectName || "Ví dụ: Brand A"}
-                    className="w-36 sm:w-52 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-semibold text-white focus:outline-none focus:border-indigo-500 transition placeholder:text-slate-600"
-                    title="Tiền tố tên cho các video khi trộn (sẽ tự động thêm #1, #2...)"
+                    className="w-36 sm:w-52 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-semibold text-white focus:outline-none focus:border-indigo-500 transition placeholder:text-slate-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title={canEditMix ? "Tiền tố tên cho các video khi trộn (sẽ tự động thêm #1, #2...)" : "Chế độ chỉ xem"}
                   />
                 </div>
 
@@ -4967,6 +5065,7 @@ export default function StudioWorkspace({
                     type="number"
                     min="1"
                     max="50"
+                    disabled={!canEditMix}
                     value={targetMixCount}
                     onChange={(e) =>
                       setTargetMixCount(
@@ -4974,7 +5073,7 @@ export default function StudioWorkspace({
                       )
                     }
                     onBlur={() => persistProjectSettings()}
-                    className="w-16 sm:w-20 px-2.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono font-bold text-center text-white focus:outline-none focus:border-rose-500"
+                    className="w-16 sm:w-20 px-2.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono font-bold text-center text-white focus:outline-none focus:border-rose-500 disabled:opacity-50 disabled:cursor-not-allowed"
                   />
                   <span className="text-[11px] text-slate-400 hidden xl:inline whitespace-nowrap">
                     video (Tối đa 50)
@@ -4985,9 +5084,10 @@ export default function StudioWorkspace({
               <div className="shrink-0">
                 <button
                   type="button"
+                  disabled={!canEditMix && !canExportMix}
                   onClick={handlePlanDiverseMix}
-                  className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-sm shadow-lg shadow-indigo-600/25 flex items-center justify-center gap-2 transition hover:scale-[1.02] active:scale-[0.98]"
-                  title="Tạo tổ hợp trộn video tự động"
+                  className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-sm shadow-lg shadow-indigo-600/25 flex items-center justify-center gap-2 transition hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
+                  title={canEditMix || canExportMix ? "Tạo tổ hợp trộn video tự động" : "Bạn không có quyền trộn video"}
                 >
                   <Sparkles className="w-4 h-4" />
                   <span>Trộn</span>
@@ -5218,6 +5318,7 @@ export default function StudioWorkspace({
                             </div>
                             <select
                               value={comp.voiceTrackId || ""}
+                              disabled={!canEditMix}
                               onClick={(e) => e.stopPropagation()}
                               onChange={(e) => {
                                 e.stopPropagation();
@@ -5226,7 +5327,7 @@ export default function StudioWorkspace({
                                   e.target.value || null
                                 );
                               }}
-                              className="bg-slate-900 border border-slate-700 text-indigo-300 text-[10px] rounded-lg px-2 py-0.5 focus:outline-none focus:border-indigo-500 max-w-[210px] truncate"
+                              className="bg-slate-900 border border-slate-700 text-indigo-300 text-[10px] rounded-lg px-2 py-0.5 focus:outline-none focus:border-indigo-500 max-w-[210px] truncate disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                               <option value="">(Không lồng voice)</option>
                               {multiVoices.map((v) => (
@@ -5267,6 +5368,7 @@ export default function StudioWorkspace({
                                   {/* Compact Mirror Toggle Button */}
                                   <button
                                     type="button"
+                                    disabled={!canEditMix}
                                     onClick={() =>
                                       handleUpdateComposedSlot(
                                         comp.id,
@@ -5280,8 +5382,12 @@ export default function StudioWorkspace({
                                       activeSlot.flipH
                                         ? "bg-rose-600/30 text-rose-300 border-rose-500/60 shadow-sm"
                                         : "bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700"
-                                    }`}
-                                    title="Lật gương ngang hình ảnh (Mirror)"
+                                    } ${!canEditMix ? "opacity-50 cursor-not-allowed" : ""}`}
+                                    title={
+                                      !canEditMix
+                                        ? "Chế độ chỉ xem, không thể đổi mirror"
+                                        : "Lật gương ngang hình ảnh (Mirror)"
+                                    }
                                   >
                                     <FlipHorizontal className="w-3.5 h-3.5" />
                                     <span>
@@ -5332,6 +5438,7 @@ export default function StudioWorkspace({
                                           <button
                                             key={spd}
                                             type="button"
+                                            disabled={!canEditMix}
                                             onClick={() =>
                                               handleUpdateComposedSlot(
                                                 comp.id,
@@ -5343,7 +5450,7 @@ export default function StudioWorkspace({
                                               activeSlot.speed === spd
                                                 ? "bg-rose-600 text-white font-bold"
                                                 : "bg-slate-800 hover:bg-slate-700 text-slate-300"
-                                            }`}
+                                            } disabled:opacity-50 disabled:cursor-not-allowed`}
                                           >
                                             {spd}x
                                           </button>
@@ -5355,6 +5462,7 @@ export default function StudioWorkspace({
                                       min="0.25"
                                       max="3.0"
                                       step="0.05"
+                                      disabled={!canEditMix}
                                       value={activeSlot.speed}
                                       onChange={(e) =>
                                         handleUpdateComposedSlot(
@@ -5366,7 +5474,7 @@ export default function StudioWorkspace({
                                           }
                                         )
                                       }
-                                      className="w-full accent-rose-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+                                      className="w-full accent-rose-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
                                     />
                                   </div>
                                   <p className="text-[10px] text-slate-400 font-mono pt-1 border-t border-slate-800/80">
@@ -5603,16 +5711,18 @@ export default function StudioWorkspace({
                     />
                     <span>Làm mới</span>
                   </button>
-                  {renderedHistoryList.length > 0 && canEditHistory && (
-                    <button
-                      type="button"
-                      onClick={() => setShowClearHistoryConfirmModal(true)}
-                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-semibold transition"
-                      title="Xóa toàn bộ lịch sử video đã render của dự án này"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                      <span>Xóa toàn bộ lịch sử</span>
-                    </button>
+                  {renderedHistoryList.length > 0 && (
+                    <PermissionGate module="history" action="edit">
+                      <button
+                        type="button"
+                        onClick={() => setShowClearHistoryConfirmModal(true)}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-semibold transition"
+                        title="Xóa toàn bộ lịch sử video đã render của dự án này"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Xóa toàn bộ lịch sử</span>
+                      </button>
+                    </PermissionGate>
                   )}
                 </div>
               </div>
@@ -5773,9 +5883,11 @@ export default function StudioWorkspace({
                           5 Cảnh tổ hợp
                         </th>
                         <th className="py-3.5 px-3 min-w-[120px]">Voice</th>
-                        <th className="py-3.5 px-4 w-44 text-center">
-                          Trạng thái
-                        </th>
+                        <PermissionGate module="history" action="edit">
+                          <th className="py-3.5 px-4 w-44 text-center">
+                            Trạng thái
+                          </th>
+                        </PermissionGate>
                         <th className="py-3.5 px-4 w-24 text-right">
                           Thao tác
                         </th>
@@ -5888,52 +6000,47 @@ export default function StudioWorkspace({
                             </td>
 
                             {/* Trạng thái (Switch toggle) */}
-                            <td
-                              className="py-3 px-4 text-center"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <div className="flex items-center justify-center gap-2">
-                                <button
-                                  type="button"
-                                  role="switch"
-                                  aria-checked={isUsed}
-                                  disabled={!canExportHistory && !canEditHistory}
-                                  onClick={(e) =>
-                                    handleToggleHistoryStatus(rec, e)
-                                  }
-                                  className={`relative inline-flex h-5 w-9 shrink-0 rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                                    isUsed ? "bg-emerald-500" : "bg-slate-700"
-                                  } ${
-                                    !canExportHistory && !canEditHistory
-                                      ? "opacity-50 cursor-not-allowed"
-                                      : "cursor-pointer"
-                                  }`}
-                                  title={
-                                    !canExportHistory && !canEditHistory
-                                      ? "Chế độ chỉ xem, không thể đổi trạng thái"
-                                      : isUsed
-                                      ? "Bấm để đánh dấu là chưa sử dụng"
-                                      : "Bấm để đánh dấu là đã sử dụng"
-                                  }
-                                >
-                                  <span
-                                    aria-hidden="true"
-                                    className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                                      isUsed ? "translate-x-4" : "translate-x-0"
+                            <PermissionGate module="history" action="edit">
+                              <td
+                                className="py-3 px-4 text-center"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <div className="flex items-center justify-center gap-2">
+                                  <button
+                                    type="button"
+                                    role="switch"
+                                    aria-checked={isUsed}
+                                    onClick={(e) =>
+                                      handleToggleHistoryStatus(rec, e)
+                                    }
+                                    className={`relative inline-flex h-5 w-9 shrink-0 rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none cursor-pointer ${
+                                      isUsed ? "bg-emerald-500" : "bg-slate-700"
                                     }`}
-                                  />
-                                </button>
-                                <span
-                                  className={`text-[11px] font-medium select-none min-w-[75px] text-left ${
-                                    isUsed
-                                      ? "text-emerald-400 font-bold"
-                                      : "text-slate-400"
-                                  }`}
-                                >
-                                  {isUsed ? "Đã dùng" : "Chưa dùng"}
-                                </span>
-                              </div>
-                            </td>
+                                    title={
+                                      isUsed
+                                        ? "Bấm để đánh dấu là chưa sử dụng"
+                                        : "Bấm để đánh dấu là đã sử dụng"
+                                    }
+                                  >
+                                    <span
+                                      aria-hidden="true"
+                                      className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                                        isUsed ? "translate-x-4" : "translate-x-0"
+                                      }`}
+                                    />
+                                  </button>
+                                  <span
+                                    className={`text-[11px] font-medium select-none min-w-[75px] text-left ${
+                                      isUsed
+                                        ? "text-emerald-400 font-bold"
+                                        : "text-slate-400"
+                                    }`}
+                                  >
+                                    {isUsed ? "Đã dùng" : "Chưa dùng"}
+                                  </span>
+                                </div>
+                              </td>
+                            </PermissionGate>
 
                             {/* Thao tác */}
                             <td
@@ -5941,19 +6048,21 @@ export default function StudioWorkspace({
                               onClick={(e) => e.stopPropagation()}
                             >
                               <div className="flex items-center justify-end gap-1.5">
-                                {comp && canExportHistory && (
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleRenderSingleComposed(comp)
-                                    }
-                                    className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
-                                    title="Tải lại file MP4 này về máy"
-                                  >
-                                    <Download className="w-3.5 h-3.5 text-emerald-400" />
-                                  </button>
+                                {comp && (
+                                  <PermissionGate module="history" action="export">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        handleRenderSingleComposed(comp)
+                                      }
+                                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
+                                      title="Tải lại file MP4 này về máy"
+                                    >
+                                      <Download className="w-3.5 h-3.5 text-emerald-400" />
+                                    </button>
+                                  </PermissionGate>
                                 )}
-                                {canEditHistory && (
+                                <PermissionGate module="history" action="edit">
                                   <button
                                     type="button"
                                     onClick={() =>
@@ -5964,7 +6073,7 @@ export default function StudioWorkspace({
                                   >
                                     <Trash2 className="w-3.5 h-3.5" />
                                   </button>
-                                )}
+                                </PermissionGate>
                               </div>
                             </td>
                           </tr>
@@ -6086,44 +6195,50 @@ export default function StudioWorkspace({
 
                       {/* Status Toggle on Drawer Header */}
                       <div className="flex items-center gap-3">
-                        <div className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-800">
-                          <button
-                            type="button"
-                            role="switch"
-                            aria-checked={
-                              selectedHistoryDetail.status === "used"
-                            }
-                            onClick={() =>
-                              handleToggleHistoryStatus(selectedHistoryDetail)
-                            }
-                            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                              selectedHistoryDetail.status === "used"
-                                ? "bg-emerald-500"
-                                : "bg-slate-700"
-                            }`}
-                            title="Bấm để đổi trạng thái sử dụng"
-                          >
-                            <span
-                              aria-hidden="true"
-                              className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                        <PermissionGate module="history" action="edit">
+                          <div className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-800">
+                            <button
+                              type="button"
+                              role="switch"
+                              aria-checked={
                                 selectedHistoryDetail.status === "used"
-                                  ? "translate-x-4"
-                                  : "translate-x-0"
+                              }
+                              onClick={() =>
+                                handleToggleHistoryStatus(selectedHistoryDetail)
+                              }
+                              className={`relative inline-flex h-5 w-9 shrink-0 rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none cursor-pointer ${
+                                selectedHistoryDetail.status === "used"
+                                  ? "bg-emerald-500"
+                                  : "bg-slate-700"
                               }`}
-                            />
-                          </button>
-                          <span
-                            className={`text-xs font-semibold select-none ${
-                              selectedHistoryDetail.status === "used"
-                                ? "text-emerald-400 font-bold"
-                                : "text-slate-400"
-                            }`}
-                          >
-                            {selectedHistoryDetail.status === "used"
-                              ? "Đã sử dụng"
-                              : "Chưa sử dụng"}
-                          </span>
-                        </div>
+                              title={
+                                selectedHistoryDetail.status === "used"
+                                  ? "Bấm để đánh dấu là chưa sử dụng"
+                                  : "Bấm để đánh dấu là đã sử dụng"
+                              }
+                            >
+                              <span
+                                aria-hidden="true"
+                                className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                                  selectedHistoryDetail.status === "used"
+                                    ? "translate-x-4"
+                                    : "translate-x-0"
+                                }`}
+                              />
+                            </button>
+                            <span
+                              className={`text-xs font-semibold select-none ${
+                                selectedHistoryDetail.status === "used"
+                                  ? "text-emerald-400 font-bold"
+                                  : "text-slate-400"
+                              }`}
+                            >
+                              {selectedHistoryDetail.status === "used"
+                                ? "Đã sử dụng"
+                                : "Chưa sử dụng"}
+                            </span>
+                          </div>
+                        </PermissionGate>
 
                         <button
                           type="button"
@@ -6414,18 +6529,20 @@ export default function StudioWorkspace({
                           </button>
                         )}
                         {selectedHistoryDetail.payload && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleRenderSingleComposed(
-                                selectedHistoryDetail.payload as ComposedVideo
-                              )
-                            }
-                            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-bold transition"
-                          >
-                            <Download className="w-3.5 h-3.5 text-emerald-400" />
-                            <span>Tải lại MP4</span>
-                          </button>
+                          <PermissionGate module="history" action="export">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleRenderSingleComposed(
+                                  selectedHistoryDetail.payload as ComposedVideo
+                                )
+                              }
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-bold transition"
+                            >
+                              <Download className="w-3.5 h-3.5 text-emerald-400" />
+                              <span>Tải lại MP4</span>
+                            </button>
+                          </PermissionGate>
                         )}
                       </div>
 
@@ -6606,27 +6723,29 @@ export default function StudioWorkspace({
                                 {item.duration.toFixed(1)}s
                               </span>
                             )}
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (item.category === "voice") {
-                                  handleRemoveVoiceItem(item.id);
-                                } else {
-                                  handleRemoveCategoryItem(
-                                    item.category as ShotCategory,
-                                    item.id
-                                  );
-                                }
-                                addToast({
-                                  type: "info",
-                                  text: "Đã xóa clip khỏi kho.",
-                                });
-                              }}
-                              className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition"
-                              title="Xóa khỏi kho"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
+                            <PermissionGate module="mix" action="edit">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (item.category === "voice") {
+                                    handleRemoveVoiceItem(item.id);
+                                  } else {
+                                    handleRemoveCategoryItem(
+                                      item.category as ShotCategory,
+                                      item.id
+                                    );
+                                  }
+                                  addToast({
+                                    type: "info",
+                                    text: "Đã xóa clip khỏi kho.",
+                                  });
+                                }}
+                                className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition"
+                                title="Xóa khỏi kho"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </PermissionGate>
                           </div>
                         </div>
 
@@ -7113,12 +7232,15 @@ export default function StudioWorkspace({
         {toasts.map((toast) => {
           const isSuccess = toast.type === "success";
           const isError = toast.type === "error";
+          const isForbidden = toast.type === "forbidden";
 
           return (
             <div
               key={toast.id}
               className={`pointer-events-auto rounded-xl p-3.5 shadow-2xl border backdrop-blur-md flex items-start gap-3 transition-all transform translate-y-0 animate-in slide-in-from-bottom-5 duration-300 ${
-                isSuccess
+                isForbidden
+                  ? "bg-slate-900/95 border-amber-500/50 text-amber-100 shadow-amber-950/40"
+                  : isSuccess
                   ? "bg-slate-900/95 border-emerald-500/40 text-emerald-100 shadow-emerald-950/40"
                   : isError
                   ? "bg-slate-900/95 border-rose-500/40 text-rose-100 shadow-rose-950/40"
@@ -7126,22 +7248,34 @@ export default function StudioWorkspace({
               }`}
             >
               <div className="mt-0.5 shrink-0">
-                {isSuccess && (
+                {isForbidden && (
+                  <ShieldAlert className="w-4 h-4 text-amber-400" />
+                )}
+                {!isForbidden && isSuccess && (
                   <CheckCircle2 className="w-4 h-4 text-emerald-400" />
                 )}
-                {isError && <AlertTriangle className="w-4 h-4 text-rose-400" />}
-                {!isSuccess && !isError && (
+                {!isForbidden && isError && (
+                  <AlertTriangle className="w-4 h-4 text-rose-400" />
+                )}
+                {!isForbidden && !isSuccess && !isError && (
                   <Info className="w-4 h-4 text-sky-400" />
                 )}
               </div>
 
               <div className="flex-1 text-xs leading-relaxed space-y-0.5 min-w-0">
-                <p className="font-semibold text-slate-100">
-                  {isSuccess
-                    ? "Thành công"
-                    : isError
-                    ? "Có lỗi xảy ra"
-                    : "Thông báo"}
+                <p
+                  className={`font-semibold ${
+                    isForbidden ? "text-amber-300" : "text-slate-100"
+                  }`}
+                >
+                  {toast.title ||
+                    (isForbidden
+                      ? "Từ chối truy cập (403)"
+                      : isSuccess
+                      ? "Thành công"
+                      : isError
+                      ? "Có lỗi xảy ra"
+                      : "Thông báo")}
                 </p>
                 <p className="text-slate-300 text-[11px] whitespace-pre-wrap break-words">
                   {toast.text}
@@ -7160,5 +7294,6 @@ export default function StudioWorkspace({
         })}
       </div>
     </div>
+    </ProjectAccessProvider>
   );
 }

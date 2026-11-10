@@ -20,9 +20,11 @@ import {
 import {
   getProjectCategoryPools,
   getProjectVoiceTracks,
+  resolveFolderAccess,
   saveProjectCategoryPools,
   saveProjectVoiceTracks,
 } from "@/lib/db";
+import { getCurrentUser } from "@/lib/auth";
 
 const VALID_CATS: ShotCategory[] = ["open", "product", "texture", "apply", "end"];
 
@@ -116,6 +118,17 @@ export async function POST(req: NextRequest) {
       (formData.get("sessionId") as string) || getSessionIdFromHeaders(req.headers)
     );
     projectId = (formData.get("projectId") as string) || "";
+  }
+
+  if (projectId) {
+    const user = await getCurrentUser();
+    const access = await resolveFolderAccess(projectId, user?.id, user?.email);
+    if (!access.isOwner && !access.permissions.mix?.actions?.includes("edit")) {
+      return NextResponse.json(
+        { error: "Bạn không có quyền chỉnh sửa kho clip của dự án này." },
+        { status: 403 }
+      );
+    }
   }
 
   const sessionPaths = ensureSessionDirs(sessionId);

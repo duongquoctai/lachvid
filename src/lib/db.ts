@@ -17,7 +17,7 @@ import {
 } from "@/types/lachvid";
 
 export const DEFAULT_USER_ID = "usr_skin1004";
-export const DEFAULT_USER_EMAIL = "skin1004@omnigen.local";
+export const DEFAULT_USER_EMAIL = "skin1004@omnigen.com";
 export const DEFAULT_USER_NAME = "Skin1004 Team";
 export const DEFAULT_USER_PASSWORD = "skin1004";
 
@@ -245,6 +245,19 @@ let dbClient: Database | null = null;
 let dbInitialized = false;
 let dbInitPromise: Promise<void> | null = null;
 let lastCloudError: string | null = null;
+
+export function resetClient() {
+  try {
+    if (dbClient) {
+      dbClient.close?.();
+    }
+  } catch {
+    // ignore
+  }
+  dbClient = null;
+  dbInitialized = false;
+  dbInitPromise = null;
+}
 
 export function getDatabaseStatus(): {
   isCloud: boolean;
@@ -530,13 +543,13 @@ export async function initDatabase() {
 // ==========================================
 
 export async function getUserById(id: string): Promise<User | null> {
-  await initDatabase();
-  const client = getClient();
-  if (!client || !dbInitialized) {
-    const local = readLocalStorage();
-    return local.users?.[id] || null;
-  }
-  try {
+  const query = async () => {
+    await initDatabase();
+    const client = getClient();
+    if (!client || !dbInitialized) {
+      const local = readLocalStorage();
+      return local.users?.[id] || null;
+    }
     const rows = (await client.sql`
       SELECT * FROM lachvid_users WHERE id = ${id} LIMIT 1;
     `) as Array<{
@@ -559,24 +572,35 @@ export async function getUserById(id: string): Promise<User | null> {
       createdAt: r.created_at,
       updatedAt: r.updated_at,
     };
+  };
+
+  try {
+    return await query();
   } catch (err) {
-    console.error("Lỗi getUserById:", err);
-    return null;
+    console.warn("Lỗi getUserById lần 1, đang reset connection và thử lại:", err);
+    resetClient();
+    try {
+      return await query();
+    } catch (retryErr) {
+      console.error("Lỗi getUserById sau retry:", retryErr);
+      return null;
+    }
   }
 }
 
 export async function getUserByEmail(email: string): Promise<User | null> {
-  await initDatabase();
   const normalized = email.trim().toLowerCase();
-  const client = getClient();
-  if (!client || !dbInitialized) {
-    const local = readLocalStorage();
-    const user = Object.values(local.users || {}).find(
-      (u) => u.email.toLowerCase() === normalized
-    );
-    return user || null;
-  }
-  try {
+
+  const query = async () => {
+    await initDatabase();
+    const client = getClient();
+    if (!client || !dbInitialized) {
+      const local = readLocalStorage();
+      const user = Object.values(local.users || {}).find(
+        (u) => u.email.toLowerCase() === normalized
+      );
+      return user || null;
+    }
     const rows = (await client.sql`
       SELECT * FROM lachvid_users WHERE LOWER(email) = ${normalized} LIMIT 1;
     `) as Array<{
@@ -599,9 +623,19 @@ export async function getUserByEmail(email: string): Promise<User | null> {
       createdAt: r.created_at,
       updatedAt: r.updated_at,
     };
+  };
+
+  try {
+    return await query();
   } catch (err) {
-    console.error("Lỗi getUserByEmail:", err);
-    return null;
+    console.warn("Lỗi getUserByEmail lần 1, đang reset connection và thử lại:", err);
+    resetClient();
+    try {
+      return await query();
+    } catch (retryErr) {
+      console.error("Lỗi getUserByEmail sau retry:", retryErr);
+      throw retryErr;
+    }
   }
 }
 
@@ -2143,6 +2177,36 @@ export async function clearProjectRenderedHistory(projectId: string) {
     `;
   } catch (err) {
     console.error("Lỗi clearProjectRenderedHistory:", err);
+  }
+}
+
+export async function getRenderedHistoryItemById(id: string): Promise<{ id: string; projectId: string; status: "unused" | "used" } | null> {
+  await initDatabase();
+  const client = getClient();
+  if (!client) {
+    const local = readLocalStorage();
+    for (const [pId, items] of Object.entries(local.rendered || {})) {
+      const found = items?.find((r) => r.id === id);
+      if (found) {
+        return { id: found.id, projectId: pId, status: found.status === "used" ? "used" : "unused" };
+      }
+    }
+    return null;
+  }
+
+  try {
+    const rows = (await client.sql`
+      SELECT id, project_id, status FROM lachvid_rendered_history WHERE id = ${id} LIMIT 1;
+    `) as Array<{ id: string; project_id: string; status?: string }>;
+    if (!rows || rows.length === 0) return null;
+    return {
+      id: rows[0].id,
+      projectId: rows[0].project_id,
+      status: rows[0].status === "used" ? "used" : "unused",
+    };
+  } catch (err) {
+    console.error("Lỗi getRenderedHistoryItemById:", err);
+    return null;
   }
 }
 
