@@ -26,6 +26,9 @@ import {
 } from "@/lib/db";
 import { getCurrentUser } from "@/lib/auth";
 
+export const dynamic = "force-dynamic";
+export const maxDuration = 120;
+
 const VALID_CATS: ShotCategory[] = ["open", "product", "texture", "apply", "end"];
 
 export async function GET(req: NextRequest) {

@@ -947,6 +947,24 @@ export default function StudioWorkspace({
   // TAB 1 ACTIONS (Tách 1 Video & Slicer Studio)
   // ==========================================
 
+  const sanitizeUploadFile = (
+    file: File,
+    defaultExt = ".mp4",
+    defaultType = "video/mp4"
+  ): File => {
+    const originalName = file.name || "media";
+    const asciiBase = originalName
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[đĐ]/g, "d")
+      .replace(/[^a-zA-Z0-9._-]/g, "_");
+    const hasExt = /\.[a-zA-Z0-9]{2,5}$/.test(asciiBase);
+    const safeName = hasExt ? asciiBase : `${asciiBase}${defaultExt}`;
+    return new File([file], safeName, {
+      type: file.type || defaultType,
+    });
+  };
+
   const handleUploadSingleSource = async (file: File) => {
     if (!file) return;
 
@@ -967,6 +985,9 @@ export default function StudioWorkspace({
     setBusyMessage(`Đang tải lên video ${file.name}...`);
     setStatusBanner(null);
     try {
+      // Chuẩn hóa tên file sang ASCII và bổ sung đuôi .mp4 nếu file thiếu đuôi (tránh lỗi multipart FormData Next.js)
+      const safeUploadFile = sanitizeUploadFile(file, ".mp4", "video/mp4");
+
       let duration = 0;
       let width = 1080;
       let height = 1920;
@@ -974,7 +995,7 @@ export default function StudioWorkspace({
       try {
         const videoEl = document.createElement("video");
         videoEl.preload = "metadata";
-        localBlobUrl = URL.createObjectURL(file);
+        localBlobUrl = URL.createObjectURL(safeUploadFile);
         videoEl.src = localBlobUrl;
         await new Promise<void>((resolve) => {
           videoEl.onloadedmetadata = () => {
@@ -995,7 +1016,7 @@ export default function StudioWorkspace({
       setSourceBlobUrl(localBlobUrl);
 
       const fd = new FormData();
-      fd.append("file", file);
+      fd.append("file", safeUploadFile);
       fd.append("kind", "source");
       fd.append("sessionId", sessionId);
       if (duration > 0) fd.append("duration", String(duration));
@@ -1789,7 +1810,7 @@ export default function StudioWorkspace({
       fd.append("sessionId", sessionId);
       if (projectId) fd.append("projectId", projectId);
       for (let i = 0; i < files.length; i++) {
-        fd.append("files", files[i]);
+        fd.append("files", sanitizeUploadFile(files[i], ".mp4", "video/mp4"));
       }
       const res = await authFetch("/api/category-library", {
         method: "POST",
@@ -1848,7 +1869,7 @@ export default function StudioWorkspace({
       if (projectId) fd.append("projectId", projectId);
       fd.append("targetCategory", category);
       for (let i = 0; i < files.length; i++) {
-        fd.append("files", files[i]);
+        fd.append("files", sanitizeUploadFile(files[i], ".mp4", "video/mp4"));
       }
       const res = await authFetch("/api/category-library", {
         method: "POST",
@@ -1886,7 +1907,7 @@ export default function StudioWorkspace({
       if (projectId) fd.append("projectId", projectId);
       fd.append("action", "upload_voice");
       for (let i = 0; i < files.length; i++) {
-        fd.append("files", files[i]);
+        fd.append("files", sanitizeUploadFile(files[i], ".mp3", "audio/mpeg"));
       }
       const res = await authFetch("/api/category-library", {
         method: "POST",
@@ -3082,7 +3103,7 @@ export default function StudioWorkspace({
       <input
         ref={singleVideoInputRef}
         type="file"
-        accept="video/mp4,video/quicktime,video/webm"
+        accept="video/*,video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm,.mkv"
         className="hidden"
         onChange={(e) => {
           if (e.target.files?.[0]) handleUploadSingleSource(e.target.files[0]);

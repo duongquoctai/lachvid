@@ -11,6 +11,7 @@ const nextConfig = {
     "localhost:3005",
   ],
   experimental: {
+    proxyClientMaxBodySize: "500mb",
     serverActions: {
       allowedOrigins: [
         "*.trycloudflare.com",

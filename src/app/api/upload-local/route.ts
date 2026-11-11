@@ -16,6 +16,9 @@ import {
   VoiceTrack,
 } from "@/types/lachvid";
 
+export const dynamic = "force-dynamic";
+export const maxDuration = 120;
+
 export async function POST(req: NextRequest) {
   try {
     // Proactively clean up expired sessions
