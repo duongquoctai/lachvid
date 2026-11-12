@@ -92,6 +92,10 @@ import * as XLSX from "xlsx";
 const VALID_TABS = ["split", "mix", "history"] as const;
 type WorkspaceTab = (typeof VALID_TABS)[number];
 
+const generateUploadId = (prefix = "upl") => {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+};
+
 interface StudioWorkspaceProps {
   projectId: string;
   projectName?: string;
@@ -318,6 +322,12 @@ export default function StudioWorkspace({
     total: number;
     name: string;
     percent: number;
+  } | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<{
+    loadedBytes: number;
+    totalBytes: number;
+    percent: number;
+    fileName?: string;
   } | null>(null);
   const [isRenderingBatch, setIsRenderingBatch] = useState<boolean>(false);
 
@@ -965,25 +975,116 @@ export default function StudioWorkspace({
     });
   };
 
+  // Helper tải file theo mảnh (Chunked Streaming Upload: 20MB / chunk) có auto-retry 3 lần
+  const uploadFileInChunks = async (
+    file: File,
+    options: {
+      endpoint: string;
+      kind?: "source" | "voice";
+      targetCategory?: ShotCategory | "voice";
+      relativePath?: string;
+      duration?: number;
+      width?: number;
+      height?: number;
+      onProgress?: (loaded: number, total: number) => void;
+    }
+  ) => {
+    const CHUNK_SIZE = 20 * 1024 * 1024; // 20 MB / chunk
+    const totalBytes = file.size;
+    const totalChunks = Math.max(1, Math.ceil(totalBytes / CHUNK_SIZE));
+    const uploadId = generateUploadId();
+
+    let lastData: any = null;
+
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      const start = chunkIndex * CHUNK_SIZE;
+      const end = Math.min(totalBytes, start + CHUNK_SIZE);
+      const chunkBlob = file.slice(start, end);
+
+      let attempt = 0;
+      let success = false;
+      let lastError: any = null;
+
+      while (attempt < 3 && !success) {
+        attempt++;
+        try {
+          const headers: Record<string, string> = {
+            "Content-Type": "application/octet-stream",
+            "x-session-id": sessionId,
+            "x-upload-id": uploadId,
+            "x-chunk-index": String(chunkIndex),
+            "x-total-chunks": String(totalChunks),
+            "x-file-name": encodeURIComponent(file.name),
+            "x-file-size": String(totalBytes),
+          };
+
+          if (projectId) headers["x-project-id"] = projectId;
+          if (options.kind) headers["x-upload-kind"] = options.kind;
+          if (options.targetCategory) headers["x-target-category"] = options.targetCategory;
+          if (options.relativePath) headers["x-relative-path"] = encodeURIComponent(options.relativePath);
+          if (options.duration) headers["x-video-duration"] = String(options.duration);
+          if (options.width) headers["x-video-width"] = String(options.width);
+          if (options.height) headers["x-video-height"] = String(options.height);
+
+          const res = await fetch(options.endpoint, {
+            method: "POST",
+            headers,
+            body: chunkBlob,
+          });
+
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(data.error || `HTTP ${res.status}`);
+          }
+
+          lastData = data;
+          success = true;
+          if (options.onProgress) {
+            options.onProgress(end, totalBytes);
+          }
+        } catch (err: any) {
+          lastError = err;
+          if (attempt < 3) {
+            await new Promise((r) => setTimeout(r, attempt * 1000));
+          }
+        }
+      }
+
+      if (!success) {
+        throw new Error(
+          `Lỗi tải mảnh ${chunkIndex + 1}/${totalChunks} của file "${file.name}": ${
+            lastError?.message || "Mất kết nối mạng"
+          }`
+        );
+      }
+    }
+
+    return lastData;
+  };
+
   const handleUploadSingleSource = async (file: File) => {
     if (!file) return;
 
-    if (
-      file.size > 95 * 1024 * 1024 &&
-      typeof window !== "undefined" &&
-      window.location.hostname.includes("trycloudflare.com")
-    ) {
+    const MAX_ALLOWED = 500 * 1024 * 1024;
+    if (file.size > MAX_ALLOWED) {
       setStatusBanner({
         type: "error",
         text: `File "${file.name}" (${(file.size / 1024 / 1024).toFixed(
           1
-        )} MB) vượt quá giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy chọn video dưới 95 MB hoặc nén trước khi tải lên.`,
+        )} MB) vượt quá giới hạn tối đa cho phép (${MAX_ALLOWED / 1024 / 1024} MB).`,
       });
       return;
     }
 
-    setBusyMessage(`Đang tải lên video ${file.name}...`);
+    setBusyMessage(`Đang chuẩn bị tải lên video ${file.name}...`);
     setStatusBanner(null);
+    setUploadProgress({
+      loadedBytes: 0,
+      totalBytes: file.size,
+      percent: 0,
+      fileName: file.name,
+    });
+
     try {
       // Chuẩn hóa tên file sang ASCII và bổ sung đuôi .mp4 nếu file thiếu đuôi (tránh lỗi multipart FormData Next.js)
       const safeUploadFile = sanitizeUploadFile(file, ".mp4", "video/mp4");
@@ -1015,21 +1116,25 @@ export default function StudioWorkspace({
 
       setSourceBlobUrl(localBlobUrl);
 
-      const fd = new FormData();
-      fd.append("file", safeUploadFile);
-      fd.append("kind", "source");
-      fd.append("sessionId", sessionId);
-      if (duration > 0) fd.append("duration", String(duration));
-      if (width > 0) fd.append("width", String(width));
-      if (height > 0) fd.append("height", String(height));
-
-      const res = await fetch("/api/upload-local", {
-        method: "POST",
-        headers: { "x-session-id": sessionId },
-        body: fd,
+      const data = await uploadFileInChunks(safeUploadFile, {
+        endpoint: "/api/upload-local",
+        kind: "source",
+        duration,
+        width,
+        height,
+        onProgress: (loaded, total) => {
+          const percent = Math.min(100, Math.round((loaded / total) * 100));
+          setUploadProgress({
+            loadedBytes: loaded,
+            totalBytes: total,
+            percent,
+            fileName: file.name,
+          });
+          setBusyMessage(
+            `Đang tải lên video: ${percent}% (${(loaded / 1024 / 1024).toFixed(1)} / ${(total / 1024 / 1024).toFixed(1)} MB)`
+          );
+        },
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi tải video");
 
       setState(data.state);
       if (data.state.shots?.length > 0) {
@@ -1046,6 +1151,7 @@ export default function StudioWorkspace({
       setStatusBanner({ type: "error", text: msg });
     } finally {
       setBusyMessage(null);
+      setUploadProgress(null);
     }
   };
 
@@ -1779,6 +1885,133 @@ export default function StudioWorkspace({
     }
   };
 
+  // Smart Batching & Chunked Upload cho danh sách nhiều file ở Bước 2
+  const uploadCategoryFilesSmart = async (
+    files: File[],
+    targetCategory?: ShotCategory | "voice"
+  ) => {
+    const BATCH_SIZE_LIMIT = 20 * 1024 * 1024; // Gom lô <= 20 MB để luôn đi qua Cloudflare an toàn
+    const totalBytes = files.reduce((acc, f) => acc + f.size, 0);
+    let loadedBytes = 0;
+
+    setUploadProgress({
+      loadedBytes: 0,
+      totalBytes,
+      percent: 0,
+    });
+
+    // Tách riêng các file nặng > 20MB (cần cắt chunk) và các file nhỏ <= 20MB (gom lô)
+    const largeFiles: File[] = [];
+    const smallFiles: File[] = [];
+
+    for (const f of files) {
+      if (f.size > BATCH_SIZE_LIMIT) {
+        largeFiles.push(f);
+      } else {
+        smallFiles.push(f);
+      }
+    }
+
+    // 1. Tải các file nhỏ theo từng lô <= 20MB
+    if (smallFiles.length > 0) {
+      let currentBatch: File[] = [];
+      let currentBatchBytes = 0;
+
+      for (let i = 0; i < smallFiles.length; i++) {
+        const file = smallFiles[i];
+        if (currentBatchBytes + file.size > BATCH_SIZE_LIMIT && currentBatch.length > 0) {
+          // Gửi lô hiện tại
+          await sendBatchFormData(currentBatch, targetCategory);
+          loadedBytes += currentBatchBytes;
+          const percent = Math.min(100, Math.round((loadedBytes / totalBytes) * 100));
+          setUploadProgress({
+            loadedBytes,
+            totalBytes,
+            percent,
+          });
+          setBusyMessage(`Đang tải lên kho: ${percent}% (${(loadedBytes / 1024 / 1024).toFixed(1)} / ${(totalBytes / 1024 / 1024).toFixed(1)} MB)`);
+          currentBatch = [];
+          currentBatchBytes = 0;
+        }
+        currentBatch.push(file);
+        currentBatchBytes += file.size;
+      }
+
+      if (currentBatch.length > 0) {
+        await sendBatchFormData(currentBatch, targetCategory);
+        loadedBytes += currentBatchBytes;
+        const percent = Math.min(100, Math.round((loadedBytes / totalBytes) * 100));
+        setUploadProgress({
+          loadedBytes,
+          totalBytes,
+          percent,
+        });
+        setBusyMessage(`Đang tải lên kho: ${percent}% (${(loadedBytes / 1024 / 1024).toFixed(1)} / ${(totalBytes / 1024 / 1024).toFixed(1)} MB)`);
+      }
+    }
+
+    // 2. Tải các file nặng lẻ qua cơ chế Chunked Upload (20MB / chunk)
+    for (const file of largeFiles) {
+      const relPath = (file as unknown as { webkitRelativePath?: string }).webkitRelativePath || "";
+      let previousFileLoaded = 0;
+      await uploadFileInChunks(file, {
+        endpoint: "/api/category-library",
+        targetCategory,
+        relativePath: relPath,
+        onProgress: (chunkLoaded) => {
+          const delta = chunkLoaded - previousFileLoaded;
+          previousFileLoaded = chunkLoaded;
+          loadedBytes += delta;
+          const percent = Math.min(100, Math.round((loadedBytes / totalBytes) * 100));
+          setUploadProgress({
+            loadedBytes,
+            totalBytes,
+            percent,
+            fileName: file.name,
+          });
+          setBusyMessage(`Đang tải lên file "${file.name}": ${percent}% (${(loadedBytes / 1024 / 1024).toFixed(1)} / ${(totalBytes / 1024 / 1024).toFixed(1)} MB)`);
+        },
+      });
+    }
+
+    // Đồng bộ lại state kho clip mới nhất
+    const refreshRes = await authFetch(
+      `/api/category-library?sessionId=${sessionId}${projectId ? `&projectId=${projectId}` : ""}`
+    );
+    const refreshData = await refreshRes.json();
+    if (refreshData.categoryPools) setCategoryPools(refreshData.categoryPools);
+    if (refreshData.multiVoiceTracks) setMultiVoices(refreshData.multiVoiceTracks);
+  };
+
+  const sendBatchFormData = async (
+    batchFiles: File[],
+    targetCategory?: ShotCategory | "voice"
+  ) => {
+    const fd = new FormData();
+    fd.append("sessionId", sessionId);
+    if (projectId) fd.append("projectId", projectId);
+    if (targetCategory) fd.append("targetCategory", targetCategory);
+
+    const isVoice = targetCategory === "voice";
+    for (const f of batchFiles) {
+      const safe = sanitizeUploadFile(
+        f,
+        isVoice ? ".mp3" : ".mp4",
+        isVoice ? "audio/mpeg" : "video/mp4"
+      );
+      fd.append("files", safe);
+    }
+
+    const res = await authFetch("/api/category-library", {
+      method: "POST",
+      headers: { "x-session-id": sessionId },
+      body: fd,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Lỗi tải lô file");
+    return data;
+  };
+
   // Master folder upload (reads all subfolders OPEN, PRODUCT, TEXTURE, APPLY, END)
   const handleMasterFolderUpload = async (
     e: React.ChangeEvent<HTMLInputElement>
@@ -1786,50 +2019,23 @@ export default function StudioWorkspace({
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    let totalBytes = 0;
-    for (let i = 0; i < files.length; i++) totalBytes += files[i].size;
-    if (
-      totalBytes > 95 * 1024 * 1024 &&
-      typeof window !== "undefined" &&
-      window.location.hostname.includes("trycloudflare.com")
-    ) {
-      setStatusBanner({
-        type: "error",
-        text: `Tổng dung lượng thư mục (${(totalBytes / 1024 / 1024).toFixed(
-          1
-        )} MB) vượt giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy chia nhỏ hoặc nạp từng cột.`,
-      });
-      if (masterFolderInputRef.current) masterFolderInputRef.current.value = "";
-      return;
-    }
+    const fileList: File[] = [];
+    for (let i = 0; i < files.length; i++) fileList.push(files[i]);
 
-    setBusyMessage(`Đang phân loại và nạp ${files.length} file từ thư mục...`);
+    setBusyMessage(`Đang phân loại và nạp ${fileList.length} file từ thư mục...`);
     setStatusBanner(null);
     try {
-      const fd = new FormData();
-      fd.append("sessionId", sessionId);
-      if (projectId) fd.append("projectId", projectId);
-      for (let i = 0; i < files.length; i++) {
-        fd.append("files", sanitizeUploadFile(files[i], ".mp4", "video/mp4"));
-      }
-      const res = await authFetch("/api/category-library", {
-        method: "POST",
-        headers: { "x-session-id": sessionId },
-        body: fd,
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi khi nạp thư mục");
-
-      setCategoryPools(data.categoryPools);
+      await uploadCategoryFilesSmart(fileList);
       setStatusBanner({
         type: "success",
-        text: `Đã nạp thành công ${data.addedCount} video vào 5 category!`,
+        text: `Đã nạp thành công ${fileList.length} video từ thư mục vào kho category!`,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setStatusBanner({ type: "error", text: msg });
     } finally {
       setBusyMessage(null);
+      setUploadProgress(null);
       if (masterFolderInputRef.current) masterFolderInputRef.current.value = "";
     }
   };
@@ -1841,56 +2047,25 @@ export default function StudioWorkspace({
   ) => {
     if (!files || files.length === 0) return;
 
-    let totalBytes = 0;
-    for (let i = 0; i < files.length; i++) totalBytes += files[i].size;
-    if (
-      totalBytes > 95 * 1024 * 1024 &&
-      typeof window !== "undefined" &&
-      window.location.hostname.includes("trycloudflare.com")
-    ) {
-      setStatusBanner({
-        type: "error",
-        text: `Tổng dung lượng file (${(totalBytes / 1024 / 1024).toFixed(
-          1
-        )} MB) vượt giới hạn 95 MB của Cloudflare Tunnel miễn phí. Hãy tải từng file nhỏ hơn.`,
-      });
-      if (categoryInputRefs.current[category]) {
-        categoryInputRefs.current[category]!.value = "";
-      }
-      return;
-    }
+    const fileList: File[] = [];
+    for (let i = 0; i < files.length; i++) fileList.push(files[i]);
 
     setBusyMessage(
-      `Đang nạp ${files.length} video vào ${category.toUpperCase()}...`
+      `Đang nạp ${fileList.length} video vào ${category.toUpperCase()}...`
     );
+    setStatusBanner(null);
     try {
-      const fd = new FormData();
-      fd.append("sessionId", sessionId);
-      if (projectId) fd.append("projectId", projectId);
-      fd.append("targetCategory", category);
-      for (let i = 0; i < files.length; i++) {
-        fd.append("files", sanitizeUploadFile(files[i], ".mp4", "video/mp4"));
-      }
-      const res = await authFetch("/api/category-library", {
-        method: "POST",
-        headers: { "x-session-id": sessionId },
-        body: fd,
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi tải video");
-
-      setCategoryPools(data.categoryPools);
+      await uploadCategoryFilesSmart(fileList, category);
       setStatusBanner({
         type: "success",
-        text: `Đã thêm ${
-          data.addedCount
-        } video vào mục ${category.toUpperCase()}`,
+        text: `Đã nạp thành công ${fileList.length} video vào mục ${category.toUpperCase()}`,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setStatusBanner({ type: "error", text: msg });
     } finally {
       setBusyMessage(null);
+      setUploadProgress(null);
       if (categoryInputRefs.current[category]) {
         categoryInputRefs.current[category]!.value = "";
       }
@@ -1900,33 +2075,24 @@ export default function StudioWorkspace({
   // Multi-voice tracks upload
   const handleVoiceUpload = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    setBusyMessage(`Đang nạp ${files.length} file audio voice...`);
-    try {
-      const fd = new FormData();
-      fd.append("sessionId", sessionId);
-      if (projectId) fd.append("projectId", projectId);
-      fd.append("action", "upload_voice");
-      for (let i = 0; i < files.length; i++) {
-        fd.append("files", sanitizeUploadFile(files[i], ".mp3", "audio/mpeg"));
-      }
-      const res = await authFetch("/api/category-library", {
-        method: "POST",
-        headers: { "x-session-id": sessionId },
-        body: fd,
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Lỗi tải audio");
 
-      setMultiVoices(data.multiVoiceTracks);
+    const fileList: File[] = [];
+    for (let i = 0; i < files.length; i++) fileList.push(files[i]);
+
+    setBusyMessage(`Đang nạp ${fileList.length} file audio voice...`);
+    setStatusBanner(null);
+    try {
+      await uploadCategoryFilesSmart(fileList, "voice");
       setStatusBanner({
         type: "success",
-        text: `Đã nạp ${data.multiVoiceTracks.length} file lồng tiếng (Voiceovers).`,
+        text: `Đã nạp thành công ${fileList.length} file lồng tiếng (Voiceovers).`,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setStatusBanner({ type: "error", text: msg });
     } finally {
       setBusyMessage(null);
+      setUploadProgress(null);
       if (voiceInputRef.current) voiceInputRef.current.value = "";
     }
   };
@@ -7236,10 +7402,43 @@ export default function StudioWorkspace({
                   </div>
                 </div>
               )}
+
+              {/* Real-time Upload Progress Tracker */}
+              {uploadProgress && (
+                <div className="pt-2 space-y-2 w-full">
+                  <div className="flex items-center justify-between text-xs font-mono font-bold px-1">
+                    <span className="text-emerald-400">
+                      {(uploadProgress.loadedBytes / 1024 / 1024).toFixed(1)} / {(uploadProgress.totalBytes / 1024 / 1024).toFixed(1)} MB
+                    </span>
+                    <span className="text-indigo-400 font-extrabold">
+                      {uploadProgress.percent}%
+                    </span>
+                  </div>
+                  {uploadProgress.fileName && (
+                    <div className="text-[11px] text-slate-400 truncate max-w-xs mx-auto">
+                      Đang nạp:{" "}
+                      <span className="text-slate-200 font-medium">
+                        {uploadProgress.fileName}
+                      </span>
+                    </div>
+                  )}
+                  <div className="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden border border-slate-700/60 p-0.5">
+                    <div
+                      className="bg-gradient-to-r from-rose-500 via-pink-500 to-indigo-500 h-full rounded-full transition-all duration-300 shadow-sm shadow-rose-500/50"
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          Math.max(0, uploadProgress.percent)
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
-            {/* Default animated progress bar pulse if no renderProgress */}
-            {!renderProgress && (
+            {/* Default animated progress bar pulse if no renderProgress and no uploadProgress */}
+            {!renderProgress && !uploadProgress && (
               <div className="w-full bg-slate-800/80 rounded-full h-1 overflow-hidden mt-1">
                 <div className="bg-gradient-to-r from-rose-500 via-indigo-500 to-indigo-600 h-full w-full animate-pulse" />
               </div>

@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { NextRequest, NextResponse } from "next/server";
 import {
   cleanupExpiredSessions,
@@ -96,6 +98,174 @@ async function pMap<T, R>(
 
 export async function POST(req: NextRequest) {
   cleanupExpiredSessions();
+
+  // -------------------------------------------------------------
+  // CHUNKED UPLOAD SUPPORT CHO FILE LẺ > 20MB
+  // -------------------------------------------------------------
+  const uploadId = req.headers.get("x-upload-id");
+  const chunkIndexHeader = req.headers.get("x-chunk-index");
+  if (uploadId && chunkIndexHeader !== null) {
+    const chunkIndex = parseInt(chunkIndexHeader, 10);
+    const totalChunks = parseInt(req.headers.get("x-total-chunks") || "1", 10);
+    const rawFileName = req.headers.get("x-file-name") || "clip.mp4";
+    const fileName = decodeURIComponent(rawFileName);
+    const targetCategory = (req.headers.get("x-target-category") as string) || "product";
+    const relativePath = decodeURIComponent(req.headers.get("x-relative-path") || "");
+    const sessionId = sanitizeSessionId(
+      req.headers.get("x-session-id") || getSessionIdFromHeaders(req.headers)
+    );
+    const projectId = req.headers.get("x-project-id") || "";
+
+    if (projectId) {
+      const user = await getCurrentUser();
+      const access = await resolveFolderAccess(projectId, user?.id, user?.email);
+      if (!access.isOwner && !access.permissions.mix?.actions?.includes("edit")) {
+        return NextResponse.json(
+          { error: "Bạn không có quyền chỉnh sửa kho clip của dự án này." },
+          { status: 403 }
+        );
+      }
+    }
+
+    const sessionPaths = ensureSessionDirs(sessionId);
+    const safeUploadId = uploadId.replace(/[^a-zA-Z0-9_-]/g, "");
+
+    // Phân loại category
+    let detectedCat: ShotCategory = "product";
+    const lowerRel = relativePath.toLowerCase();
+    const lowerName = fileName.toLowerCase();
+    const isVoice = targetCategory === "voice" || lowerRel.includes("/voice/") || lowerRel.includes("\\voice\\");
+
+    if (!isVoice) {
+      if (lowerRel.includes("/open/") || lowerRel.includes("\\open\\") || lowerName.startsWith("open_") || targetCategory === "open") {
+        detectedCat = "open";
+      } else if (lowerRel.includes("/product/") || lowerRel.includes("\\product\\") || lowerName.startsWith("product_") || targetCategory === "product") {
+        detectedCat = "product";
+      } else if (lowerRel.includes("/texture/") || lowerRel.includes("\\texture\\") || lowerName.startsWith("texture_") || targetCategory === "texture") {
+        detectedCat = "texture";
+      } else if (lowerRel.includes("/apply/") || lowerRel.includes("\\apply\\") || lowerName.startsWith("apply_") || targetCategory === "apply") {
+        detectedCat = "apply";
+      } else if (lowerRel.includes("/end/") || lowerRel.includes("\\end\\") || lowerName.startsWith("end_") || targetCategory === "end") {
+        detectedCat = "end";
+      }
+    }
+
+    const targetDir = isVoice
+      ? sessionPaths.voicesDir
+      : path.join(sessionPaths.categoriesDir, detectedCat);
+    if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+
+    const partPath = path.join(targetDir, `${safeUploadId}.part`);
+    const safeName = path.basename(fileName).replace(/\s+/g, "_");
+    const ext = path.extname(safeName).toLowerCase() || (isVoice ? ".mp3" : ".mp4");
+    const fileHash = crypto.createHash("md5").update(safeName).digest("hex").slice(0, 8);
+    const itemId = isVoice ? `voice_${fileHash}` : `clip_${detectedCat}_${fileHash}`;
+    const savedFileName = `${itemId}_${safeName}`;
+    const finalDestPath = path.join(targetDir, savedFileName);
+
+    if (chunkIndex === 0 && fs.existsSync(partPath)) {
+      fs.unlinkSync(partPath);
+    }
+
+    if (!req.body) {
+      return NextResponse.json({ error: "Không tìm thấy dữ liệu chunk stream." }, { status: 400 });
+    }
+
+    const nodeStream = Readable.fromWeb(req.body as any);
+    const writeStream = fs.createWriteStream(partPath, {
+      flags: chunkIndex === 0 ? "w" : "a",
+    });
+    await pipeline(nodeStream, writeStream);
+
+    if (chunkIndex < totalChunks - 1) {
+      const stats = fs.statSync(partPath);
+      return NextResponse.json({
+        partial: true,
+        chunkIndex,
+        totalChunks,
+        receivedBytes: stats.size,
+      });
+    }
+
+    // Chunk cuối cùng -> Đổi tên thành file thật và cập nhật kho
+    if (fs.existsSync(finalDestPath)) {
+      fs.unlinkSync(finalDestPath);
+    }
+    fs.renameSync(partPath, finalDestPath);
+
+    const stats = fs.statSync(finalDestPath);
+    const state = readProjectState(sessionId);
+    const pools: CategoryPools = state.categoryPools || {
+      open: [],
+      product: [],
+      texture: [],
+      apply: [],
+      end: [],
+    };
+
+    if (isVoice) {
+      const curVoices = state.multiVoiceTracks || [];
+      const newVoice: MultiVoiceItem = {
+        id: itemId,
+        name: safeName.replace(ext, ""),
+        fileName: savedFileName,
+        localUrl: `/api/media/sessions/${sessionId}/voices/${savedFileName}`,
+        localPath: finalDestPath,
+        duration: 20,
+        sourceType: "local",
+      };
+      // Tránh trùng lặp
+      if (!curVoices.some((v) => v.id === itemId || v.fileName === savedFileName)) {
+        curVoices.push(newVoice);
+      }
+      state.multiVoiceTracks = curVoices;
+      writeProjectState(state, sessionId);
+      if (projectId) {
+        await saveProjectVoiceTracks(projectId, curVoices);
+      }
+      return NextResponse.json({
+        success: true,
+        sessionId,
+        completed: true,
+        multiVoiceTracks: curVoices,
+        categoryPools: pools,
+      });
+    }
+
+    const isLocked = lowerName.includes("_lock");
+    const item: CategoryVideoItem = {
+      id: itemId,
+      name: safeName.replace(ext, ""),
+      fileName: savedFileName,
+      category: detectedCat,
+      localUrl: `/api/media/sessions/${sessionId}/categories/${detectedCat}/${savedFileName}`,
+      localPath: finalDestPath,
+      duration: 4.0,
+      sizeBytes: stats.size,
+      lockFlipH: isLocked,
+      sourceType: "local",
+      contentHash: fileHash,
+    };
+
+    if (!pools[detectedCat].some((it) => it.id === itemId || it.fileName === savedFileName)) {
+      pools[detectedCat].push(item);
+    }
+
+    state.categoryPools = pools;
+    writeProjectState(state, sessionId);
+    if (projectId) {
+      await saveProjectCategoryPools(projectId, pools);
+    }
+
+    return NextResponse.json({
+      success: true,
+      sessionId,
+      completed: true,
+      addedItem: item,
+      categoryPools: pools,
+      multiVoiceTracks: state.multiVoiceTracks || [],
+    });
+  }
 
   const contentType = req.headers.get("content-type") || "";
   let action = "upload";
