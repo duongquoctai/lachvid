@@ -94,12 +94,14 @@ export async function POST(req: NextRequest) {
     }
 
     if (contentType.includes("video/mp4")) {
-      const filename = composedVideos[0]?.name ? `${composedVideos[0].name}.mp4` : "rendered.mp4";
+      const rawName = composedVideos[0]?.name ? `${composedVideos[0].name}.mp4` : "rendered.mp4";
+      const asciiFallback = rawName.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
+      const encodedName = encodeURIComponent(rawName);
       return new NextResponse(pyRes.body, {
         status: 200,
         headers: {
           "Content-Type": "video/mp4",
-          "Content-Disposition": `attachment; filename="${filename}"`,
+          "Content-Disposition": `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedName}`,
         },
       });
     }

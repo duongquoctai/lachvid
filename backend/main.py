@@ -29,12 +29,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Concurrency Semaphore: Default 1 heavy FFmpeg / PySceneDetect task at a time to protect low-RAM containers (configurable via WORKER_CONCURRENCY)
+# Concurrency Semaphore & FFmpeg Thread Count (configurable via env vars)
 try:
     _env_workers = int(os.getenv("WORKER_CONCURRENCY", "1"))
 except ValueError:
     _env_workers = 1
 WORKER_SEMAPHORE = threading.BoundedSemaphore(max(1, _env_workers))
+
+try:
+    _env_ffmpeg_threads = max(1, int(os.getenv("FFMPEG_THREADS", "2")))
+except ValueError:
+    _env_ffmpeg_threads = 2
+FFMPEG_THREADS = str(_env_ffmpeg_threads)
 
 # Real-time render progress tracker: session_id -> { current, total, percent, current_name }
 RENDER_PROGRESS = {}
@@ -306,20 +312,20 @@ def slice_scenes_endpoint(req: SliceVideoRequest):
     session_id = req.session_id or "export"
 
     def _slice_zip_generator():
-        with WORKER_SEMAPHORE:
-            import subprocess
-            import imageio_ffmpeg
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        import subprocess
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
-            probe = subprocess.run([ffmpeg_exe, "-i", req.file_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            has_audio = "Audio:" in probe.stderr
+        probe = subprocess.run([ffmpeg_exe, "-i", req.file_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        has_audio = "Audio:" in probe.stderr
 
-            valid_categories = {"OPEN", "PRODUCT", "TEXTURE", "APPLY", "END"}
+        valid_categories = {"OPEN", "PRODUCT", "TEXTURE", "APPLY", "END"}
 
-            with tempfile.TemporaryDirectory() as ephemeral_dir:
-                zip_stream = StreamingZipBuffer()
-                with zipfile.ZipFile(zip_stream, "w", zipfile.ZIP_DEFLATED) as zipf:
-                    for idx, sc in enumerate(req.scenes):
+        with tempfile.TemporaryDirectory() as ephemeral_dir:
+            zip_stream = StreamingZipBuffer()
+            with zipfile.ZipFile(zip_stream, "w", zipfile.ZIP_DEFLATED) as zipf:
+                for idx, sc in enumerate(req.scenes):
+                    with WORKER_SEMAPHORE:
                         cat_upper = sc.category.upper().strip()
                         if cat_upper not in valid_categories:
                             cat_upper = "PRODUCT"
@@ -359,13 +365,13 @@ def slice_scenes_endpoint(req: SliceVideoRequest):
                             ffmpeg_exe,
                             "-hide_banner",
                             "-loglevel", "error",
-                            "-threads", "1",
+                            "-threads", FFMPEG_THREADS,
                             "-y",
                             "-ss", f"{sc.begin:.3f}",
                             "-to", f"{sc.end:.3f}",
                             "-i", req.file_path,
-                            "-filter_threads", "1",
-                            "-filter_complex_threads", "1",
+                            "-filter_threads", FFMPEG_THREADS,
+                            "-filter_complex_threads", FFMPEG_THREADS,
                         ]
 
                         if vf_filters:
@@ -378,15 +384,15 @@ def slice_scenes_endpoint(req: SliceVideoRequest):
                             "-c:v", "libx264",
                             "-preset", "superfast",
                             "-crf", "19",
-                            "-threads", "1",
-                            "-x264-params", "threads=1:rc-lookahead=5:sync-lookahead=0:ref=1:bframes=0",
+                            "-threads", FFMPEG_THREADS,
+                            "-x264-params", f"threads={FFMPEG_THREADS}:rc-lookahead=5:sync-lookahead=0:ref=1:bframes=0",
                             "-c:a", "aac",
                             "-movflags", "+faststart",
                             out_file_path,
                         ])
 
                         try:
-                            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=180)
                             arc_name = f"{cat_upper}/{file_name}"
                             zipf.write(out_file_path, arcname=arc_name)
                         except subprocess.CalledProcessError as e:
@@ -401,12 +407,13 @@ def slice_scenes_endpoint(req: SliceVideoRequest):
                                     pass
 
                         chunk_bytes = zip_stream.pop_bytes()
-                        if chunk_bytes:
-                            yield chunk_bytes
 
-                tail_bytes = zip_stream.pop_bytes()
-                if tail_bytes:
-                    yield tail_bytes
+                    if chunk_bytes:
+                        yield chunk_bytes
+
+            tail_bytes = zip_stream.pop_bytes()
+            if tail_bytes:
+                yield tail_bytes
 
     gen = _slice_zip_generator()
     first_chunk = next(gen, b"")
@@ -548,25 +555,46 @@ def render_composed_endpoint(req: RenderBatchRequest):
     session_id = req.session_id or "render"
     is_single = len(req.videos) == 1
 
-    # Single video mode: render and stream MP4 in 256KB chunks
+    # Single video mode: render inside semaphore, then stream MP4 in 256KB chunks outside semaphore
     if is_single:
         def _single_mp4_generator():
-            with WORKER_SEMAPHORE:
-                import subprocess
-                import hashlib
-                import imageio_ffmpeg
-                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            import subprocess
+            import hashlib
+            from concurrent.futures import ThreadPoolExecutor
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
-                v_item = req.videos[0]
-                safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", v_item.name).strip("_") or "video_1"
-                final_mp4_name = f"{safe_name}.mp4"
+            v_item = req.videos[0]
+            safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", v_item.name).strip("_") or "video_1"
+            final_mp4_name = f"{safe_name}.mp4"
 
-                with tempfile.TemporaryDirectory() as batch_dir:
-                    drive_cache_dir = os.path.join(batch_dir, "_drive_cache")
-                    chunk_cache_dir = os.path.join(batch_dir, "_chunk_cache")
-                    os.makedirs(drive_cache_dir, exist_ok=True)
-                    os.makedirs(chunk_cache_dir, exist_ok=True)
-                    final_mp4_path = os.path.join(batch_dir, final_mp4_name)
+            with tempfile.TemporaryDirectory() as batch_dir:
+                drive_cache_dir = os.path.join(batch_dir, "_drive_cache")
+                chunk_cache_dir = os.path.join(batch_dir, "_chunk_cache")
+                os.makedirs(drive_cache_dir, exist_ok=True)
+                os.makedirs(chunk_cache_dir, exist_ok=True)
+                final_mp4_path = os.path.join(batch_dir, final_mp4_name)
+
+                with WORKER_SEMAPHORE:
+                    unique_drive_ids = set()
+                    if v_item.voice_url:
+                        did = extract_drive_file_id(v_item.voice_url)
+                        if did:
+                            unique_drive_ids.add(did)
+                    for slot in v_item.slots:
+                        if slot.url:
+                            did = extract_drive_file_id(slot.url)
+                            if did:
+                                unique_drive_ids.add(did)
+
+                    if unique_drive_ids:
+                        def _prefetch_single_drive(fid: str):
+                            target = os.path.join(drive_cache_dir, f"drive_{fid}.media")
+                            if not (os.path.exists(target) and os.path.getsize(target) > 1000):
+                                download_drive_file(fid, target)
+
+                        with ThreadPoolExecutor(max_workers=min(6, len(unique_drive_ids))) as pool:
+                            list(pool.map(_prefetch_single_drive, unique_drive_ids))
 
                     chunk_files: List[str] = []
                     total_duration = 0.0
@@ -613,9 +641,9 @@ def render_composed_endpoint(req: RenderBatchRequest):
                             ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
                             "-ss", f"{v_begin:.3f}",
                             "-to", f"{v_end:.3f}",
-                            "-threads", "1",
+                            "-threads", FFMPEG_THREADS,
                             "-i", resolved_src,
-                            "-filter_threads", "1", "-filter_complex_threads", "1",
+                            "-filter_threads", FFMPEG_THREADS, "-filter_complex_threads", FFMPEG_THREADS,
                             "-vf", ",".join(vf_filters),
                             "-an",
                             "-c:v", "libx264",
@@ -624,12 +652,12 @@ def render_composed_endpoint(req: RenderBatchRequest):
                             "-maxrate", "4M",
                             "-bufsize", "4M",
                             "-pix_fmt", "yuv420p",
-                            "-threads", "1",
-                            "-x264-params", "threads=1:rc-lookahead=5:sync-lookahead=0:ref=1:bframes=0",
+                            "-threads", FFMPEG_THREADS,
+                            "-x264-params", f"threads={FFMPEG_THREADS}:rc-lookahead=5:sync-lookahead=0:ref=1:bframes=0",
                             cached_chunk_path,
                         ]
                         try:
-                            subprocess.run(cmd_chunk, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                            subprocess.run(cmd_chunk, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=180)
                             chunk_files.append(cached_chunk_path)
                         except subprocess.CalledProcessError as e:
                             err_msg = e.stderr.decode("utf-8", errors="ignore").strip()
@@ -682,7 +710,7 @@ def render_composed_endpoint(req: RenderBatchRequest):
                         ]
 
                     try:
-                        subprocess.run(cmd_final, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                        subprocess.run(cmd_final, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=180)
                     except subprocess.CalledProcessError as e:
                         err_msg = e.stderr.decode("utf-8", errors="ignore").strip()
                         sig_hint = f" (killed signal {e.returncode} - OOM)" if e.returncode < 0 else f" (exit {e.returncode})"
@@ -691,12 +719,13 @@ def render_composed_endpoint(req: RenderBatchRequest):
                     shutil.rmtree(chunk_cache_dir, ignore_errors=True)
                     shutil.rmtree(drive_cache_dir, ignore_errors=True)
 
-                    with open(final_mp4_path, "rb") as f:
-                        while True:
-                            buf = f.read(256 * 1024)
-                            if not buf:
-                                break
-                            yield buf
+                # Stream outside WORKER_SEMAPHORE so semaphore is never held across yield
+                with open(final_mp4_path, "rb") as f:
+                    while True:
+                        buf = f.read(256 * 1024)
+                        if not buf:
+                            break
+                        yield buf
 
         gen = _single_mp4_generator()
         first_chunk = next(gen, b"")
@@ -717,70 +746,70 @@ def render_composed_endpoint(req: RenderBatchRequest):
 
     # Batch mode: Stream ZIP on the fly + rolling eviction of chunks & drive files
     def _batch_zip_generator():
-        with WORKER_SEMAPHORE:
-            import subprocess
-            import hashlib
-            from concurrent.futures import ThreadPoolExecutor
-            import imageio_ffmpeg
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        import subprocess
+        import hashlib
+        from concurrent.futures import ThreadPoolExecutor
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
-            RENDER_PROGRESS[session_id] = {
-                "current": 0,
-                "total": len(req.videos),
-                "current_name": "",
-                "percent": 0,
-            }
+        RENDER_PROGRESS[session_id] = {
+            "current": 0,
+            "total": len(req.videos),
+            "current_name": "",
+            "percent": 0,
+        }
 
-            try:
-                with tempfile.TemporaryDirectory() as batch_dir:
-                    drive_cache_dir = os.path.join(batch_dir, "_drive_cache")
-                    chunk_cache_dir = os.path.join(batch_dir, "_chunk_cache")
-                    os.makedirs(drive_cache_dir, exist_ok=True)
-                    os.makedirs(chunk_cache_dir, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory() as batch_dir:
+                drive_cache_dir = os.path.join(batch_dir, "_drive_cache")
+                chunk_cache_dir = os.path.join(batch_dir, "_chunk_cache")
+                os.makedirs(drive_cache_dir, exist_ok=True)
+                os.makedirs(chunk_cache_dir, exist_ok=True)
 
-                    # Track last video index that uses each Drive file ID and each slot signature
-                    drive_last_video_idx = {}
-                    slot_last_video_idx = {}
-                    unique_drive_ids = set()
+                # Track last video index that uses each Drive file ID and each slot signature
+                drive_last_video_idx = {}
+                slot_last_video_idx = {}
+                unique_drive_ids = set()
 
-                    for v_idx, v_item in enumerate(req.videos):
-                        if v_item.voice_url:
-                            did = extract_drive_file_id(v_item.voice_url)
+                for v_idx, v_item in enumerate(req.videos):
+                    if v_item.voice_url:
+                        did = extract_drive_file_id(v_item.voice_url)
+                        if did:
+                            unique_drive_ids.add(did)
+                            drive_last_video_idx[did] = v_idx
+                    for slot in v_item.slots:
+                        if slot.url:
+                            did = extract_drive_file_id(slot.url)
                             if did:
                                 unique_drive_ids.add(did)
                                 drive_last_video_idx[did] = v_idx
-                        for slot in v_item.slots:
-                            if slot.url:
-                                did = extract_drive_file_id(slot.url)
-                                if did:
-                                    unique_drive_ids.add(did)
-                                    drive_last_video_idx[did] = v_idx
-                            slot_key = (
-                                slot.file_path or "",
-                                slot.url or "",
-                                round(max(0.0, slot.video_begin), 3),
-                                round(slot.video_end, 3),
-                                round(max(0.1, min(5.0, slot.speed or 1.0)), 4),
-                                bool(slot.flip_h),
-                            )
-                            slot_last_video_idx[slot_key] = v_idx
+                        slot_key = (
+                            slot.file_path or "",
+                            slot.url or "",
+                            round(max(0.0, slot.video_begin), 3),
+                            round(slot.video_end, 3),
+                            round(max(0.1, min(5.0, slot.speed or 1.0)), 4),
+                            bool(slot.flip_h),
+                        )
+                        slot_last_video_idx[slot_key] = v_idx
 
-                    if unique_drive_ids:
-                        def _prefetch_drive(fid: str):
-                            target = os.path.join(drive_cache_dir, f"drive_{fid}.media")
-                            if not (os.path.exists(target) and os.path.getsize(target) > 1000):
-                                download_drive_file(fid, target)
+                if unique_drive_ids:
+                    def _prefetch_drive(fid: str):
+                        target = os.path.join(drive_cache_dir, f"drive_{fid}.media")
+                        if not (os.path.exists(target) and os.path.getsize(target) > 1000):
+                            download_drive_file(fid, target)
 
-                        with ThreadPoolExecutor(max_workers=min(8, len(unique_drive_ids))) as pool:
-                            list(pool.map(_prefetch_drive, unique_drive_ids))
+                    with ThreadPoolExecutor(max_workers=min(8, len(unique_drive_ids))) as pool:
+                        list(pool.map(_prefetch_drive, unique_drive_ids))
 
-                    zip_stream = StreamingZipBuffer()
-                    rendered_count = 0
-                    chunk_dur_cache = {}
-                    probe_dur_cache = {}
+                zip_stream = StreamingZipBuffer()
+                rendered_count = 0
+                chunk_dur_cache = {}
+                probe_dur_cache = {}
 
-                    with zipfile.ZipFile(zip_stream, "w", zipfile.ZIP_STORED) as zipf:
-                        for idx, v_item in enumerate(req.videos):
+                with zipfile.ZipFile(zip_stream, "w", zipfile.ZIP_STORED) as zipf:
+                    for idx, v_item in enumerate(req.videos):
+                        with WORKER_SEMAPHORE:
                             safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", v_item.name).strip("_") or f"video_{idx+1}"
                             final_mp4_name = f"{safe_name}.mp4"
                             final_mp4_path = os.path.join(batch_dir, final_mp4_name)
@@ -855,9 +884,9 @@ def render_composed_endpoint(req: RenderBatchRequest):
                                         ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
                                         "-ss", f"{v_begin:.3f}",
                                         "-to", f"{v_end:.3f}",
-                                        "-threads", "1",
+                                        "-threads", FFMPEG_THREADS,
                                         "-i", resolved_src,
-                                        "-filter_threads", "1", "-filter_complex_threads", "1",
+                                        "-filter_threads", FFMPEG_THREADS, "-filter_complex_threads", FFMPEG_THREADS,
                                         "-vf", ",".join(vf_filters),
                                         "-an",
                                         "-c:v", "libx264",
@@ -866,13 +895,13 @@ def render_composed_endpoint(req: RenderBatchRequest):
                                         "-maxrate", "4M",
                                         "-bufsize", "4M",
                                         "-pix_fmt", "yuv420p",
-                                        "-threads", "1",
-                                        "-x264-params", "threads=1:rc-lookahead=5:sync-lookahead=0:ref=1:bframes=0",
+                                        "-threads", FFMPEG_THREADS,
+                                        "-x264-params", f"threads={FFMPEG_THREADS}:rc-lookahead=5:sync-lookahead=0:ref=1:bframes=0",
                                         cached_chunk_path
                                     ]
 
                                     try:
-                                        subprocess.run(cmd_chunk, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                                        subprocess.run(cmd_chunk, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=180)
                                         chunk_files.append(cached_chunk_path)
                                     except subprocess.CalledProcessError as e:
                                         err_msg = e.stderr.decode("utf-8", errors="ignore").strip()
@@ -925,7 +954,7 @@ def render_composed_endpoint(req: RenderBatchRequest):
                                     ]
 
                                 try:
-                                    subprocess.run(cmd_final, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                                    subprocess.run(cmd_final, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=180)
                                 except subprocess.CalledProcessError as e:
                                     err_msg = e.stderr.decode("utf-8", errors="ignore").strip()
                                     sig_hint = f" (killed signal {e.returncode} - OOM)" if e.returncode < 0 else f" (exit {e.returncode})"
@@ -963,17 +992,17 @@ def render_composed_endpoint(req: RenderBatchRequest):
                                 "current_name": v_item.name,
                             }
 
-                            # Immediately stream this video's ZIP bytes to the client and free RAM
                             chunk_bytes = zip_stream.pop_bytes()
-                            if chunk_bytes:
-                                yield chunk_bytes
 
-                    # Flush ZIP central directory at the end of the archive
-                    tail_bytes = zip_stream.pop_bytes()
-                    if tail_bytes:
-                        yield tail_bytes
-            finally:
-                RENDER_PROGRESS.pop(session_id, None)
+                        # Yield outside WORKER_SEMAPHORE so semaphore is never held while waiting on network I/O
+                        if chunk_bytes:
+                            yield chunk_bytes
+
+                tail_bytes = zip_stream.pop_bytes()
+                if tail_bytes:
+                    yield tail_bytes
+        finally:
+            RENDER_PROGRESS.pop(session_id, None)
 
     gen = _batch_zip_generator()
     first_chunk = next(gen, b"")
