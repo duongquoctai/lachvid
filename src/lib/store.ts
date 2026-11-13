@@ -16,7 +16,11 @@ export const OUTPUTS_DIR = path.join(DATA_DIR, "outputs");
 export const STATE_FILE = path.join(DATA_DIR, "project_state.json");
 
 export const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
-export const MAX_SESSIONS_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB limit
+const envMaxStorageMb = Number(process.env.MAX_STORAGE_MB);
+export const MAX_SESSIONS_BYTES =
+  (Number.isFinite(envMaxStorageMb) && envMaxStorageMb > 0 ? envMaxStorageMb : 600) *
+  1024 *
+  1024; // Default 600 MB (configurable via MAX_STORAGE_MB)
 
 export interface SessionPaths {
   rootDir: string;

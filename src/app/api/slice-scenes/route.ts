@@ -71,8 +71,7 @@ export async function POST(req: NextRequest) {
     // Forward the streaming ZIP file or JSON response
     const contentType = pyRes.headers.get("content-type") || "";
     if (contentType.includes("application/zip")) {
-      const zipArrayBuffer = await pyRes.arrayBuffer();
-      return new NextResponse(zipArrayBuffer, {
+      return new NextResponse(pyRes.body, {
         status: 200,
         headers: {
           "Content-Type": "application/zip",
