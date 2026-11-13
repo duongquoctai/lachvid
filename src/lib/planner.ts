@@ -211,26 +211,48 @@ export function planDiverseCombinations(
   }
 
   let attempts = 0;
-  const maxAttempts = 200000;
+  const maxAttempts = 100000;
+  let consecutiveFailures = 0;
+  let usageSlack = 0;
+  let backtracks = 0;
+  const maxBacktracks = 100;
 
   while (selected.length < targetN && attempts < maxAttempts) {
     attempts++;
 
-    // Pick 1 shot per category, prioritizing least-used shots
+    // Pick 1 shot per category, prioritizing least-used shots (with fallback slack & backtracking when stuck)
     const candidateTuple: Shot[] = [];
+    let allSingleCandidate = true;
+    let emptyCategoryPool = false;
+
     for (const cat of CATEGORY_ORDER) {
-      const items = byCat[cat];
+      const eligible = byCat[cat].filter(
+        (it) => (shotUsageCounts[it.id] || 0) < maxFreq
+      );
+      if (eligible.length === 0) {
+        emptyCategoryPool = true;
+        break;
+      }
+
       let minUsage = Infinity;
-      for (const item of items) {
+      for (const item of eligible) {
         const u = shotUsageCounts[item.id] || 0;
         if (u < minUsage) minUsage = u;
       }
-      const bestCandidates = items.filter(
-        (it) => (shotUsageCounts[it.id] || 0) === minUsage
+
+      const bestCandidates = eligible.filter(
+        (it) => (shotUsageCounts[it.id] || 0) <= minUsage + usageSlack
       );
+      if (bestCandidates.length > 1) {
+        allSingleCandidate = false;
+      }
       const chosenItem =
         bestCandidates[Math.floor(rand() * bestCandidates.length)];
       candidateTuple.push(chosenItem);
+    }
+
+    if (emptyCategoryPool) {
+      break;
     }
 
     const candIds: [string, string, string, string, string] = [
@@ -257,28 +279,54 @@ export function planDiverseCombinations(
         break;
       }
     }
-    if (exceedsFreq) continue;
 
     // Check anti-collision with previously rendered history (Hamming >= 2)
     // Matches by contentHash or drive ID so different links of same clip are recognized
     let violatesHistory = false;
-    for (const histIds of parsedHistory) {
-      if (computeFingerprintHammingDistance(candFingerprints, histIds) < 2) {
-        violatesHistory = true;
-        break;
+    if (!exceedsFreq) {
+      for (const histIds of parsedHistory) {
+        if (computeFingerprintHammingDistance(candFingerprints, histIds) < 2) {
+          violatesHistory = true;
+          break;
+        }
       }
     }
-    if (violatesHistory) continue;
 
     // Check pairwise Hamming distance against all already selected tuples in this batch
     let violatesHamming = false;
-    for (const prevFps of selectedFingerprints) {
-      if (computeFingerprintHammingDistance(candFingerprints, prevFps) < minHamming) {
-        violatesHamming = true;
-        break;
+    if (!exceedsFreq && !violatesHistory) {
+      for (const prevFps of selectedFingerprints) {
+        if (computeFingerprintHammingDistance(candFingerprints, prevFps) < minHamming) {
+          violatesHamming = true;
+          break;
+        }
       }
     }
-    if (violatesHamming) continue;
+
+    if (exceedsFreq || violatesHistory || violatesHamming) {
+      consecutiveFailures++;
+
+      if (allSingleCandidate || consecutiveFailures >= 30) {
+        if (usageSlack === 0 && selected.length > 0 && backtracks < maxBacktracks) {
+          // Backtrack the last tuple to escape dead-ends at cycle boundaries (e.g. 2, 5, 8)
+          const poppedIds = selectedIds.pop()!;
+          selected.pop();
+          selectedFingerprints.pop();
+          for (const id of poppedIds) {
+            shotUsageCounts[id] = Math.max(0, (shotUsageCounts[id] || 0) - 1);
+          }
+          backtracks++;
+          consecutiveFailures = 0;
+        } else if (usageSlack < maxFreq) {
+          usageSlack++;
+          consecutiveFailures = 0;
+        } else if (consecutiveFailures >= 5000) {
+          // Genuinely saturated across the entire eligible pool
+          break;
+        }
+      }
+      continue;
+    }
 
     // Candidate is valid! Add to selected
     selected.push(candidateTuple as [Shot, Shot, Shot, Shot, Shot]);
@@ -287,6 +335,8 @@ export function planDiverseCombinations(
     for (const id of candIds) {
       shotUsageCounts[id] = (shotUsageCounts[id] || 0) + 1;
     }
+    consecutiveFailures = 0;
+    usageSlack = 0;
   }
 
   if (selected.length < targetN) {
