@@ -29,8 +29,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Concurrency Semaphore: Max 3 heavy FFmpeg / PySceneDetect tasks in parallel
-WORKER_SEMAPHORE = threading.BoundedSemaphore(3)
+# Concurrency Semaphore: Default 1 heavy FFmpeg / PySceneDetect task at a time to protect low-RAM containers (configurable via WORKER_CONCURRENCY)
+try:
+    _env_workers = int(os.getenv("WORKER_CONCURRENCY", "1"))
+except ValueError:
+    _env_workers = 1
+WORKER_SEMAPHORE = threading.BoundedSemaphore(max(1, _env_workers))
 
 # Real-time render progress tracker: session_id -> { current, total, percent, current_name }
 RENDER_PROGRESS = {}
@@ -353,10 +357,15 @@ def slice_scenes_endpoint(req: SliceVideoRequest):
 
                         cmd = [
                             ffmpeg_exe,
+                            "-hide_banner",
+                            "-loglevel", "error",
+                            "-threads", "1",
                             "-y",
                             "-ss", f"{sc.begin:.3f}",
                             "-to", f"{sc.end:.3f}",
                             "-i", req.file_path,
+                            "-filter_threads", "1",
+                            "-filter_complex_threads", "1",
                         ]
 
                         if vf_filters:
@@ -367,8 +376,10 @@ def slice_scenes_endpoint(req: SliceVideoRequest):
 
                         cmd.extend([
                             "-c:v", "libx264",
-                            "-preset", "veryfast",
+                            "-preset", "superfast",
                             "-crf", "19",
+                            "-threads", "1",
+                            "-x264-params", "threads=1:rc-lookahead=5:sync-lookahead=0:ref=1:bframes=0",
                             "-c:a", "aac",
                             "-movflags", "+faststart",
                             out_file_path,
@@ -379,8 +390,9 @@ def slice_scenes_endpoint(req: SliceVideoRequest):
                             arc_name = f"{cat_upper}/{file_name}"
                             zipf.write(out_file_path, arcname=arc_name)
                         except subprocess.CalledProcessError as e:
-                            err_msg = e.stderr.decode("utf-8", errors="ignore")
-                            raise HTTPException(status_code=500, detail=f"Lỗi khi cắt cảnh {file_name}: {err_msg[:300]}")
+                            err_msg = e.stderr.decode("utf-8", errors="ignore").strip()
+                            sig_hint = f" (killed signal {e.returncode} - OOM)" if e.returncode < 0 else f" (exit {e.returncode})"
+                            raise HTTPException(status_code=500, detail=f"Lỗi khi cắt cảnh {file_name}{sig_hint}: {err_msg[-400:]}")
                         finally:
                             if os.path.exists(out_file_path):
                                 try:
@@ -598,26 +610,31 @@ def render_composed_endpoint(req: RenderBatchRequest):
                         vf_filters.append("fps=30")
 
                         cmd_chunk = [
-                            ffmpeg_exe, "-y",
+                            ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
                             "-ss", f"{v_begin:.3f}",
                             "-to", f"{v_end:.3f}",
+                            "-threads", "1",
                             "-i", resolved_src,
+                            "-filter_threads", "1", "-filter_complex_threads", "1",
                             "-vf", ",".join(vf_filters),
                             "-an",
                             "-c:v", "libx264",
-                            "-preset", "veryfast",
+                            "-preset", "superfast",
                             "-crf", "23",
                             "-maxrate", "4M",
-                            "-bufsize", "8M",
+                            "-bufsize", "4M",
                             "-pix_fmt", "yuv420p",
+                            "-threads", "1",
+                            "-x264-params", "threads=1:rc-lookahead=5:sync-lookahead=0:ref=1:bframes=0",
                             cached_chunk_path,
                         ]
                         try:
                             subprocess.run(cmd_chunk, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
                             chunk_files.append(cached_chunk_path)
                         except subprocess.CalledProcessError as e:
-                            err_msg = e.stderr.decode("utf-8", errors="ignore")
-                            raise HTTPException(status_code=500, detail=f"Lỗi khi xử lý cảnh {slot.category}: {err_msg[:300]}")
+                            err_msg = e.stderr.decode("utf-8", errors="ignore").strip()
+                            sig_hint = f" (killed signal {e.returncode} - OOM)" if e.returncode < 0 else f" (exit {e.returncode})"
+                            raise HTTPException(status_code=500, detail=f"Lỗi khi xử lý cảnh {slot.category}{sig_hint}: {err_msg[-400:]}")
 
                     concat_list = os.path.join(batch_dir, "concat.txt")
                     with open(concat_list, "w") as f:
@@ -632,7 +649,7 @@ def render_composed_endpoint(req: RenderBatchRequest):
 
                     if voice_path:
                         cmd_final = [
-                            ffmpeg_exe, "-y",
+                            ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
                             "-f", "concat",
                             "-safe", "0",
                             "-i", concat_list,
@@ -648,7 +665,7 @@ def render_composed_endpoint(req: RenderBatchRequest):
                         ]
                     else:
                         cmd_final = [
-                            ffmpeg_exe, "-y",
+                            ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
                             "-f", "concat",
                             "-safe", "0",
                             "-i", concat_list,
@@ -667,8 +684,9 @@ def render_composed_endpoint(req: RenderBatchRequest):
                     try:
                         subprocess.run(cmd_final, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
                     except subprocess.CalledProcessError as e:
-                        err_msg = e.stderr.decode("utf-8", errors="ignore")
-                        raise HTTPException(status_code=500, detail=f"Lỗi khi ghép audio cho {v_item.name}: {err_msg[:300]}")
+                        err_msg = e.stderr.decode("utf-8", errors="ignore").strip()
+                        sig_hint = f" (killed signal {e.returncode} - OOM)" if e.returncode < 0 else f" (exit {e.returncode})"
+                        raise HTTPException(status_code=500, detail=f"Lỗi khi ghép audio cho {v_item.name}{sig_hint}: {err_msg[-400:]}")
 
                     shutil.rmtree(chunk_cache_dir, ignore_errors=True)
                     shutil.rmtree(drive_cache_dir, ignore_errors=True)
@@ -834,18 +852,22 @@ def render_composed_endpoint(req: RenderBatchRequest):
                                     vf_filters.append("fps=30")
 
                                     cmd_chunk = [
-                                        ffmpeg_exe, "-y",
+                                        ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
                                         "-ss", f"{v_begin:.3f}",
                                         "-to", f"{v_end:.3f}",
+                                        "-threads", "1",
                                         "-i", resolved_src,
+                                        "-filter_threads", "1", "-filter_complex_threads", "1",
                                         "-vf", ",".join(vf_filters),
                                         "-an",
                                         "-c:v", "libx264",
-                                        "-preset", "veryfast",
+                                        "-preset", "superfast",
                                         "-crf", "23",
                                         "-maxrate", "4M",
-                                        "-bufsize", "8M",
+                                        "-bufsize", "4M",
                                         "-pix_fmt", "yuv420p",
+                                        "-threads", "1",
+                                        "-x264-params", "threads=1:rc-lookahead=5:sync-lookahead=0:ref=1:bframes=0",
                                         cached_chunk_path
                                     ]
 
@@ -853,8 +875,9 @@ def render_composed_endpoint(req: RenderBatchRequest):
                                         subprocess.run(cmd_chunk, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
                                         chunk_files.append(cached_chunk_path)
                                     except subprocess.CalledProcessError as e:
-                                        err_msg = e.stderr.decode("utf-8", errors="ignore")
-                                        raise HTTPException(status_code=500, detail=f"Lỗi khi xử lý cảnh {slot.category}: {err_msg[:300]}")
+                                        err_msg = e.stderr.decode("utf-8", errors="ignore").strip()
+                                        sig_hint = f" (killed signal {e.returncode} - OOM)" if e.returncode < 0 else f" (exit {e.returncode})"
+                                        raise HTTPException(status_code=500, detail=f"Lỗi khi xử lý cảnh {slot.category}{sig_hint}: {err_msg[-400:]}")
 
                                 concat_list = os.path.join(chunk_dir, "concat.txt")
                                 with open(concat_list, "w") as f:
@@ -869,7 +892,7 @@ def render_composed_endpoint(req: RenderBatchRequest):
 
                                 if voice_path:
                                     cmd_final = [
-                                        ffmpeg_exe, "-y",
+                                        ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
                                         "-f", "concat",
                                         "-safe", "0",
                                         "-i", concat_list,
@@ -885,7 +908,7 @@ def render_composed_endpoint(req: RenderBatchRequest):
                                     ]
                                 else:
                                     cmd_final = [
-                                        ffmpeg_exe, "-y",
+                                        ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
                                         "-f", "concat",
                                         "-safe", "0",
                                         "-i", concat_list,
@@ -904,8 +927,9 @@ def render_composed_endpoint(req: RenderBatchRequest):
                                 try:
                                     subprocess.run(cmd_final, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
                                 except subprocess.CalledProcessError as e:
-                                    err_msg = e.stderr.decode("utf-8", errors="ignore")
-                                    raise HTTPException(status_code=500, detail=f"Lỗi khi ghép audio cho {v_item.name}: {err_msg[:300]}")
+                                    err_msg = e.stderr.decode("utf-8", errors="ignore").strip()
+                                    sig_hint = f" (killed signal {e.returncode} - OOM)" if e.returncode < 0 else f" (exit {e.returncode})"
+                                    raise HTTPException(status_code=500, detail=f"Lỗi khi ghép audio cho {v_item.name}{sig_hint}: {err_msg[-400:]}")
 
                                 # Rolling cleanup: remove any chunk and Drive cached file no longer needed by remaining videos
                                 for cpath in retire_chunk_paths:
