@@ -9,6 +9,8 @@ const nextConfig = {
     "*.pinggy.link",
     "localhost:3000",
     "localhost:3005",
+    "*.up.railway.app",
+    "*.railway.app",
   ],
   experimental: {
     proxyClientMaxBodySize: "500mb",
@@ -20,6 +22,8 @@ const nextConfig = {
         "*.ngrok-free.app",
         "*.ngrok.app",
         "*.pinggy.link",
+        "*.up.railway.app",
+        "*.railway.app",
       ],
       bodySizeLimit: "500mb",
     },
