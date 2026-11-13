@@ -1,0 +1,17 @@
+node_modules
+.next
+out
+build
+backend/.venv
+backend/__pycache__
+**/__pycache__
+*.pyc
+.git
+.gitignore
+.env
+.env.*
+data
+*.log
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
